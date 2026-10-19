@@ -1,179 +1,431 @@
 # Приложение A. Шпаргалки
 
-> По одной «странице» на инструмент — только то, что нужно в работе и на собеседовании. Версии: kubectl 1.36, Helm 4.2, Kustomize 5.8, kind 0.32, Argo CD 3.5, crictl из kindest/node 1.36.
+> Одна страница на инструмент: команды, которые нужны в работе чаще всего, и ошибки, на которых спотыкаются. Версии как на стенде курса: kubectl 1.36, kind 0.32, containerd 2.3, etcd 3.6, Helm 4.2.2, Kustomize 5.8.1, Argo CD 3.5.5, cosign 2.5.3, Velero 1.18.4.
 
 ---
 
-## A.1. kubectl — навигация и чтение
+## Как пользоваться
+
+Шпаргалка не учит, а напоминает. Механизм, схема и разбор вывода лежат в части, на которую ведёт ссылка в конце каждой страницы. Если команда непонятна, откройте карточку инструмента: там сказано, откуда инструмент берёт данные и что он меняет.
+
+Команды даны в форме Ubuntu. Различия Manjaro названы в строках «Установка» карточек и сведены в приложении B. Значения `orders`, `NAME`, `ID` в командах замените своими. Узлы стенда — контейнеры Docker, поэтому команды для узла запускают как `docker exec lab-worker …`.
+
+Таблица ниже перечисляет страницы и части, где стоит карточка инструмента.
+
+| Страница | Инструмент | Карточка |
+|---|---|---|
+| A.1 | kubectl | 00-2 §2 |
+| A.2 | kind | 00-2 §3 |
+| A.3 | crictl | 00-2 §4 |
+| A.4 | journalctl для kubelet | 00-2 §4, 11-4 §3 |
+| A.5 | etcdctl и etcdutl | 01-1 §4, 10-2 §3 |
+| A.6 | kubeadm | 10-1 §3 |
+| A.7 | helm 4 и helm-diff | 07-1 §3, 07-2 §3 |
+| A.8 | kustomize | 07-3 §3 |
+| A.9 | argocd | 08-1 §3 |
+| A.10 | cosign | 06-4, работа 3 |
+| A.11 | velero | 04-3, работа 3 |
+| A.12 | tcpdump и netshoot | 03-1, работа 2 |
+| A.13 | ingress2gateway | 03-5, работа 3 |
+| A.14 | stern и k9s | 00-2 §4 |
+
+---
+
+## A.1. kubectl
+
+Команды ниже не меняют текущий namespace: namespace задан флагом `-n` или функцией `k`, а контекст переключается отдельно.
 
 ```bash
-kubectl config get-contexts; kubectl config use-context kind-lab
-kubectl config set-context --current --namespace=orders        # ns по умолчанию
-kubectl get pods -o wide --show-labels                         # узел, IP, метки
-kubectl get pods -A --field-selector=status.phase!=Running     # всё, что не Running
-kubectl get pods -l app=orders-api -w                          # наблюдать
-kubectl get deploy orders-api -o yaml | less                   # полный объект
-kubectl get pod p -o jsonpath='{.status.containerStatuses[0].lastState}'
-kubectl get pods -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,RESTARTS:.status.containerStatuses[0].restartCount
-kubectl get events --sort-by=.lastTimestamp | tail -20
-kubectl get events --field-selector involvedObject.name=p,reason=FailedScheduling
-kubectl describe pod p                                         # события внизу
-kubectl explain deploy.spec.strategy.rollingUpdate --recursive # документация поля
-kubectl api-resources --namespaced=false                       # кластерные типы
-kubectl top pods --containers; kubectl top nodes               # нужен metrics-server
+kubectl config get-contexts                        # список контекстов, звёздочка — текущий
+kubectl config use-context kind-lab                # сменить контекст, namespace не трогаем
+k() { kubectl -n orders "$@"; }                    # функция k: namespace только для неё
+k get pods -o wide                                 # поды с узлом и IP, -A вместо -n — все
+k describe pod NAME                                # состояние и события пода (внизу вывода)
+k logs deploy/orders-api --tail=20                 # лог одного пода из Deployment
+k exec -it pod/NAME -- sh                          # shell в контейнере
+k debug -it pod/NAME --image=busybox:1.37 --target=api   # временный контейнер рядом с целью
+k get pod NAME -o jsonpath='{.status.podIP}'       # одно поле объекта
+k get pods -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName   # своя таблица
+kubectl explain deployment.spec.strategy           # описание поля из схемы кластера
+kubectl apply -f app.yaml --dry-run=server         # проверка на сервере без записи
+kubectl diff -f app.yaml                           # что изменит apply; код 1 — есть правки
+kubectl auth can-i delete pods -n orders           # разрешено ли мне это действие
+kubectl auth whoami                                # кем кластер считает меня
+k events --for pod/postgres-0                      # события одного объекта
+k top pods                                         # CPU и память подов (нужен metrics-server)
+k port-forward svc/orders-api 9000:80              # localhost:9000 → один под за Service
+k get deploy orders-api -v=8                       # HTTP-запросы и ответы kubectl
+KUBERC=off kubectl get pods                        # выполнить без файла kuberc
 ```
 
-## A.2. kubectl — изменения
+Частые ошибки:
+
+- Не тот контекст: команда сработала, но в другом кластере. Проверяйте `kubectl config current-context`.
+- Забыт `-n`: ответ `No resources found in default namespace`. Нужен флаг `-n` или `-A`.
+- `--dry-run=client` не проходит admission. Серверные ошибки и политики ловит только `--dry-run=server`.
+- `port-forward` к Service выбирает один под при запуске и не балансирует.
+
+Подробно: карточка и разделы 2–4 части 00-2, права и `auth` — 06-1, отладка подов — 11-2.
+
+## A.2. kind
+
+kind поднимает узлы-контейнеры Docker. На стенде кластер создают и гасят скрипты `lab-up.sh` и `lab-down.sh`, а kind нужен для осмотра и сборки логов.
 
 ```bash
-kubectl apply -f x.yaml --server-side                          # SSA, managedFields
-kubectl diff -f x.yaml                                         # что изменится
-kubectl apply -f x.yaml --dry-run=server                       # проверка admission без записи
-kubectl create deploy d --image=busybox:1.37 --dry-run=client -o yaml -- sleep 3600 > d.yaml
-kubectl set image deploy/orders-api api=localhost:5001/orders-api:2.1
-kubectl set resources deploy/orders-api --requests=cpu=100m,memory=128Mi
-kubectl scale deploy/orders-api --replicas=4
-kubectl rollout status|history|undo|restart deploy/orders-api
-kubectl patch svc s -p '{"spec":{"selector":{"app":"x"}}}'     # merge patch
-kubectl patch svc s --type=json -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":"http"}]'
-kubectl label ns orders pod-security.kubernetes.io/enforce=restricted --dry-run=server
-kubectl taint node n key=val:NoSchedule  /  kubectl taint node n key=val:NoSchedule-
-kubectl cordon|uncordon n; kubectl drain n --ignore-daemonsets --delete-emptydir-data --timeout=5m
-kubectl delete pod p --grace-period=0 --force                  # только если узел точно мёртв
+bash kubernetes/lab/lab-up.sh                      # поднять или запустить стенд (из корня репо)
+bash kubernetes/lab/lab-down.sh                    # остановить узлы и реестр, данные остаются
+bash kubernetes/lab/lab-down.sh --purge            # удалить кластер, реестр, том и ~/lab/k8s
+kind get clusters                                  # кластеры kind на этой машине
+kind get nodes --name lab                          # контейнеры-узлы кластера lab
+kind export kubeconfig --name lab                  # вернуть контекст kind-lab в kubeconfig
+kind export logs ./kind-logs --name lab            # собрать логи всех узлов в каталог
+kind load docker-image IMAGE --name lab            # копировать образ с хоста в containerd узлов
+kind create cluster --wait 120s                    # создать кластер и ждать control plane до 120 с
+kind delete cluster --name lab                     # удалить кластер (реестр останется без кластера)
+docker exec -it lab-worker bash                    # зайти на узел
+docker ps --format '{{.Names}} {{.Ports}}'         # контейнеры стенда и их порты
 ```
 
-## A.3. kubectl — внутрь
+Частые ошибки:
+
+- `too many open files` в логах kubelet: мало `fs.inotify.max_user_instances` (00-1 §5).
+- `port is already allocated`: порт хоста занят другим контейнером.
+- После перезагрузки машины `kubectl` отвечает `connection refused`: узлы остановлены, их запускает `lab-up.sh`.
+- Образ, загруженный `kind load`, не удаляют через `crictl rmi --prune`: удаляйте по имени.
+
+Подробно: карточка kind в 00-2 §3, стенд — 00-1 §3–5 и приложение C.
+
+## A.3. crictl
+
+crictl говорит с containerd на узле напрямую, мимо API-сервера, и видит то же, что kubelet. На стенде его запускают через `docker exec`.
 
 ```bash
-kubectl logs p [-c c] [--previous] [--since=10m] [-f]; kubectl logs -l app=orders-api --prefix --tail=20
-kubectl exec -it p -- sh
-kubectl debug -it p --image=busybox:1.37 --target=api          # эфемерный контейнер рядом
-kubectl debug p --copy-to=p-dbg --container=api -- sleep 3600  # копия с другой командой
-kubectl debug node/lab-worker -it --image=busybox:1.37         # узел: /host
-kubectl port-forward svc/orders-api 8000:80
-kubectl run t --rm -it --image=busybox:1.37 --restart=Never -- wget -qO- -T 3 http://orders-api.orders/api/orders
-kubectl get --raw '/readyz?verbose'; kubectl get --raw /metrics | grep apiserver_requested_deprecated_apis
-kubectl auth can-i create deploy -n orders                     # мои права
+N=lab-worker                                       # узел, на котором работаем
+docker exec $N crictl ps                           # запущенные контейнеры
+docker exec $N crictl ps -a                        # и остановленные, с числом попыток ATTEMPT
+docker exec $N crictl ps --name postgres           # фильтр по имени контейнера
+docker exec $N crictl pods --name postgres-0       # песочницы (pause) подов
+ID=$(docker exec $N crictl ps -q --name postgres)  # только идентификатор контейнера
+docker exec $N crictl logs --tail=20 $ID           # последние 20 строк лога
+docker exec $N crictl logs -f $ID                  # то же со слежением
+docker exec $N crictl inspect $ID                  # JSON: pid, mounts, cgroup
+docker exec -it $N crictl exec -it $ID sh          # команда внутри контейнера
+docker exec $N crictl images                       # образы на узле
+docker exec $N crictl stats                        # использование CPU и памяти
+docker exec lab-control-plane crictl ps --name kube-apiserver   # API-сервер при лежащем API
 ```
 
-## A.4. Диагностика по STATUS
+Частые ошибки:
 
-| STATUS | Смотреть |
-|---|---|
-| Pending (без узла) | `FailedScheduling` целиком; нет событий — scheduler |
-| ContainerCreating долго | события пода: `FailedMount`, `FailedCreatePodSandBox` |
-| ImagePullBackOff | `state.waiting.message`: not found / 401 / 429 / DNS |
-| CreateContainerConfigError | нет ConfigMap/Secret/ключа |
-| CrashLoopBackOff / Error | `logs` (`--previous`), `lastState.exitCode` |
-| OOMKilled 137 | лимит памяти, событий нет |
-| RunContainerError / StartError 128 | бинарника/команды нет |
-| Running 0/1 | `Unhealthy` — readiness |
-| Terminating долго | grace, finalizers, узел недоступен |
-| Evicted | `status.message`: давление узла или ephemeral-storage |
+- `permission denied` на сокете: на обычном узле нужен `sudo crictl …`.
+- `connect: no such file or directory`: crictl не нашёл runtime, задайте `--runtime-endpoint`.
+- `docker ps` на узле с containerd пуст: Docker там нет, контейнеры показывает только crictl.
+- `crictl rm` на живом узле: kubelet пересоздаст контейнер, на проде так не делают.
 
-## A.5. Helm 4
+Подробно: карточка crictl в 00-2 §4, устройство узла — 01-2.
+
+## A.4. journalctl для kubelet
+
+Kubelet и containerd пишут в journald, а не в файлы. Журнал читают на самом узле; на стенде команды идут через `docker exec`.
 
 ```bash
-helm repo add bitnami https://charts.bitnami.com/bitnami && helm repo update
-helm search repo postgresql --versions | head
-helm pull oci://registry-1.docker.io/bitnamicharts/postgresql --version X   # OCI
-helm show values chart > values.yaml
-helm template rel ./chart -f values.yaml | kubeconform -strict              # рендер + проверка
-helm lint ./chart
-helm upgrade --install rel ./chart -n ns --create-namespace -f values.yaml --wait --timeout 5m --rollback-on-failure
-helm list -A; helm history rel; helm get values rel; helm get manifest rel
-helm rollback rel 3
-helm uninstall rel                                              # PVC StatefulSet остаются
+N=lab-worker                                       # узел, на котором работаем
+docker exec $N systemctl is-active kubelet         # active, inactive или failed
+docker exec $N journalctl -u kubelet -n 50 --no-pager          # последние 50 строк
+docker exec $N journalctl -u kubelet --since -10min --no-pager # журнал за 10 минут
+docker exec $N journalctl -u kubelet --since -1min --no-pager | grep PLEG   # поиск по тексту
+docker exec $N journalctl -u containerd -p err --no-pager      # только ошибки containerd
+docker exec $N journalctl -k --no-pager | grep -i 'out of memory'   # журнал ядра, OOM
+docker exec $N ls /var/log/pods                    # файлы логов контейнеров (не journald)
+kubectl get --raw "/api/v1/nodes/$N/proxy/logs/?query=kubelet&tailLines=50"   # через API
 ```
 
-`another operation is in progress` → `helm history` → `helm rollback rel <последняя deployed>`.
+Частые ошибки:
 
-## A.6. Kustomize
+- Без `--no-pager` вывод открывается в pager и скрипт зависает.
+- Логи подов ищут в journald, а они лежат в `/var/log/pods/<namespace>_<под>_<uid>/`.
+- Запрос через API закрыт настройками kubelet и требует право `nodes/proxy`. При аварии на него не рассчитывают.
 
-```yaml
-# overlays/prod/kustomization.yaml
-resources: [../../base]
-namespace: orders
-images: [{name: orders-api, newName: localhost:5001/orders-api, newTag: "2.1"}]
-replicas: [{name: orders-api, count: 4}]
-patches: [{path: resources.yaml}]
-configMapGenerator: [{name: orders-config, literals: [MODE=prod]}]   # хэш в имени → rollout
-```
+Подробно: журналы компонентов в 11-4 §3 и 11-1 §3, карточка crictl в 00-2 §4.
+
+## A.5. etcdctl и etcdutl
+
+etcdctl читает живой etcd по mTLS, а etcdutl работает с файлами снимков без сервера. Переменные `E` и `X` собирают сертификаты и вход в под etcd.
 
 ```bash
-kubectl kustomize overlays/prod | less
-kubectl apply -k overlays/prod --server-side
-kubectl diff -k overlays/prod
+E='etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt'
+E+=' --cert=/etc/kubernetes/pki/etcd/server.crt --key=/etc/kubernetes/pki/etcd/server.key'
+X='kubectl -n kube-system exec etcd-lab-control-plane --'
+$X $E endpoint health                              # отвечает ли etcd на запрос
+$X $E endpoint status -w table                     # лидер, версия, размер базы, ревизия
+$X $E member list -w table                         # члены кластера etcd
+$X $E get /registry/configmaps --prefix --keys-only   # имена ключей с префиксом
+$X $E get /registry/pods --prefix --count-only     # только число ключей
+$X $E alarm list                                   # активные тревоги, например NOSPACE
+REV=$($X $E endpoint status -w json | jq '.[0].Status.header.revision')   # текущая ревизия
+$X $E compact $REV                                 # удалить историю до этой ревизии
+$X $E defrag                                       # дефрагментировать член, по одному за раз
+$X $E alarm disarm                                 # снять тревогу после очистки
+etcdctl --endpoints=https://127.0.0.1:2379 snapshot save /backup/etcd.db   # снимок (в поде)
+etcdutl snapshot status /backup/etcd.db -w table   # хеш, ревизия, число ключей, размер
+etcdutl snapshot restore /backup/etcd.db --data-dir /var/lib/etcd-restored \
+  --bump-revision=1000000000 --mark-compacted      # восстановить в новый каталог
 ```
 
-## A.7. Argo CD
+Частые ошибки:
+
+- `context deadline exceeded`: неверный адрес, etcd не запущен или нет кворума.
+- `x509: certificate signed by unknown authority`: не заданы или перепутаны `--cacert`, `--cert`, `--key`.
+- `snapshot status` и `snapshot restore` есть только в etcdutl: из etcdctl 3.6 их убрали.
+- Снимок хранят как пароль: Secret в нём лежат открытым текстом, если нет шифрования.
+
+Подробно: карточка etcdctl в 01-1 §4, снимки, восстановление и тревоги — 10-2 §3–5. Команда `restore` в 10-2 дополняется флагами `--name`, `--initial-cluster` и `--initial-advertise-peer-urls`.
+
+## A.6. kubeadm
+
+kubeadm пишет файлы на узел и объекты в кластер. Команды запускают на узлах control plane, поэтому на стенде они идут через `docker exec`.
 
 ```bash
-argocd login <host> --sso|--username admin
-argocd app list; argocd app get orders --refresh
-argocd app diff orders; argocd app sync orders [--prune]
-argocd app history orders; argocd app rollback orders <id>     # при auto-sync перезапишется — откат через git revert
-kubectl -n argocd get applications -o wide
+kubeadm init --config kubeadm.yaml --upload-certs  # создать первый узел control plane
+kubeadm token create --print-join-command          # новый токен и готовая команда join
+kubeadm join ADDR:6443 --token TOKEN \
+  --discovery-token-ca-cert-hash sha256:HASH       # добавить рабочий узел
+kubeadm config print init-defaults                 # значения по умолчанию, формат v1beta4
+kubeadm config migrate --old-config old.yaml --new-config new.yaml   # v1beta3 → v1beta4
+kubeadm config images list                         # образы, нужные этой версии
+kubeadm certs check-expiration                     # сроки всех сертификатов
+sudo kubeadm certs renew all                       # продлить листовые сертификаты и kubeconfig
+sudo apt-mark unhold kubeadm                       # снять запрет обновления пакета
+sudo kubeadm upgrade plan                          # до каких версий можно обновиться
+sudo kubeadm upgrade apply v1.36.5                 # обновить первый узел control plane
+sudo kubeadm upgrade node                          # остальные узлы, после пакета kubeadm
+sudo apt-mark hold kubeadm                         # снова закрепить версию пакета
+kubeadm reset                                      # убрать с узла всё, что создал kubeadm
 ```
 
-Аннотации: `argocd.argoproj.io/sync-wave: "1"`, `argocd.argoproj.io/hook: PreSync`, `argocd.argoproj.io/sync-options: Prune=false`.
+Частые ошибки:
 
-## A.8. Узел: crictl, journalctl, systemctl (в kind — `docker exec <узел> …`)
+- `could not find a JWS signature in the cluster-info ConfigMap`: токен истёк или в нём опечатка.
+- `cluster CA found in cluster-info ConfigMap is invalid`: хеш CA в команде не тот.
+- `[ERROR FileAvailable--etc-kubernetes-manifests-…]`: узел уже использовался, сначала `kubeadm reset`.
+- После `certs renew` забыли перезапустить static pods и выдать свежий `admin.conf`.
+
+Подробно: карточка kubeadm в 10-1 §3, обновление — 10-3 §3, сертификаты — 10-4.
+
+## A.7. helm 4 и helm-diff
+
+Helm рендерит чарт на вашей машине и хранит историю релиза в Secret. Плагин helm-diff показывает разницу до `upgrade`.
 
 ```bash
-crictl ps -a [--name api]; crictl pods; crictl images
-crictl logs [--tail=50] <id>; crictl inspect <id> | less
-crictl rmi --prune                      # образы kind load удаляются только по имени
-journalctl -u kubelet --since -10min --no-pager | grep -iE 'error|fail'
-journalctl -u containerd --since -10min --no-pager
-systemctl status kubelet containerd
-cat /var/lib/kubelet/config.yaml        # evictionHard, cgroupDriver, …
-ls /etc/kubernetes/manifests            # static pods control plane
-df -h /var/lib/containerd /var/lib/kubelet; du -sh /var/log/pods/* | sort -h | tail
+helm lint ./demo --strict                          # проверить чарт, предупреждения как ошибки
+helm template r ./demo -n ns                       # отрендерить манифесты без кластера
+helm install r ./demo -n ns --wait                 # поставить релиз и дождаться готовности
+helm upgrade --install r ./demo -n ns \
+  -f prod.yaml --set image.tag=2.1                 # установить или обновить одной командой
+helm upgrade r ./demo -n ns --rollback-on-failure --timeout 5m   # при ошибке откатить сам
+helm list -n ns                                    # релизы в namespace
+helm status r -n ns                                # статус и NOTES релиза
+helm history r -n ns                               # все ревизии с описанием
+helm get values r -n ns                            # значения, которые передали вы
+helm get manifest r -n ns                          # манифест, ушедший в кластер
+helm rollback r 1 -n ns                            # вернуться к ревизии 1 (новая ревизия)
+helm uninstall r -n ns                             # удалить релиз и его объекты
+helm show values CHART --version X                 # значения чужого чарта по умолчанию
+helm pull CHART --version X --untar                # скачать чарт и распаковать шаблоны
+helm diff upgrade r CHART -n ns -f prod.yaml --detailed-exitcode   # разница; код 2 — есть
+helm diff revision r 1 2 -n ns                     # сравнить две ревизии релиза
+helm plugin list                                   # установленные плагины
 ```
 
-## A.9. Control plane и etcd
+Частые ошибки:
+
+- `another operation (install/upgrade/rollback) is in progress`: релиз завис в `pending-*`, смотрите `helm history`.
+- `--reuse-values` не подхватывает новые значения по умолчанию из обновлённого чарта. В CI передавайте полный набор `-f`.
+- `helm template oci://…` в Helm 4 печатает строки `Pulled:` и `Digest:` перед манифестами. Для OCI сначала `helm pull`.
+- helm-diff без `--three-way-merge` не видит ручных правок кластера.
+
+Подробно: карточка helm в 07-1 §3, карточка helm-diff и установка плагина с проверкой подписи — 07-2 §3.
+
+## A.8. kustomize
+
+Kustomize встроен в kubectl и печатает обычный YAML. Отдельный бинарник нужен для `kustomize edit`.
 
 ```bash
-kubectl get --raw '/livez?verbose'; kubectl get --raw /livez/etcd
-kubectl -n kube-system get lease kube-scheduler kube-controller-manager
-E="kubectl -n kube-system exec etcd-lab-control-plane -- etcdctl --endpoints=https://127.0.0.1:2379 \
-  --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
-  --key=/etc/kubernetes/pki/etcd/healthcheck-client.key"
-$E endpoint status -w table; $E endpoint health; $E alarm list
-kubeadm certs check-expiration; kubeadm certs renew all        # затем перезапустить static pods
-kubeadm upgrade plan; kubeadm upgrade apply v1.36.5            # на первом control-plane
+kubectl kustomize overlays/prod                    # собрать и вывести YAML, кластер не нужен
+kubectl kustomize overlays/prod > /tmp/prod.yaml   # сохранить сборку как артефакт
+kubectl apply -k overlays/prod                     # собрать и применить в кластер
+kubectl apply -k overlays/prod --dry-run=server    # проверить на сервере, не применяя
+kubectl diff -k overlays/prod                      # разница с кластером; код 1 — есть правки
+kubectl get -k overlays/prod                       # состояние объектов сборки
+kubectl delete -k overlays/prod                    # удалить все объекты сборки
+kubectl kustomize --enable-helm DIR                # разрешить helmCharts (нужен helm в PATH)
+kubectl kustomize --enable-helm DIR | kubectl apply -f -   # применить сборку с Helm
+kustomize edit set image localhost:5001/orders-api:2.1     # сменить тег в images
+kustomize edit fix                                 # перевести устаревшие поля на новые
+kubectl version --client                           # строка Kustomize Version встроенной сборки
 ```
 
-## A.10. kind
+Частые ошибки:
+
+- `kubectl apply -k` не принимает `--enable-helm`: сборку с Helm пускают через конвейер.
+- Файл вне каталога kustomization не читается: сработал ограничитель загрузки.
+- Метки попали в селектор Deployment, и обновление отклонено.
+- Kustomize старше 5.8.1 с Helm 4 в PATH: сборка с `helmCharts` падает.
+
+Подробно: карточка Kustomize в 07-3 §3, поломки — 07-3 §5.
+
+## A.9. argocd
+
+CLI не читает Git и кластер сам: он вызывает API сервера Argo CD. Версия CLI должна совпадать с версией сервера (3.5.5).
 
 ```bash
-kind get clusters; kind get nodes --name lab
-kind load docker-image localhost:5001/orders-api:2.1 --name lab
-kind export kubeconfig --name lab
-docker exec -it lab-worker bash                                # «зайти на узел»
-bash kubernetes/lab/lab-up.sh | lab-down.sh [--purge]          # стенд курса (приложение C)
+argocd login 127.0.0.1:8443 --insecure --username admin   # войти, токен сохранится
+argocd version --client                            # версия CLI
+argocd app list                                    # все Application: sync, health, источник
+argocd app get orders-staging --refresh            # состояние; refresh перечитывает Git
+argocd app diff orders-staging                     # разница Git и кластера; код 1 — есть
+argocd app sync orders-staging                     # применить Git сейчас
+argocd app sync orders-staging --dry-run           # показать, что бы применилось
+argocd app wait orders-staging --sync --health --timeout 300   # ждать Synced и Healthy
+argocd app history orders-staging                  # применённые ревизии с номерами
+argocd app set orders-staging --sync-policy none   # выключить автоматическую синхронизацию
+argocd app rollback orders-staging 3               # вернуть ревизию 3 (auto-sync выключен)
+argocd app delete orders-staging                   # удалить Application, по умолчанию с объектами
+argocd app get orders-staging -o json | jq -r '.status.sync.status'   # статус для скрипта
+argocd repo list                                   # подключённые репозитории
+argocd account generate-token --account ci         # токен для CI вместо пароля
 ```
 
-## A.11. Числа, которые спрашивают
+Частые ошибки:
 
-| Что | Значение |
-|---|---|
-| NotReady узла | 50 с (`node-monitor-grace-period`, с 1.32; раньше 40 с) |
-| Эвикция с недоступного узла | 300 с (`tolerationSeconds`) |
-| Back-off рестартов | 10 с → … → 5 мин, сброс после 10 мин работы |
-| `terminationGracePeriodSeconds` | 30 с |
-| `maxSurge`/`maxUnavailable` | 25 %/25 % |
-| `progressDeadlineSeconds` | 600 с |
-| `revisionHistoryLimit` | 10 |
-| Job `backoffLimit` | 6 |
-| HPA: цикл / окно уменьшения | 15 с / 300 с |
-| NodePort | 30000–32767 |
-| Подов на узел | 110 |
-| ConfigMap/Secret | ≤ 1 МиБ |
-| Квота etcd | 2 ГиБ |
-| Таймаут вебхука | 10 с по умолчанию, ≤ 30 с |
-| Сертификаты kubeadm / CA | 1 год / 10 лет |
-| Skew kubelet / kubectl | до −3 минора / ±1 |
-| DNS | `ndots:5`, таймаут резолвера 5 с |
-| Envoy Gateway | connect timeout 10 с, таймаут маршрута 15 с (наблюдалось на стенде, 11-2) |
+- Без `--insecure` вход не проходит, если сервер отдаёт самоподписанный сертификат.
+- `rollback` отказывает при включённом auto-sync: сначала `app set --sync-policy none`.
+- После свежего коммита `diff` пуст: контроллер ещё не сравнил, выполните refresh.
+- `login` ждёт до тайм-аута: порт-форвард к серверу упал или не запущен.
+
+Подробно: карточка argocd в 08-1 §3, диагностика — 08-1 §4–5.
+
+## A.10. cosign
+
+cosign подписывает дайджест образа и кладёт подпись в тот же реестр. Образ всегда задают по дайджесту, а не по тегу.
+
+```bash
+cosign version                                     # версия (на стенде v2.5.3)
+cosign generate-key-pair                           # создать cosign.key и cosign.pub
+D=sha256:HEX          # дайджест из заголовка Docker-Content-Digest реестра (06-4, шаг 2)
+COSIGN_PASSWORD='' cosign sign --key cosign.key --yes --tlog-upload=false \
+  localhost:5001/lab-06-4/orders-api@$D              # подписать дайджест, без записи в Rekor
+cosign verify --key cosign.pub --insecure-ignore-tlog=true \
+  localhost:5001/lab-06-4/orders-api@$D            # проверить подпись открытым ключом
+cosign triangulate localhost:5001/lab-06-4/orders-api@$D   # где лежит подпись в реестре
+curl -s http://localhost:5001/v2/lab-06-4/orders-api/tags/list     # теги и тег .sig в реестре
+```
+
+Частые ошибки:
+
+- `no signatures found` или `no matching signatures`: подписали другой дайджест или ключ не тот.
+- `http: server gave HTTP response to HTTPS client`: реестр без TLS, добавьте `--allow-insecure-registry`.
+- Подпись по тегу: тег переместили, и проверка проверяет не тот образ. Работайте с дайджестом.
+- Флаги `--tlog-upload=false` и `--insecure-ignore-tlog=true` годятся только для учебного стенда.
+
+Подробно: карточка cosign и работа 3 в 06-4, политика образов — 06-4 §3.
+
+## A.11. velero
+
+Velero копирует объекты namespace и файлы томов в бакет S3 и возвращает их на живой кластер. Снимок etcd он не заменяет. Флаг `--namespace` указывает namespace установки.
+
+```bash
+velero backup-location get --namespace lab-04-3   # доступен ли бакет: Available или Unavailable
+velero backup create demo --include-namespaces lab-04-3-demo --wait --namespace lab-04-3
+velero backup get --namespace lab-04-3             # список бэкапов и их фаз
+velero backup describe demo --details --namespace lab-04-3     # состав и скопированные тома
+velero restore create --from-backup demo --namespace lab-04-3  # восстановить из бэкапа
+kubectl -n lab-04-3 logs deploy/velero             # лог сервера при Unavailable
+velero uninstall --namespace lab-04-3              # удалить Velero вместе с CRD и namespace
+```
+
+Частые ошибки:
+
+- Том не скопирован: нет аннотации `backup.velero.io/backup-volumes` (режим opt-in). Восстановленный PVC пуст.
+- Фаза `Unavailable`: неверный `s3Url`, ключи или нет `s3ForcePathStyle=true`.
+- Фаза `PartiallyFailed` считается ошибкой: часть объектов или томов не сохранена.
+- Клиент и сервер из разных релизов.
+
+Подробно: карточка Velero и работа 3 в 04-3, поломки — 04-3 §5.
+
+## A.12. tcpdump и netshoot
+
+В узлах kind tcpdump нет. Контейнер netshoot делит network namespace узла и показывает его интерфейсы. Контейнер не привилегированный, ничего не монтирует с хоста.
+
+```bash
+docker pull nicolaka/netshoot:v0.13                # образ с tcpdump (около 540 МБ на диске)
+IPB=$(kubectl get pod p-lab-worker2 -o jsonpath='{.status.podIP}')   # адрес пода
+docker run --rm --net=container:lab-worker2 nicolaka/netshoot:v0.13 \
+  timeout 10 tcpdump -n -t -p -i eth0 -c 4 "icmp and host $IPB"   # захват на eth0 узла
+tcpdump -n -i eth0 host 10.244.3.69                # без DNS-запросов, один интерфейс, адрес
+tcpdump -n -t -i any -c 5 tcp port 80              # без времени, все интерфейсы, 5 пакетов
+tcpdump -n -e -i eth0 arp                          # печатать MAC-адреса
+tcpdump -n -i eth0 -w /tmp/a.pcap                  # записать в файл для Wireshark
+```
+
+Частые ошибки:
+
+- Нет `-n`: утилита ждёт DNS-ответов и вывод тормозит.
+- Захват на хосте, а не в namespace узла: интерфейсов пода не видно.
+- `-i any` показывает один пакет несколько раз, по разу на каждом интерфейсе.
+- Нет фильтра: вывод тонет в чужом трафике.
+
+Подробно: карточка tcpdump и работа 2 в 03-1, поломки сети — 11-3.
+
+## A.13. ingress2gateway
+
+ingress2gateway читает Ingress и печатает Gateway и HTTPRoute. Манифесты идут в stdout, предупреждения в stderr. Результат проверяет человек.
+
+```bash
+ingress2gateway print --input-file ingress.yaml --providers=ingress-nginx \
+  --emitter envoy-gateway > gateway.yaml           # из файла, кластер не нужен
+ingress2gateway print --providers=ingress-nginx --namespace lab-03-5      # из одного namespace
+ingress2gateway print --providers=ingress-nginx --all-namespaces          # инвентаризация всех
+kubectl apply -f gateway.yaml --dry-run=server     # проверить результат на сервере
+kubectl diff -f gateway.yaml                       # что изменится в кластере
+```
+
+Частые ошибки:
+
+- Вывод принят за готовый: предупреждения нужно читать, `gatewayClassName` и имена listener'ов править.
+- Regex и таймауты переводятся приблизительно.
+- Нужен Go 1.25.5 или новее для `go install`; в Ubuntu 24.04 проще взять готовый файл релиза.
+
+Подробно: карточка ingress2gateway и работа 3 в 03-5, Gateway API — 03-4.
+
+## A.14. stern и k9s
+
+stern склеивает логи многих подов в один поток, k9s показывает объекты в терминале в реальном времени. Оба ходят в API-сервер с вашими правами.
+
+```bash
+stern -n orders orders-api                         # хвост логов подов, чьё имя подходит
+stern -n orders -l app=orders-api                  # то же, но по метке
+stern -n orders orders-api --tail 5                # начать с пяти последних строк
+stern -n orders orders-api -c api --since 10m      # один контейнер, логи за 10 минут
+stern -A 'orders|postgres' --no-follow             # все namespace, без слежения
+k9s --readonly -n orders                           # запуск без права менять и удалять
+:pods                                              # внутри k9s: список подов (также :deploy, :ns)
+/текст                                             # внутри k9s: фильтр по подстроке, Esc сбрасывает
+d                                                  # внутри k9s: describe выбранного объекта
+l                                                  # внутри k9s: логи выбранного пода
+0                                                  # внутри k9s: все namespace
+:q                                                 # выйти из k9s
+```
+
+Частые ошибки:
+
+- Слишком широкий шаблон имени: поток забит чужими логами.
+- Забыт `-n`: stern ищет только в текущем namespace.
+- k9s без `--readonly` на чужом кластере: одно подтверждение удаляет объект.
+- k9s не запускается без терминала, например в CI.
+
+Подробно: карточки stern и k9s в 00-2 §4, работа 3 в 00-2.
+
+---
+
+Связанные приложения: B (Manjaro и Ubuntu), C (запуск и сброс стенда), D (глоссарий RU и EN), E (что читать дальше).
