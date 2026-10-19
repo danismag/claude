@@ -278,7 +278,7 @@ Velero в режиме opt-in не копирует тома без аннота
 
 ## Лабораторные работы
 
-Работы 1 и 2 идут на стенде 00-1 в namespace `orders`: он содержит демо-базу, и именно её мы бэкапим и теряем. Работа 3 идёт в собственных namespace `lab-04-3` (Velero и MinIO) и `lab-04-3-demo` (данные для бэкапа). Файлы лежат в `~/lab/k8s/04-3/`.
+Работы 1 и 2 идут на стенде 00-1 в namespace `orders`: он содержит демо-базу, и именно её мы бэкапим и теряем. Работа 3 идёт в собственных namespace `lab-04-3` (Velero и шлюз S3) и `lab-04-3-demo` (данные для бэкапа). Файлы лежат в `~/lab/k8s/04-3/`.
 
 Подготовку выполняют один раз: выбирают контекст стенда и создают каталог.
 
@@ -810,46 +810,50 @@ curl -s http://orders.localhost:8088/api/orders | jq -c '[.orders[].item]'
 
 Эту работу вы выполняете сами, результаты в ней — ожидаемые.
 
-**Цель.** Поставить Velero с MinIO как хранилищем, сделать бэкап namespace вместе с данными тома, удалить namespace и восстановить его, затем сравнить результат со снапшотом etcd.
-
-**Что понадобится.** Стенд 00-1, доступ с хоста к GitHub и `quay.io`, около 1 ГиБ диска. Версии закреплены:
-
-- Velero v1.18.4 — последний релиз на GitHub от 2026-09-28.
-- Плагин AWS v1.14.0 — по таблице совместимости репозитория плагина.
-- MinIO `RELEASE.2025-09-07T16-13-09Z` и клиент `mc` `RELEASE.2025-08-13T08-35-41Z`.
-
 **Риски.**
 
-- Что меняется: установка Velero создаёт около 15 CRD и ClusterRoleBinding с правами `cluster-admin` для ServiceAccount Velero.
-- Нагрузка: агент Velero (DaemonSet) читает `/var/lib/kubelet/pods` на каждом узле и занимает 100–200 МиБ памяти.
+- Что меняется: установка Velero создаёт набор CRD группы `velero.io` и ClusterRoleBinding с правами `cluster-admin` для ServiceAccount Velero.
+- Нагрузка: агент Velero (DaemonSet) монтирует с каждого узла `/var/lib/kubelet/pods` и `/var/lib/kubelet/plugins`. Лимитов у агента по умолчанию нет, а сервер Velero запрашивает 500m CPU и 128 МиБ памяти с лимитом 1 CPU и 512 МиБ.
 - Узел: шаг 7 временно кладёт файл снапшота в `/var/lib/etcd` узла `lab-control-plane`.
 - Хост: создаётся каталог с бинарным файлом Velero и файлами ключей с правами 600.
 - Откат: уборка удаляет Velero, CRD, оба namespace и файлы ключей.
+
+**Цель.** Поставить Velero с S3-хранилищем в кластере, сделать бэкап namespace вместе с данными тома, удалить namespace и восстановить его, затем сравнить результат со снапшотом etcd.
+
+**Что понадобится.** Стенд 00-1, доступ с хоста к GitHub и Docker Hub, около 1 ГиБ диска. Версии закреплены:
+
+- Velero v1.18.4 — последний релиз на GitHub от 28 сентября 2026 года.
+- Плагин `velero-plugin-for-aws` v1.14.4 — ветка v1.14.x совместима с Velero v1.18.x по таблице репозитория плагина.
+- S3-шлюз `versity/versitygw:v1.8.0` и клиент `amazon/aws-cli:2.37.0`.
+
+Разработчики проверили Velero v1.18 на Kubernetes 1.33–1.35. Ожидаемая совместимость в README — «1.18 и новее», так что версия 1.36 на стенде в неё входит, хотя отдельно не проверялась.
+
+Хранилищем служит **VersityGW** (Versity S3 Gateway) — шлюз, который отдаёт каталог файловой системы по протоколу S3: каждый подкаталог корня становится бакетом. Раньше учебные стенды брали MinIO, но его community-версия перешла на выпуск только исходного кода, а репозиторий `minio/minio` архивирован 25 апреля 2026 года. Для Velero подходит любое S3-совместимое хранилище, поэтому команды работы меняются только в адресе и ключах.
 
 **Схема опыта.**
 
 ```
  namespace lab-04-3                          namespace lab-04-3-demo
  ┌──────────────────────────────┐            ┌────────────────────────┐
- │ MinIO (бакет velero)         │◄── Kopia ──┤ Deployment + PVC       │
+ │ VersityGW (бакет velero)     │◄── Kopia ──┤ Deployment + PVC       │
  │ Velero server + node-agent   │            │ ConfigMap, файл note   │
  └──────────────────────────────┘            └────────────────────────┘
    delete ns lab-04-3-demo  ──►  velero restore  ──►  объекты и файл вернулись
 ```
 
-Схема 7. Velero и MinIO живут в `lab-04-3`, бэкапится `lab-04-3-demo`. Бакет лежит внутри кластера: на стенде это учебная замена хранилища вне кластера.
+Схема 7. Velero и шлюз S3 живут в `lab-04-3`, бэкапится `lab-04-3-demo`. Бакет лежит внутри кластера: на стенде это учебная замена хранилища вне кластера.
 
 #### Шаг 1. Скачать клиент Velero
 
-Команда скачивает CLI в каталог работы, распаковывает его и сверяет контрольную сумму с файлом релиза.
+Команда скачивает CLI в каталог работы, сверяет контрольную сумму с файлом релиза и распаковывает бинарный файл.
 
 ```bash
 mkdir -p ~/lab/k8s/04-3/bin && cd ~/lab/k8s/04-3/bin
 V=v1.18.4
 BASE=https://github.com/vmware-tanzu/velero/releases/download/$V
 curl -fLO $BASE/velero-$V-linux-amd64.tar.gz
-curl -fLO $BASE/velero-$V-checksums.txt
-sha256sum -c --ignore-missing velero-$V-checksums.txt
+curl -fLO $BASE/CHECKSUM
+sha256sum -c --ignore-missing CHECKSUM
 tar xzf velero-$V-linux-amd64.tar.gz --strip-components=1 velero-$V-linux-amd64/velero
 ./velero version --client-only
 ```
@@ -858,6 +862,7 @@ tar xzf velero-$V-linux-amd64.tar.gz --strip-components=1 velero-$V-linux-amd64/
 |---|---|
 | `V=v1.18.4` | закреплённая версия клиента и сервера |
 | `curl -fLO` | скачать файл по имени, следуя редиректам, с ошибкой при коде 4xx |
+| `CHECKSUM` | файл релиза с суммами SHA-256 всех архивов |
 | `sha256sum -c --ignore-missing` | сверить только скачанные файлы с файлом сумм |
 | `--strip-components=1` | положить бинарь прямо в текущий каталог |
 | `version --client-only` | показать версию клиента, не обращаясь к кластеру |
@@ -873,115 +878,117 @@ Client:
 
 Разбор: строка `OK` подтверждает целостность архива. Клиент и сервер Velero должны быть одной версии, поэтому та же `v1.18.4` закреплена в шаге 3.
 
-#### Шаг 2. Поднять MinIO и создать бакет
+#### Шаг 2. Поднять шлюз S3 и создать бакет
 
-Команды создают namespace, генерируют ключи доступа, запускают MinIO и Job, который создаёт бакет `velero`.
+Команды создают namespace, генерируют ключи доступа и собирают из них Secret и файл учётных данных для Velero.
 
 ```bash
 cd ~/lab/k8s/04-3
 kubectl create ns lab-04-3
 umask 077
-printf 'lab04user' > minio-user
-openssl rand -hex 16 > minio-pass
-kubectl -n lab-04-3 create secret generic minio-creds \
-  --from-file=MINIO_ROOT_USER=minio-user --from-file=MINIO_ROOT_PASSWORD=minio-pass
+printf 'lab04user' > s3-user
+openssl rand -hex 16 > s3-pass
+kubectl -n lab-04-3 create secret generic s3-creds \
+  --from-file=ROOT_ACCESS_KEY_ID=s3-user --from-file=ROOT_SECRET_ACCESS_KEY=s3-pass
 printf '[default]\naws_access_key_id=%s\naws_secret_access_key=%s\n' \
-  "$(cat minio-user)" "$(cat minio-pass)" > credentials-velero
+  "$(cat s3-user)" "$(cat s3-pass)" > credentials-velero
 ```
 
 | Часть команды | Значение |
 |---|---|
 | `umask 077` | новые файлы доступны только владельцу |
-| `openssl rand -hex 16` | сгенерировать случайный пароль, а не писать в команду |
+| `openssl rand -hex 16` | сгенерировать случайный пароль, а не писать его в команду |
 | `--from-file=KEY=файл` | положить содержимое файла в ключ Secret |
+| `ROOT_ACCESS_KEY_ID` | переменная, из которой VersityGW читает корневой ключ |
 | `printf … > credentials-velero` | собрать файл ключей в формате AWS для Velero |
 
-Секрет и файл ключей создаются без пароля в командной строке. Теперь манифест MinIO и Job бакета.
+Секрет и файл ключей создаются без пароля в командной строке. Теперь манифест шлюза и Job, который создаёт бакет через API S3.
 
 ```bash
-cat > minio.yaml <<'EOF'
+cat > s3.yaml <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: minio, namespace: lab-04-3}
+metadata: {name: s3, namespace: lab-04-3}
 spec:
   replicas: 1
-  selector: {matchLabels: {app: minio}}
+  selector: {matchLabels: {app: s3}}
   template:
-    metadata: {labels: {app: minio}}
+    metadata: {labels: {app: s3}}
     spec:
       containers:
-      - name: minio
-        image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
-        args: ["server", "/data", "--console-address", ":9001"]
-        envFrom: [{secretRef: {name: minio-creds}}]
-        ports: [{containerPort: 9000}]
+      - name: versitygw
+        image: versity/versitygw:v1.8.0
+        args: ["--port", ":7070", "posix", "/data"]
+        envFrom: [{secretRef: {name: s3-creds}}]
+        ports: [{containerPort: 7070}]
         resources: {limits: {memory: 512Mi, cpu: "500m"}}
         volumeMounts: [{name: data, mountPath: /data}]
       volumes: [{name: data, emptyDir: {sizeLimit: 1Gi}}]
 ---
 apiVersion: v1
 kind: Service
-metadata: {name: minio, namespace: lab-04-3}
+metadata: {name: s3, namespace: lab-04-3}
 spec:
-  selector: {app: minio}
-  ports: [{port: 9000, targetPort: 9000}]
+  selector: {app: s3}
+  ports: [{port: 7070, targetPort: 7070}]
 ---
 apiVersion: batch/v1
 kind: Job
-metadata: {name: minio-mb, namespace: lab-04-3}
+metadata: {name: s3-mb, namespace: lab-04-3}
 spec:
   backoffLimit: 6
   template:
     spec:
       restartPolicy: OnFailure
       containers:
-      - name: mc
-        image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
-        envFrom: [{secretRef: {name: minio-creds}}]
-        command:
-        - sh
-        - -ec
-        - |
-          mc alias set m http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
-          mc mb --ignore-existing m/velero
+      - name: mb
+        image: amazon/aws-cli:2.37.0
+        args: ["s3", "mb", "s3://velero", "--endpoint-url", "http://s3:7070"]
+        env:
+        - {name: AWS_DEFAULT_REGION, value: us-east-1}
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom: {secretKeyRef: {name: s3-creds, key: ROOT_ACCESS_KEY_ID}}
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom: {secretKeyRef: {name: s3-creds, key: ROOT_SECRET_ACCESS_KEY}}
 EOF
-kubectl apply -f minio.yaml
-kubectl -n lab-04-3 rollout status deploy/minio --timeout=180s
-kubectl -n lab-04-3 wait --for=condition=Complete job/minio-mb --timeout=120s
-kubectl -n lab-04-3 logs job/minio-mb
+kubectl apply -f s3.yaml
+kubectl -n lab-04-3 rollout status deploy/s3 --timeout=180s
+kubectl -n lab-04-3 wait --for=condition=Complete job/s3-mb --timeout=120s
+kubectl -n lab-04-3 logs job/s3-mb
 ```
 
 | Часть команды | Значение |
 |---|---|
+| `--port :7070 posix /data` | слушать порт 7070 и хранить бакеты в каталоге `/data` |
 | `envFrom: secretRef` | передать ключи Secret как переменные окружения |
 | `emptyDir: sizeLimit: 1Gi` | данные бакета живут, пока жив под; лимит 1 ГиБ |
 | `resources.limits` | не больше 512 МиБ памяти и 0,5 ядра |
-| `mc alias set m …` | запомнить адрес и ключи сервера под именем `m` |
-| `mc mb --ignore-existing` | создать бакет, если его ещё нет |
+| `s3 mb s3://velero` | создать бакет `velero` запросом API S3 |
+| `--endpoint-url http://s3:7070` | обращаться к шлюзу в кластере, а не к AWS |
 
 Ожидаемый результат:
 
 ```
-deployment "minio" successfully rolled out
-job.batch/minio-mb condition met
-Added `m` successfully.
-Bucket created successfully `m/velero`.
+deployment "s3" successfully rolled out
+job.batch/s3-mb condition met
+make_bucket: velero
 ```
 
-Разбор: MinIO готов, бакет `velero` создан. Job при необходимости повторяет попытки до 6 раз, пока сервер не запустится.
+Разбор: шлюз готов, бакет `velero` создан. Job при необходимости повторяет попытки до 6 раз, пока шлюз не начнёт отвечать. Если под шлюза падает с `xattr check failed`, файловая система под `emptyDir` не поддерживает расширенные атрибуты, в которых VersityGW хранит метаданные объектов.
 
 #### Шаг 3. Установить Velero
 
-Команда ставит сервер Velero, агента на узлах и плагин AWS, и указывает на MinIO как на хранилище S3.
+Команда ставит сервер Velero, агента на узлах и плагин AWS и указывает на шлюз как на хранилище S3.
 
 ```bash
 ~/lab/k8s/04-3/bin/velero install --namespace lab-04-3 \
   --provider aws \
   --image velero/velero:v1.18.4 \
-  --plugins velero/velero-plugin-for-aws:v1.14.0 \
+  --plugins velero/velero-plugin-for-aws:v1.14.4 \
   --bucket velero \
   --secret-file ~/lab/k8s/04-3/credentials-velero \
-  --backup-location-config region=minio,s3ForcePathStyle=true,s3Url=http://minio.lab-04-3.svc:9000 \
+  --backup-location-config \
+    region=us-east-1,s3ForcePathStyle=true,s3Url=http://s3.lab-04-3.svc:7070 \
   --use-volume-snapshots=false \
   --use-node-agent \
   --wait
@@ -991,18 +998,19 @@ Bucket created successfully `m/velero`.
 | Часть команды | Значение |
 |---|---|
 | `--namespace lab-04-3` | установить Velero в свой namespace, а не в `velero` |
-| `--provider aws` | использовать плагин S3, он подходит и для MinIO |
+| `--provider aws` | использовать плагин S3, он подходит и для других S3-хранилищ |
 | `--bucket velero` | бакет, созданный на шаге 2 |
+| `region=us-east-1` | регион подписи запросов; у VersityGW он такой по умолчанию |
 | `s3ForcePathStyle=true` | адресовать бакет по пути, а не по имени хоста |
-| `s3Url=http://minio…:9000` | адрес Service MinIO внутри кластера |
+| `s3Url=http://s3…:7070` | адрес Service шлюза внутри кластера |
 | `--use-volume-snapshots=false` | не создавать место для снапшотов: драйвер local-path их не умеет |
 | `--use-node-agent` | поставить агента для копирования файлов томов |
-| `--wait` | дождаться готовности сервера Velero |
+| `--wait` | дождаться готовности сервера Velero и агента |
 
 Ожидаемый результат:
 
 ```
-Velero is installed! Use 'kubectl logs deployment/velero -n lab-04-3' to view the status.
+Velero is installed! … Use 'kubectl logs deployment/velero -n lab-04-3' to view the status.
 NAME      PROVIDER   BUCKET/PREFIX   PHASE       LAST VALIDATED   ACCESS MODE   DEFAULT
 default   aws        velero          Available   …                ReadWrite     true
 ```
@@ -1010,7 +1018,7 @@ default   aws        velero          Available   …                ReadWrite   
 Разбор:
 
 1. `Velero is installed!` — созданы CRD, сервер, агент и расположение бэкапов по умолчанию.
-2. Фаза `Available` значит, что Velero достучался до бакета. При `Unavailable` смотрите лог `deployment/velero` и значение `s3Url`.
+2. Фаза `Available` значит, что Velero достучался до бакета. При `Unavailable` смотрите лог `deployment/velero`, значение `s3Url` и регион (§5).
 3. Флаг `--namespace` нужно повторять в каждой команде `velero`, иначе клиент ищет namespace `velero`.
 
 #### Шаг 4. Создать данные для бэкапа
@@ -1081,7 +1089,8 @@ lab-04-3 data v1
 VEL=~/lab/k8s/04-3/bin/velero
 $VEL backup create demo-1 --namespace lab-04-3 \
   --include-namespaces lab-04-3-demo --wait
-$VEL backup describe demo-1 --namespace lab-04-3 --details | grep -E 'Phase|Kopia|data'
+$VEL backup describe demo-1 --namespace lab-04-3 --details \
+  | grep -E '^Phase|Pod Volume|lab-04-3-demo/'
 ```
 
 | Часть команды | Значение |
@@ -1090,22 +1099,24 @@ $VEL backup describe demo-1 --namespace lab-04-3 --details | grep -E 'Phase|Kopi
 | `--include-namespaces` | взять объекты только этого namespace |
 | `--wait` | дождаться завершения бэкапа |
 | `describe --details` | показать список объектов и томов |
-| `grep -E …` | оставить фазу и строки о копировании томов |
+| `grep -E …` | оставить фазу, заголовок раздела томов и строку пода |
 
 Ожидаемый результат:
 
 ```
+Backup request "demo-1" submitted successfully.
+…
 Backup completed with status: Completed. …
 Phase:  Completed
-  Kopia Backups (specify --details for more information):
-    Completed:  1
+	Pod Volume Backups - kopia:
+			lab-04-3-demo/writer-…: data (…)
 ```
 
 Разбор:
 
 1. `Completed` — все объекты и том сохранены. `PartiallyFailed` означало бы потерю части данных.
-2. Раздел с Kopia подтверждает копирование данных тома. Если его нет, на поде забыта аннотация, и восстановление вернёт пустой PVC (§5).
-3. Объекты и файлы тома лежат в бакете `velero` в MinIO, а не в etcd.
+2. Раздел `Pod Volume Backups - kopia` со строкой пода и тома `data` подтверждает копирование данных тома. Если вместо него стоит `<none included>`, на поде забыта аннотация, и восстановление вернёт пустой PVC (§5).
+3. Объекты и файлы тома лежат в бакете `velero` шлюза S3, а не в etcd.
 
 #### Шаг 6. Потерять namespace и восстановить его
 
@@ -1115,7 +1126,7 @@ Phase:  Completed
 kubectl delete ns lab-04-3-demo --wait=true
 kubectl get ns lab-04-3-demo
 $VEL restore create demo-1-r1 --namespace lab-04-3 --from-backup demo-1 --wait
-kubectl -n lab-04-3-demo get pvc,pod,cm app-config
+kubectl -n lab-04-3-demo get pvc,pod,cm
 kubectl -n lab-04-3-demo rollout status deploy/writer --timeout=180s
 kubectl -n lab-04-3-demo exec deploy/writer -- cat /data/note.txt
 ```
@@ -1124,7 +1135,7 @@ kubectl -n lab-04-3-demo exec deploy/writer -- cat /data/note.txt
 |---|---|
 | `delete ns --wait=true` | удалить namespace и его объекты, включая PVC |
 | `restore create --from-backup` | создать объекты из бэкапа |
-| `get pvc,pod,cm app-config` | убедиться, что вернулись PVC, под и ConfigMap |
+| `get pvc,pod,cm` | убедиться, что вернулись PVC, под и ConfigMap |
 | `exec … cat` | проверить, что данные тома вернулись |
 
 Ожидаемый результат:
@@ -1135,15 +1146,16 @@ Restore completed with status: Completed. …
 persistentvolumeclaim/data   Bound   …
 pod/writer-…                 1/1     Running   …
 configmap/app-config         1       …
+configmap/kube-root-ca.crt   1       …
 lab-04-3 data v1
 ```
 
 Разбор:
 
 1. После удаления namespace исчезли объекты и PVC. Local-path с политикой `Delete` (04-2) удалил и каталог тома на узле.
-2. Velero создал PVC, и под стартовал с вспомогательным init-контейнером, который ждал, пока агент вернёт файлы в том.
+2. Velero создал PVC и добавил поду вспомогательный init-контейнер: он ждёт, пока агент вернёт файлы в том, и только потом пускает основной контейнер.
 3. Файл `note.txt` со строкой `lab-04-3 data v1` вернулся: восстановление включает данные, а не только объекты.
-4. PV новый, а имя PVC прежнее: Velero восстанавливает связь по имени и namespace.
+4. PVC получил прежнее имя, а драйвер local-path выдал под него новый PV: при FSB данные возвращаются в новый том.
 
 #### Шаг 7. Сравнить со снапшотом etcd
 
@@ -1158,7 +1170,7 @@ kubectl -n kube-system exec etcd-lab-control-plane -- etcdctl \
   snapshot save /var/lib/etcd/lab-04-3.db
 kubectl -n kube-system exec etcd-lab-control-plane -- \
   etcdutl snapshot status /var/lib/etcd/lab-04-3.db -w table
-$VEL backup describe demo-1 --namespace lab-04-3 | grep -E 'Namespaces|Total items'
+$VEL backup describe demo-1 --namespace lab-04-3 | grep -A1 -E '^(Namespaces|Total items)'
 ```
 
 | Часть команды | Значение |
@@ -1167,7 +1179,7 @@ $VEL backup describe demo-1 --namespace lab-04-3 | grep -E 'Namespaces|Total ite
 | `--cacert --cert --key` | сертификаты клиента, как в 10-2 |
 | `snapshot save …` | записать снапшот в каталог данных узла |
 | `etcdutl snapshot status -w table` | показать ревизию, число ключей и размер файла |
-| `grep -E 'Namespaces\|Total items'` | оставить охват и число объектов бэкапа Velero |
+| `grep -A1 -E '^(Namespaces\|Total items)'` | оставить охват и число объектов бэкапа Velero |
 
 Ожидаемый результат (числа у вас другие):
 
@@ -1175,8 +1187,11 @@ $VEL backup describe demo-1 --namespace lab-04-3 | grep -E 'Namespaces|Total ite
 Snapshot saved at /var/lib/etcd/lab-04-3.db
 | HASH | REVISION | TOTAL KEYS | TOTAL SIZE |
 | …    | …        | … (сотни)  | … МБ       |
+Namespaces:
   Included:  lab-04-3-demo
-  Total items to be backed up: …  (десятки)
+--
+Total items to be backed up:  …  (десятки)
+Items backed up:              …
 ```
 
 Разбор:
@@ -1197,28 +1212,28 @@ docker exec lab-control-plane rm -f /var/lib/etcd/lab-04-3.db
 
 | Что узнали | Где видно |
 |---|---|
-| Velero хранит объекты и файлы томов в бакете S3, а не в etcd | бакет `velero` в MinIO |
-| Без аннотации (opt-in) данные тома не копируются | раздел Kopia в `describe --details` |
+| Velero хранит объекты и файлы томов в бакете S3, а не в etcd | бакет `velero` шлюза |
+| Без аннотации (opt-in) данные тома не копируются | раздел `Pod Volume Backups` в `describe` |
 | Восстановление возвращает namespace целиком вместе с данными | шаг 6, файл `note.txt` |
 | Снапшот etcd охватывает кластер, Velero — выбранные объекты | шаг 7 |
 
-**Уборка.** Удаляем Velero вместе с CRD и ClusterRoleBinding, затем namespace и файлы с ключами. Каталог `bin` с клиентом можно оставить.
+**Уборка.** Удаляем Velero вместе с CRD, ClusterRoleBinding и его namespace, затем демо-namespace и файлы с ключами. Каталог `bin` с клиентом можно оставить.
 
 ```bash
 kubectl delete ns lab-04-3-demo --ignore-not-found
 $VEL uninstall --namespace lab-04-3 --force
 kubectl delete ns lab-04-3 --ignore-not-found
 kubectl get crd | grep velero.io
-rm -f ~/lab/k8s/04-3/credentials-velero ~/lab/k8s/04-3/minio-user ~/lab/k8s/04-3/minio-pass
+rm -f ~/lab/k8s/04-3/credentials-velero ~/lab/k8s/04-3/s3-user ~/lab/k8s/04-3/s3-pass
 ```
 
-Команда `get crd` не должна вернуть ничего: CRD Velero удалены. Файлы ключей стираются, а MinIO уничтожается вместе с namespace (данные лежали в `emptyDir`).
+Команда `velero uninstall` удаляет CRD, ClusterRoleBinding и сам namespace `lab-04-3`, поэтому следующая `delete ns` нужна только на случай сбоя. Команда `get crd` не должна вернуть ничего. Шлюз S3 исчезает вместе с namespace, а его данные лежали в `emptyDir` и удаляются с подом.
 
 **Вопросы для самопроверки.**
 
 1. Что вернул бы `velero restore`, если бы на поде не было аннотации тома?
 2. Почему Velero не заменяет снапшот etcd, а снапшот etcd не заменяет Velero?
-3. Почему бакет MinIO внутри кластера не удовлетворяет правилу 3-2-1?
+3. Почему бакет шлюза S3 внутри кластера не удовлетворяет правилу 3-2-1?
 
 <details>
 <summary>Ответы</summary>
