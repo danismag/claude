@@ -445,7 +445,7 @@ gpush "argocd: ApplicationSet for orders overlays"
 | `namespace: 'lab-08-2-{{ .path.basename }}'` | namespace, совпадающий с тем, что задаёт overlay |
 | `ignoreDifferences`, `RespectIgnoreDifferences=true` | защита `replicas` от HPA, как в 08-1 |
 
-Результат: команда печатает короткий хеш нового коммита, например `3c1a9f0`.
+Результат: команда печатает короткий хеш нового коммита. Хеш у каждого свой; в тексте дальше он не нужен.
 
 Разбор: хеш показывает, что файл попал в `main`. ApplicationSet пока только лежит в Git, в кластере его нет, и Application не созданы.
 
@@ -528,14 +528,14 @@ prod replicas=3 image=localhost:5001/orders-api@sha256:ad4f8fd2…
 
 **Вопросы для самопроверки.**
 
-1. Почему в подготовке пришлось удалить Application `orders-staging` из 08-1?
+1. Что сделает ApplicationSet, если Application `orders-staging` уже существует и никому не принадлежит?
 2. Что произойдёт, если добавить каталог `overlays/qa` и отправить коммит?
 3. Зачем у `root` нет finalizer'а?
 
 <details>
 <summary>Ответ</summary>
 
-1. ApplicationSet не забирает Application, которые создали не он. Объект с тем же именем остался бы чужим, и ApplicationSet не смог бы им управлять.
+1. Заберёт его себе: поставит себя владельцем и перепишет spec и finalizer по шаблону. Поэтому подготовка удаляет старый Application заранее, чтобы не получить смесь настроек 08-1 и шаблона.
 2. Генератор найдёт новый каталог в течение опроса Git (по умолчанию до 180 с), и появится Application `orders-qa`. Namespace `lab-08-2-qa` при этом нужно создать заранее, как в подготовке.
 3. Без finalizer'а удаление `root` не каскадирует на ApplicationSet и порождённые Application. Это нужно для порядка уборки в работе 3.
 
