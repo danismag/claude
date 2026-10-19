@@ -1,110 +1,227 @@
-# 03-4. Gateway API, Ingress и TLS
+# 03-4. Gateway API
 
-> Модуль 3 «Сеть» · часть 4 из 5 · 🟡🔴 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд 00-1 (Envoy Gateway 1.9.2, Gateway `lab`), cert-manager ставится в лабе. База — networks 08-5: полная цепочка внешнего трафика, Ingress и ingress-nginx на kind, MetalLB, первый взгляд на Gateway API; TLS и PKI — networks 05-4.
+> Модуль 03 «Сеть» · часть 4 из 6 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд 00-1 (Gateway `lab`, Envoy Gateway 1.9.2), образы `orders-api` из 00-1, `python:3.12-slim` и `curlimages/curl:8.11.1` (узлы и Docker берут их из Docker Hub) · Опирается на: 02-1 (условие Ready), 02-2 (canary-выкатка), 03-2 (Service и EndpointSlice)
+
+## Где мы на карте
+
+Эта часть разбирает вход в кластер на уровне HTTP: как запрос снаружи попадает в нужный Service. Часть 03-1 дала путь пакета между подами, 03-2 показала Service, который выбирает под для каждого соединения, а 03-3 научила находить сервисы по именам. Gateway API добавляет поверх Service маршрутизацию по содержимому запроса: по хосту, пути, заголовкам и весам.
+
+Следующая часть, 03-5, добавит к входу TLS и разберёт переход с Ingress. После неё 03-6 покажет NetworkPolicy, которая решает, кому вообще можно дойти до подов.
+
+```
+клиент ──► NodePort 30080 ──► Envoy (Gateway lab)    03-4: хост, путь, заголовки, веса
+                                    │ выбирает Service по HTTPRoute
+                                    ▼
+                        Service + EndpointSlice       03-2: выбирает под
+                                    ▼
+                        поды в состоянии Ready        02-1: принимают запрос
+```
+
+Схема 1. Место Gateway API на пути запроса: он стоит перед Service и решает, в какой именно Service отправить запрос.
 
 ---
 
-## Зачем это DevOps-у
+## 1. Какую задачу решает L7-вход
 
-L7-вход в кластер — то, через что идёт весь пользовательский трафик. В 2026 году это ещё и **миграция**: ingress-nginx, самый популярный Ingress-контроллер, в марте 2026 закончил сопровождение — без исправлений безопасности. Команды переходят на Gateway API (Envoy Gateway, Istio, Cilium, NGINX Gateway Fabric, Traefik). В работе: маршруты не применяются («Accepted=False»), canary весами, перенос аннотаций ingress-nginx, сертификаты и их продление. На собеседовании: «Ingress vs Gateway API», «как сделать canary без mesh», «как устроен cert-manager».
+Вход в кластер должен отправлять запросы к разным сервисам по содержимому запроса, а не только по адресу и порту. Разберём, чем он отличается от Service, зачем для него отдельный API и как этот API делит ответственность между командами.
 
-Сквозной сценарий уже идёт через Gateway API: `curl http://orders.localhost:8088/api/orders` → Gateway `lab` → HTTPRoute `orders-api` (00-1). Здесь — как это устроено и что ещё умеет.
+### Один вход для многих сервисов
+
+Service типа LoadBalancer или NodePort (03-2) работает на **L4** — транспортном уровне модели OSI: он видит IP-адреса, порты и соединения, но не читает HTTP. Поэтому каждому сервису нужен свой внешний адрес, а балансировка идёт по соединениям, и одно долгое соединение остаётся на одном поде.
+
+**L7** — прикладной уровень, на котором видны хост, путь, заголовки и каждый отдельный запрос. Его обслуживает **обратный прокси** (reverse proxy) — процесс, который принимает запросы клиентов и сам пересылает их на бэкенды. Один прокси с одним внешним адресом заменяет десяток балансировщиков и выбирает сервис по тексту запроса.
+
+```
+L4: Service                              L7: прокси входа
+клиент ─► IP:порт ─► под                 клиент ─► orders.localhost/api ─► Service orders-api
+(видит соединение, не видит HTTP)        клиент ─► shop.localhost/      ─► Service shop
+                                         (видит хост, путь и заголовки каждого запроса)
+```
+
+Схема 2. Слева Service различает только адрес и порт, справа прокси различает запросы и разводит их по сервисам.
+
+### Почему не Ingress
+
+Первый API входа, **Ingress**, описывает только хост, путь и TLS. Всё остальное он оставляет **аннотациям** — строкам в метаданных, которые понимает один конкретный контроллер, поэтому манифест нельзя перенести между реализациями. Сам Ingress заморожен: новых функций в нём не будет. Сопровождение ingress-nginx, самого популярного контроллера, закончилось 24 марта 2026 года, а подробности и переход на новый API разобраны в 03-5.
+
+**Gateway API** (gateway.networking.k8s.io) вносит эти функции в типизированные поля: веса, редиректы, заголовки, таймауты. Один манифест работает на разных реализациях — Envoy Gateway, Istio, Cilium, NGINX Gateway Fabric, Traefik. Тот же API описывает и трафик внутри кластера для service mesh, но сетка в курс не входит.
+
+### Роли вместо одного объекта
+
+Ingress смешивает всё в одном объекте, а Gateway API делит его по ролям.
+
+- **Провайдер** (platform provider) поставляет реализацию и описывает её тип.
+- **Оператор кластера** (cluster operator) решает, какие порты и протоколы открыты и кто может подключать маршруты.
+- **Разработчик приложения** (application developer) описывает, куда вести запросы его сервиса.
+
+Права RBAC (06-1) раздают по этим же границам. Команда может менять свои маршруты, но не может открыть новый порт на общем входе и не может направить трафик в чужой сервис без разрешения.
 
 ---
 
-## 1. Ingress и Gateway API 🟡
+## 2. Как устроен Gateway API
 
-| | Ingress (`networking.k8s.io/v1`) | Gateway API (`gateway.networking.k8s.io/v1`) |
-|---|---|---|
-| Объекты | Ingress, IngressClass | GatewayClass → Gateway → HTTPRoute / GRPCRoute / TLSRoute / TCPRoute / UDPRoute |
-| Роли | один объект на всё | платформа: GatewayClass, Gateway (порты, TLS, кто может цепляться); приложение: Route |
-| Возможности в стандарте | хост, путь, TLS | плюс заголовки, query, методы, веса, зеркалирование, редиректы, rewrite, таймауты, cross-namespace с разрешениями |
-| Всё остальное | **аннотации контроллера** (у ingress-nginx — сотни, несовместимы между контроллерами) | в стандарте или в типизированных расширениях (Policy-объекты) |
-| Статус | заморожен: новых функций не будет | развивается: на стенде v1.6.1 (bundle), канал experimental |
+Gateway API состоит из трёх основных объектов и двух процессов: контроллера и прокси. Разберём, что делает каждая часть и как маршрут привязывается ко входу.
 
-Проверено: Ingress без контроллера — просто объект в etcd. На стенде нет ни одного `IngressClass` (`No resources found`), Ingress с `ingressClassName: nginx` создаётся, `ADDRESS` пуст, `status={"loadBalancer":{}}`, трафик на `legacy.localhost` получает 404 от Envoy (такого хоста нет ни в одном HTTPRoute). Аннотация `nginx.ingress.kubernetes.io/rewrite-target` никого не интересует.
+### Три объекта и их владельцы
 
-## 2. Gateway стенда изнутри 🟡
+Объектов три, и у каждого свой владелец.
+
+- **GatewayClass** — тип входа: объект на весь кластер, который называет контроллер в поле `controllerName`; его создаёт провайдер или установщик реализации.
+- **Gateway** — экземпляр входа: он описывает **listener** (слушатель), то есть пару «порт и протокол», иногда с именем хоста, на которой прокси принимает трафик; его создаёт оператор кластера.
+- **HTTPRoute** — набор правил, который выбирает бэкенд по хосту, пути, заголовкам и другим признакам запроса; его пишет команда приложения.
 
 ```
-GatewayClass eg (controllerName: gateway.envoyproxy.io/gatewayclass-controller, parametersRef → EnvoyProxy nodeport)
-   └─ Gateway lab (ns envoy-gateway-system), listener http:80, allowedRoutes: All namespaces
-        ├─ HTTPRoute orders-api (ns orders)   hostnames: orders.localhost
-        └─ HTTPRoute shop (ns lab-03-4)       hostnames: shop.localhost
-Envoy Gateway (контроллер) → Deployment envoy-…-lab (прокси) + Service NodePort 80:30080
+GatewayClass eg      controllerName: gateway.envoyproxy.io/gatewayclass-controller
+   └─ Gateway lab    ns envoy-gateway-system · listener http:80 · принимает маршруты из всех ns
+        ├─ HTTPRoute orders-api   ns orders       hostnames: orders.localhost
+        └─ HTTPRoute shop         ns lab-03-4     hostnames: shop.localhost  (создаём в лабе)
+                     └─► backendRefs: Service ─► EndpointSlice ─► поды
 ```
 
-Контроллер читает Gateway и Route, генерирует конфигурацию Envoy и отдаёт её прокси по xDS. Состояние смотрят в `status`:
+Схема 3. Объекты стенда: сверху вниз идёт передача власти от провайдера к оператору и дальше к командам приложений.
 
-```bash
-kubectl -n envoy-gateway-system get gateway lab -o jsonpath='{range .status.listeners[*]}{.name}: attachedRoutes={.attachedRoutes} {range .conditions[*]}{.type}={.status} {end}{"\n"}{end}'
+Кроме HTTPRoute есть и другие маршруты: GRPCRoute для gRPC, TLSRoute для TLS без расшифровки, TCPRoute и UDPRoute для остальных протоколов (§6). Принцип у всех один: маршрут привязывается к Gateway и указывает бэкенд.
+
+### Контроллер и прокси
+
+Реализация делится на **плоскость управления** (control plane) и **плоскость данных** (data plane). Контроллер читает Gateway и маршруты из API-сервера и собирает из них конфигурацию. Прокси получает её по протоколу **xDS** — набору API, которым Envoy принимает настройки на лету, без перезапуска. Прокси принимает пользовательские запросы и пересылает их на поды.
+
+```
+API-сервер: GatewayClass, Gateway, HTTPRoute
+        │ watch (01-1)
+        ▼
+ envoy-gateway (контроллер, ns envoy-gateway-system)
+        │ xDS: маршруты, listener'ы, адреса бэкендов
+        ▼
+ Deployment envoy-…-lab (прокси)  ◄── Service NodePort 80:30080 ◄── клиенты
+        │ запрос по HTTPRoute
+        ▼
+ поды бэкендов
 ```
 
-Проверено: `http: attachedRoutes=1 Programmed=True Accepted=True ResolvedRefs=True` (на пустом стенде — один маршрут orders-api).
+Схема 4. Контроллер сам не видит пользовательский трафик: он только настраивает прокси, который его обслуживает.
 
-Условия Route — первое, куда смотреть, когда «маршрут не работает»:
+На стенде контроллер Envoy Gateway работает в namespace `envoy-gateway-system`. Для каждого Gateway он создаёт Deployment с прокси Envoy и Service типа NodePort. Параметры этого Service берутся из объекта EnvoyProxy, на который ссылается GatewayClass: поэтому порт 80 доступен на узлах как 30080 (00-1).
 
-| Условие | False означает |
-|---|---|
-| `Accepted` | Gateway не принял маршрут: namespace не разрешён `allowedRoutes`, hostname не совпал ни с одним listener, нет такого Gateway/listener |
-| `ResolvedRefs` | бэкенд не найден или запрещён: нет Service/порта, ссылка в другой namespace без ReferenceGrant |
+### Привязка маршрута к Gateway
 
-## 3. Маршрутизация, веса и приоритет правил 🟡🔴
+Маршрут и Gateway должны согласиться друг с другом: маршрут просит о привязке, а Gateway разрешает её. Маршрут просит через поле **parentRefs** — ссылку на Gateway, а иногда и на конкретный listener по имени `sectionName`. Gateway разрешает через поле **allowedRoutes** у listener'а, которое задаёт допустимые namespace и виды маршрутов.
 
-Маршрут лабы (две версии orders-api по 2 реплики):
+```
+HTTPRoute shop (ns lab-03-4)                       Gateway lab (ns envoy-gateway-system)
+  parentRefs: lab, envoy-gateway-system  ───────►   listener http:80
+  hostnames: shop.localhost                           allowedRoutes: namespaces from All
+        ▲                                                     │
+        └──── привязка есть, если: namespace разрешён, а хост маршрута ────┘
+              пересекается с хостом listener'а (у http:80 хоста нет: пересекается любой)
+```
+
+Схема 5. Привязка работает в обе стороны; если не выполнено любое условие, маршрут получает `Accepted=False` (§4).
+
+Значения allowedRoutes по умолчанию — `Same`: принимать маршруты только из namespace самого Gateway. Другие варианты: `All` (любые namespace, так на стенде) и `Selector` (namespace с нужными метками). Так оператор решает, какие команды вообще могут публиковать маршруты на общем входе.
+
+---
+
+## 3. Как управлять маршрутами
+
+Маршрутом управляют через поля HTTPRoute: что сопоставлять, как выбирать правило, что менять в запросе и как делить трафик. Отдельный раздел посвящён весам, потому что на них держится canary-выкатка (02-2), и доступу между namespace.
+
+### Хост и путь
+
+Правило состоит из условий `matches`, фильтров `filters` и бэкендов `backendRefs`. Поле `hostnames` у маршрута задаёт, для каких имён он работает, а в `matches` описывают путь, заголовки, параметры строки запроса и метод. Внутри одного условия все признаки должны совпасть (логическое И), а несколько условий в списке образуют ИЛИ.
+
+У пути три типа сопоставления: `Exact` требует точного совпадения, `PathPrefix` сравнивает по сегментам, а `RegularExpression` зависит от реализации. Префикс `/api` подходит к `/api` и `/api/orders`, но не подходит к `/apiary`. Если путь не указан, правило получает `PathPrefix: /`, и это значение определяет приоритет (следующий подраздел).
 
 ```yaml
-spec:
-  parentRefs: [{name: lab, namespace: envoy-gateway-system}]
-  hostnames: ["shop.localhost"]
-  rules:
-  - matches: [{path: {type: PathPrefix, value: /api}, headers: [{name: x-canary, value: "true"}]}]
-    backendRefs: [{name: api-2-1, port: 80}]
-  - matches: [{path: {type: PathPrefix, value: /api}}]
-    backendRefs:
-    - {name: api-2-0, port: 80, weight: 90}
-    - {name: api-2-1, port: 80, weight: 10}
-  - matches: [{path: {type: PathPrefix, value: /}}]
-    filters: [{type: RequestRedirect, requestRedirect: {path: {type: ReplaceFullPath, replaceFullPath: /api/orders}, statusCode: 302}}]
+rules:
+- matches:
+  - path: {type: PathPrefix, value: /api}
+    headers: [{name: x-canary, value: "true"}]
+  backendRefs: [{name: api-2-1, port: 80}]
 ```
 
-Проверено (1000 запросов на `/api/orders`, клиент в сети kind):
+Фрагмент маршрута: запросы с путём `/api…` и заголовком `x-canary: true` идут в Service `api-2-1`. Оба признака в одном условии, поэтому нужны оба.
+
+### Приоритет правил
+
+Gateway API выбирает правило по специфичности, а не по порядку в YAML. Если запросу подходят несколько правил, побеждает то, которое выше в такой цепочке:
+
+1. точное совпадение пути (`Exact`);
+2. самый длинный префикс пути;
+3. совпадение метода HTTP;
+4. больше совпадений по заголовкам;
+5. больше совпадений по параметрам строки запроса.
+
+Если и после этого есть ничья между маршрутами, выигрывает более старый маршрут по времени создания, а затем тот, у которого раньше имя в виде `namespace/name`. Внутри одного маршрута при полной ничьей действует порядок в YAML. Эти правила записаны в спецификации Gateway API, и все реализации обязаны их соблюдать.
 
 ```
-weights 90/10 over 1000: {'api-2-1': 99, 'api-2-0': 901}
-x-canary: true -> {'api-2-1': 20}
-GET / -> 302 http://shop.localhost/api/orders
-unknown host -> 404
+запрос GET /api/orders, заголовок x-canary: true
+
+правило A: заголовок x-canary, пути нет  →  путь неявно "/" (длина 1)   проигрывает
+правило B: PathPrefix /api, без заголовка →  длина префикса 4            выигрывает
+правило C: PathPrefix /api + заголовок    →  длина 4, плюс заголовок      выигрывает у B
 ```
 
-Веса работают на уровне запросов (Envoy — L7), а не соединений, как у kube-proxy (03-2). Это и есть canary без mesh: меняете веса 90/10 → 50/50 → 0/100 правкой одного объекта (вручную, из CI или Argo Rollouts/Flagger с анализом метрик).
+Схема 6. Правило без пути считается префиксом `/` и проигрывает любому более длинному пути, даже если совпадает заголовок; в лабораторной работе 1 вы увидите это в измерениях.
 
-### Ловушка приоритета 🔴
+Отсюда практический вывод: правило «особого» трафика должно быть не менее специфичным, чем правило «обычного». Заголовочное правило для тестировщиков получает тот же путь, что и правило с весами, и тогда лишний заголовок поднимает его выше.
 
-Первая версия маршрута содержала правило **только с заголовком** (без `path`). Проверено:
+### Фильтры
 
-```
-x-canary: true -> {'api-2-0': 19, 'api-2-1': 1}
-```
+**Фильтр** (filter) меняет запрос или ответ либо отвечает вместо бэкенда. Чаще всего нужны четыре.
 
-Заголовок «не работал»: запросы с `x-canary: true` уходили в общий канал 90/10. Причина — правила Gateway API применяются не по порядку в YAML, а по **приоритету**: точный путь > самый длинный префикс > метод > больше совпадений по заголовкам > больше по query. Правило без `path` считается `PathPrefix: /` и проигрывает правилу `/api`. После добавления `path: /api` к правилу с заголовком — 20 из 20 в `api-2-1`. В ingress-nginx canary делался аннотациями на отдельном Ingress — при миграции такие правила нужно переписать и **проверить**.
+- `RequestRedirect` — ответить редиректом с кодом 301 или 302, по умолчанию 302.
+- `URLRewrite` — переписать путь или хост перед отправкой бэкенду.
+- `RequestHeaderModifier` — добавить, изменить или удалить заголовки запроса.
+- `RequestMirror` — отправить копию запроса на второй бэкенд и отбросить её ответ, чтобы проверить новую версию на живом трафике без риска для клиентов.
 
-Ещё одна мелочь, пойманная на стенде: Envoy нормализует путь — `/api/orders/../../version` превращается в `/version` до маршрутизации (защита от обхода правил путями).
+В версии 1.5 появился и фильтр CORS, но поддерживают его не все реализации.
 
-## 4. Чужой namespace: ReferenceGrant 🟡
+Если фильтра не хватает, например для лимита запросов или аутентификации, реализация предлагает свои **Policy-объекты**: у Envoy Gateway это BackendTrafficPolicy и SecurityPolicy. Они привязываются к Gateway или маршруту ссылкой `targetRefs`, но работают только в этой реализации.
 
-Route в `lab-03-4` ссылается на Service `orders-api` в namespace `orders`. Проверено:
+### Canary весами
 
-```
-Accepted=True Accepted: Route is accepted
-ResolvedRefs=False RefNotPermitted: Failed to process route rule 0 backendRef 0: Backend ref to Service orders/orders-api not permitted by any ReferenceGrant.
-cross.localhost -> 500
-```
-
-Владелец целевого namespace разрешает доступ явно:
+**Canary-выкатка** (canary release) — постепенное включение новой версии: сначала на малую долю трафика, потом на всё больше. В 02-2 доля задавалась числом подов, а в Gateway API её задают **весами** (weight) в списке `backendRefs`. Вес — целое число; доля бэкенда равна его весу, делённому на сумму весов правила. По умолчанию вес равен 1, а вес 0 выключает бэкенд.
 
 ```yaml
-apiVersion: gateway.networking.k8s.io/v1      # v1 в Gateway API 1.6 (раньше — v1beta1)
+rules:
+- matches: [{path: {type: PathPrefix, value: /api}}]
+  backendRefs:
+  - {name: api-2-0, port: 80, weight: 90}    # стабильная версия, 90 %
+  - {name: api-2-1, port: 80, weight: 10}    # canary, 10 %
+```
+
+Фрагмент маршрута: два Service, по одному на версию, и веса 90 и 10. Сумма равна 100, но это не обязательно: пара 9 и 1 даёт те же доли.
+
+```
+запросы ──► правило /api ──┬── 90 % ──► Service api-2-0 ──► поды версии 2.0
+                           └── 10 % ──► Service api-2-1 ──► поды версии 2.1
+        правило /api + x-canary: true ──► всегда Service api-2-1  (для тестировщиков)
+```
+
+Схема 7. Веса делят запросы между версиями, а заголовочное правило даёт тестировщикам гарантированный путь на canary.
+
+Веса работают на уровне запросов: Envoy выбирает бэкенд для каждого запроса, а не для соединения, как kube-proxy в 03-2. Поэтому доля не зависит от числа подов: версия 2.1 с одной репликой получает ровно столько же запросов, сколько с десятью. На стенде 1000 запросов при весах 90 и 10 дали 901 и 99 (лабораторная работа 2). Выбор случайный. Для доли 10 % разброс на 1000 запросов составляет около 9 запросов (одно стандартное отклонение), поэтому отклонение в один-два процента не говорит о поломке.
+
+Управление выкаткой сводится к правке весов: 90/10, затем 50/50, затем 0/100, а при ошибках обратно 100/0. Правку делают вручную, из CI или контроллерами вроде Argo Rollouts и Flagger, которые сами меняют веса по метрикам. Заголовочное правило остаётся при любых весах, поэтому тестировщики проверяют canary, пока обычные пользователи его ещё не видят (весы 100/0).
+
+### Доступ между namespace: ReferenceGrant
+
+Маршрут в одном namespace может ссылаться на Service из другого, но только с согласия владельца того namespace. Согласие записывается объектом **ReferenceGrant** (разрешение на ссылку): его создают в namespace целевого объекта, и в нём перечислены, кому и что разрешено. Без него контроллер помечает ссылку недопустимой, а прокси отвечает на такие запросы кодом 500.
+
+```
+ns lab-03-4                              ns orders
+HTTPRoute cross ── backendRefs ──► Service orders-api
+      │                                        ▲
+      └── нужен ReferenceGrant allow-lab-03-4 ─┘
+          from: HTTPRoute из ns lab-03-4
+          to:   Service orders-api
+```
+
+Схема 8. Разрешение лежит у владельца цели: команда не может дать его себе сама.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
 kind: ReferenceGrant
 metadata: {name: allow-lab-03-4, namespace: orders}
 spec:
@@ -112,127 +229,358 @@ spec:
   to: [{group: "", kind: Service, name: orders-api}]
 ```
 
-После него — `ResolvedRefs=True`, `200`. Модель безопасности: команда может опубликовать маршрут на общем Gateway, но не может направить трафик в чужие сервисы без согласия их владельца. В Ingress такой защиты нет. Тот же механизм нужен Gateway, чтобы взять TLS-секрет из другого namespace.
+Поле `from` перечисляет, кто ссылается: группу, вид и namespace. Поле `to` перечисляет, на что можно ссылаться: группу, вид и, по желанию, имя; без имени разрешены все объекты этого вида в namespace. Группа `""` означает основные объекты Kubernetes, такие как Service и Secret. С версии 1.5 ReferenceGrant стабилен в версии `v1`, а раньше был `v1beta1`.
 
-## 5. TLS: cert-manager 🟡🔴
-
-cert-manager — оператор, который выпускает и продлевает сертификаты: `Issuer`/`ClusterIssuer` (кто подписывает: ACME/Let's Encrypt, свой CA, Vault, облачные CA) → `Certificate` (что выпустить) → Secret `kubernetes.io/tls`. Установка на стенд (лаба, шаг 5) — Helm-чарт v1.21.2 с `enableGatewayAPI: true` (за 31 с).
-
-Цепочка стенда: самоподписанный `ClusterIssuer selfsigned` → `Certificate lab-ca` (isCA) → `ClusterIssuer lab-ca` (тип CA). Для Gateway достаточно аннотации — cert-manager сам создаёт Certificate для каждого HTTPS-listener'а с hostname (gateway-shim):
-
-```bash
-kubectl -n envoy-gateway-system annotate gateway lab cert-manager.io/cluster-issuer=lab-ca
-# + listener: {name: https-shop, protocol: HTTPS, port: 443, hostname: shop.localhost,
-#              tls: {mode: Terminate, certificateRefs: [{name: shop-localhost-tls}]}}
-```
-
-Проверено:
-
-```
-certificate.cert-manager.io/shop-localhost-tls condition met
-dnsNames=["shop.localhost"] issuer=lab-ca notAfter=2027-01-12T10:10:21Z renewal=2026-12-13T10:10:21Z
-http: attachedRoutes=3 Programmed=True
-https-shop: attachedRoutes=1 Programmed=True
-80:30080 443:30708
-```
-
-Срок — 90 дней (дефолт cert-manager), продление за 1/3 до конца. Маршрут `shop` прицепился к обоим listener'ам — hostname совпал. Проверка (клиент в сети kind, CA из Secret `lab-ca`):
-
-```
-* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384 / x25519 / RSASSA-PSS
-* ALPN: server accepted h2
-*  subject:
-*  expire date: Jan 12 10:10:21 2027 GMT
-*  issuer: CN=lab-ca
-https -> 200
-no CA -> 000 SSL certificate problem: unable to get local issuer certificate
-other SNI -> 000 Recv failure: Connection reset by peer
-```
-
-`subject` пустой — cert-manager кладёт имя только в SAN (CN устарел для серверных сертификатов). Запрос с SNI, которого нет ни у одного listener'а, Envoy сбрасывает на уровне TLS. HTTP/2 включился сам (ALPN).
-
-В проде вместо своего CA — ACME (Let's Encrypt): `ClusterIssuer` с `acme` и решателем `http01` (через тот же Gateway — cert-manager создаёт временный HTTPRoute) или `dns01` (wildcard, закрытые кластеры). Что мониторить: `certmanager_certificate_expiration_timestamp_seconds`, условие `Ready` у Certificate, события `Issuing`/ошибки ACME. Срок жизни публичных сертификатов сокращается (CA/B Forum: до 200 дней с марта 2026 и далее вниз) — ручное продление больше не вариант (networks 05-4).
-
-## 6. Миграция с ingress-nginx 🔴
-
-ingress-nginx завершил сопровождение в марте 2026 (объявление Kubernetes SIG Network, ноябрь 2025): контроллер продолжит работать, но без исправлений, в том числе уязвимостей уровня CVE-2025-1974 («IngressNightmare» — RCE через admission webhook контроллера). План:
-
-| Шаг | Что делать |
-|---|---|
-| инвентаризация | `kubectl get ingress -A -o json \| jq '[.items[].metadata.annotations // {} \| keys[]] \| group_by(.) \| map({(.[0]): length}) \| add'` — какие аннотации используются и сколько раз |
-| выбор реализации | Gateway API-контроллер: Envoy Gateway, NGINX Gateway Fabric (тот же nginx), Istio, Cilium, Traefik, облачные (GKE, AWS Gateway Controller) |
-| перевод объектов | `ingress2gateway` (инструмент SIG Network) генерирует Gateway/HTTPRoute из Ingress и части аннотаций (⚠️ в среде агента не запускался) |
-| аннотации без аналога в стандарте | `rewrite-target` → фильтр `URLRewrite`; canary-аннотации → веса/заголовки в одном HTTPRoute (§3, проверьте приоритет!); rate limit, auth, CORS → Policy-объекты реализации (`BackendTrafficPolicy`, `SecurityPolicy` у Envoy Gateway); `configuration-snippet` — переписывать, это и был главный источник уязвимостей |
-| параллельный запуск | новый Gateway с отдельным IP/LB, перенос DNS по одному хосту, сравнение логов и кодов ответов |
-| TLS | cert-manager переходит с аннотаций Ingress на аннотацию Gateway (gateway-shim) |
-
-Мелочи, на которых ломаются: ingress-nginx по умолчанию делал редирект HTTP→HTTPS и нормализовал слэши — в Gateway это явные правила; таймауты ingress-nginx (`proxy-read-timeout` 60 с по умолчанию) и вашей реализации Gateway API различаются — сверьте дефолты по её документации и задайте явно (`timeouts.request`/`backendRequest` в HTTPRoute; ⚠️ дефолты Envoy Gateway на стенде не измерялись); WebSocket-кейс — networks 08-5 §6.
+Разрешение нужно только для ссылки на объект в чужом namespace. Ссылки внутри своего namespace проходят без него. Привязка маршрута к Gateway из другого namespace его тоже не требует: её регулирует allowedRoutes (§2). Тот же механизм защищает TLS-секреты: Gateway берёт сертификат из другого namespace только по ReferenceGrant (03-5).
 
 ---
 
-## 🔧 Лаба
+## 4. Как увидеть состояние
 
-### Шаг 0. Подготовка: две версии orders-api
+Gateway API сообщает о себе через `status` объектов, и первое, что смотрят при любой неполадке, это **условия** (conditions) Gateway и маршрута. Они бывают True, False или Unknown и содержат причину (reason) и сообщение (message).
+
+### Состояние Gateway и listener
+
+У Gateway есть условия двух уровней: общие для объекта и отдельные для каждого listener'а в `status.listeners`. Главные условия два: `Accepted` значит, что контроллер принял объект, а `Programmed` — что конфигурация доставлена в прокси и он готов принимать трафик. У listener'а добавляются `ResolvedRefs` (все ссылки разрешены, например на TLS-секрет, 03-5) и счётчик `attachedRoutes` — сколько маршрутов к нему привязано.
+
+```
+Gateway lab
+ ├─ status.conditions:   Accepted, Programmed
+ └─ status.listeners[http]
+      ├─ attachedRoutes: число привязанных маршрутов
+      └─ conditions:     Accepted, Programmed, ResolvedRefs
+```
+
+Схема 9. Условия лежат на двух уровнях; при «Gateway не работает» сначала смотрят `Programmed` у нужного listener'а.
+
+### Состояние маршрута
+
+Условия маршрута лежат в `status.parents`: отдельный список для каждого Gateway, к которому маршрут пытается привязаться. Так одну и ту же неполадку видно отдельно по каждому родителю. Нужны два условия: `Accepted` и `ResolvedRefs`.
+
+Таблица показывает частые причины, когда условие равно False.
+
+| Условие | Причина (reason) | Что значит |
+|---|---|---|
+| Accepted | NotAllowedByListeners | namespace маршрута не разрешён в allowedRoutes |
+| Accepted | NoMatchingListenerHostname | хост маршрута не пересекается с хостом listener'а |
+| Accepted | NoMatchingParent | нет такого Gateway или listener'а |
+| ResolvedRefs | BackendNotFound | Service или его порт не существует |
+| ResolvedRefs | RefNotPermitted | ссылка в чужой namespace без ReferenceGrant |
+
+### Команды наблюдения
+
+Три команды покрывают почти все случаи: статус объекта, события и логи контроллера.
+
+```bash
+kubectl -n envoy-gateway-system get gateway lab           # колонки ADDRESS и PROGRAMMED
+kubectl describe httproute shop                           # условия и события маршрута
+kubectl -n envoy-gateway-system logs deploy/envoy-gateway --tail=50   # логи контроллера
+```
+
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `get gateway lab` | готов ли Gateway принимать трафик |
+| `describe httproute shop` | условия маршрута по каждому родителю, события |
+| `logs deploy/envoy-gateway` | почему контроллер отклонил или не смог применить объект |
+
+Точные поля читают через jsonpath, как в лабораторных работах, потому что вывод `describe` длинный. Логи прокси Envoy полезны при другой неполадке: когда статус зелёный, а запросы идут не туда.
+
+---
+
+## 5. Что ломается и как найти причину
+
+Неполадки входа делятся на три группы: маршрут не принят, бэкенд недопустим и запрос попал не в то правило. Для каждой причина читается из статуса или из кода ответа.
+
+### Маршрут не принят
+
+Если `Accepted=False`, прокси этого маршрута не знает, поэтому его хост получает 404. Причина записана в `reason` условия, и чаще всего это одна из трёх.
+
+- Namespace маршрута не разрешён в allowedRoutes (по умолчанию разрешён только namespace Gateway).
+- Хост маршрута не пересекается с хостом listener'а.
+- В parentRefs опечатка в имени или namespace Gateway.
+
+Исправление зависит от причины: либо оператор расширяет allowedRoutes, либо автор правит hostnames и parentRefs. Менять надо то, что названо в `message`: контроллер указывает конкретное поле.
+
+### Бэкенд не найден или запрещён
+
+При `ResolvedRefs=False` маршрут принят, но его бэкенд недопустим. Для запросов к такому бэкенду прокси отвечает 500; на стенде так выглядит ссылка без ReferenceGrant. Сообщение называет правило, номер бэкенда и объект, например «Backend ref to Service orders/orders-api not permitted by any ReferenceGrant».
+
+Проверьте три вещи. Существует ли Service с таким именем в указанном namespace. Совпадает ли `port` с портом Service, а не контейнера. Есть ли ReferenceGrant при ссылке в чужой namespace. Если ссылка допустима, а ответ 503, то Service есть, но у него нет готовых адресов, и дальше идёт диагностика EndpointSlice из 03-2.
+
+### Запрос попал не в то правило
+
+Самая коварная поломка: все условия True, ответ 200, но запрос ушёл в другую версию. Причина обычно в приоритете (§3): правило с заголовком без пути проиграло правилу с длинным префиксом. Код ответа этого не покажет, поэтому в проверках нужно смотреть содержимое ответа: версию или имя пода, как это делает клиент в лабораторной работе 1.
+
+Вторая причина того же рода связана с нормализацией. Envoy приводит путь к каноническому виду до выбора правила: на стенде запрос `/api/orders/../../version` превратился в `/version`. Правило с точным путём `/api/orders/../../version` не сработает, но и обход правил через `..` невозможен.
+
+### Диагностика по коду ответа
+
+Код ответа сужает круг причин ещё до просмотра статуса. Таблица связывает типичные симптомы с причиной и первым действием.
+
+| Ответ | Вероятная причина | Что смотреть |
+|---|---|---|
+| 404 | ни хост, ни путь не подошли | hostnames и matches, Accepted маршрута |
+| 500 | недопустимый бэкенд | ResolvedRefs, ReferenceGrant |
+| 503 | у бэкенда нет готовых подов | EndpointSlice Service (03-2) |
+| Connection refused | Gateway не готов | Programmed у Gateway и listener'а |
+| зависание запроса | узел без пода Envoy при политике Local | externalTrafficPolicy, 00-1 |
+
+Код 503 в этой таблице взят из поведения Envoy и на стенде отдельно не воспроизводился.
+
+---
+
+## 6. Пределы и значения по умолчанию
+
+Gateway API развивается быстро, поэтому важны версии, значения по умолчанию и то, чего реализация может не уметь. Ниже собраны факты, которые чаще всего приводят к неожиданностям.
+
+### Версии и каналы
+
+Gateway API поставляется релизами с набором CRD в двух каналах. Канал **standard** содержит стабильные объекты, а **experimental** добавляет ещё не стабильные. На стенде стоит набор CRD версии 1.6.1 в канале experimental. Реализация требует определённую версию CRD. Envoy Gateway 1.9.x нужны CRD Gateway API 1.6, а версию 1.9.0 стоит пропустить в пользу 1.9.1 и выше.
+
+Что принесли последние версии (по заметкам к релизам):
+
+- **1.4** — BackendTLSPolicy стала стабильной (TLS до бэкенда, 03-5) и появилось поле `status.supportedFeatures` у GatewayClass, где реализация перечисляет, что она умеет;
+- **1.5** — стабильными стали ListenerSet, TLSRoute и ReferenceGrant `v1`; добавлены фильтр CORS и проверка клиентских сертификатов на Gateway;
+- **1.6** — TCPRoute и UDPRoute перешли в `v1`.
+
+Поддержку нужной функции проверяют по `supportedFeatures` реализации и по её документации, а не по наличию CRD: CRD может быть установлен, а контроллер его не обрабатывать.
+
+### Значения по умолчанию и лимиты
+
+Несколько значений определяют поведение, даже когда вы их не писали.
+
+- **Путь** — без `path` правило получает `PathPrefix: /`.
+- **Вес** — 1; сумма весов правила может быть любой, а вес 0 лишает бэкенд запросов.
+- **allowedRoutes** — `Same`, то есть только namespace Gateway.
+- **Редирект** — код 302, если `statusCode` не задан.
+- **Таймауты** — спецификация не задаёт значений: они зависят от реализации. Поле `timeouts.request` в правиле HTTPRoute задаёт предел явно; дефолты Envoy Gateway сверяйте по его документации.
+
+Размеры списков ограничены схемой CRD. В HTTPRoute не больше 16 правил и 16 хостов. В правиле не больше 64 условий и 16 бэкендов. В Gateway не больше 64 listener'ов. Для большого числа сервисов на одном входе хватает нескольких маршрутов на команду.
+
+### ListenerSet и другие протоколы
+
+**ListenerSet** — объект версии 1.5, в котором команда приложения описывает свои listener'ы и подключает их к общему Gateway. Раньше любой новый хост с собственным сертификатом требовал правки самого Gateway, то есть работы оператора. С ListenerSet оператор разрешает подключение один раз, а дальше команда управляет своими listener'ами сама.
+
+Gateway API работает не только с HTTP.
+
+- GRPCRoute обслуживает gRPC.
+- TLSRoute передаёт TLS без расшифровки и выбирает бэкенд по имени SNI.
+- TCPRoute и UDPRoute дают L4-вход для баз, очередей и DNS.
+
+У L4-маршрутов нет заголовков и путей, поэтому выбор идёт только по порту listener'а. Поддерживает их не каждая реализация, и перед использованием стоит свериться с `supportedFeatures`.
+
+---
+
+## Лабораторные работы
+
+Работы идут на стенде 00-1 в namespace `lab-03-4` и выполняются подряд: общую подготовку делают один раз перед работой 1. Хост работы почти не меняют: на машине появляются каталог `~/lab/k8s/03-4`, образы Docker и текущий namespace в контексте kubectl, а остальное происходит внутри кластера kind.
+
+Подготовка создаёт namespace, каталог и два образа с версиями 2.0 и 2.1 в реестре стенда. Образ 2.0 — это образ из 00-1 под новым именем, образ 2.1 собирается из тех же исходников с другим номером версии. Приложение не требует базы и отвечает JSON с именем пода, по которому клиент отличает версии.
 
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-03-4
 kubectl config set-context --current --namespace=lab-03-4
-for v in 2.0 2.1; do n=api-${v/./-}; kubectl apply -f - <<EOF
+mkdir -p ~/lab/k8s/03-4
+
+docker tag localhost:5001/orders-api:2.0 localhost:5001/lab-03-4/orders-api:2.0
+docker build -t localhost:5001/lab-03-4/orders-api:2.1 \
+  --build-arg APP_VERSION=2.1 ~/lab/k8s/orders-api
+docker push localhost:5001/lab-03-4/orders-api:2.0
+docker push localhost:5001/lab-03-4/orders-api:2.1
+```
+
+| Часть команды | Значение |
+|---|---|
+| `config set-context --current --namespace=…` | сделать `lab-03-4` текущим namespace |
+| `docker tag … lab-03-4/orders-api:2.0` | дать образу 2.0 имя с префиксом работы |
+| `docker build … --build-arg APP_VERSION=2.1` | собрать версию 2.1 из исходников orders-api |
+| `docker push` | отправить оба образа в реестр стенда |
+
+Теперь создаём две версии приложения: Deployment и Service на каждую. Манифест лежит в файле, потому что его читают несколько работ.
+
+```bash
+cat > ~/lab/k8s/03-4/versions.yaml <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: $n}
+metadata: {name: api-2-0}
 spec:
   replicas: 2
-  selector: {matchLabels: {app: $n}}
+  selector: {matchLabels: {app: api-2-0}}
   template:
-    metadata: {labels: {app: $n}}
+    metadata: {labels: {app: api-2-0}}
     spec:
       containers:
       - name: api
-        image: localhost:5001/orders-api:$v
+        image: localhost:5001/lab-03-4/orders-api:2.0
         ports: [{name: http, containerPort: 8000}]
         readinessProbe: {httpGet: {path: /ready, port: http}, periodSeconds: 2}
 ---
 apiVersion: v1
 kind: Service
-metadata: {name: $n}
+metadata: {name: api-2-0}
 spec:
-  selector: {app: $n}
+  selector: {app: api-2-0}
+  ports: [{name: http, port: 80, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: api-2-1}
+spec:
+  replicas: 2
+  selector: {matchLabels: {app: api-2-1}}
+  template:
+    metadata: {labels: {app: api-2-1}}
+    spec:
+      containers:
+      - name: api
+        image: localhost:5001/lab-03-4/orders-api:2.1
+        ports: [{name: http, containerPort: 8000}]
+        readinessProbe: {httpGet: {path: /ready, port: http}, periodSeconds: 2}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: api-2-1}
+spec:
+  selector: {app: api-2-1}
   ports: [{name: http, port: 80, targetPort: http}]
 EOF
-done
-kubectl rollout status deploy/api-2-0; kubectl rollout status deploy/api-2-1
+kubectl apply -f ~/lab/k8s/03-4/versions.yaml
+kubectl rollout status deploy/api-2-0
+kubectl rollout status deploy/api-2-1
 ```
 
-Клиент для замеров — скрипт в контейнере сети `kind` (с хоста те же запросы — `curl -H 'Host: shop.localhost' http://127.0.0.1:8088/...`):
+| Часть манифеста | Значение |
+|---|---|
+| `replicas: 2` | по два пода на версию |
+| `app: api-2-0` | метка, по которой Service выбирает поды своей версии |
+| `image: …:2.0` и `…:2.1` | две версии приложения |
+| `readinessProbe /ready` | под попадает в Service, когда приложение готово (02-5) |
+| `port: 80`, `targetPort: http` | Service принимает на 80 и ведёт на порт пода с именем `http` |
+
+Результат (сокращён):
+
+```
+deployment.apps/api-2-0 created
+service/api-2-0 created
+deployment.apps/api-2-1 created
+service/api-2-1 created
+deployment "api-2-0" successfully rolled out
+deployment "api-2-1" successfully rolled out
+```
+
+Разбор вывода: четыре строки `created` — объекты принял API-сервер, а две последние строки значат, что поды обеих версий прошли проверку готовности.
+
+Последний инструмент подготовки — клиент для замеров. Он работает в контейнере в сети kind и ходит прямо на NodePort узла. Запрос с хоста через порт 8088 идёт тем же путём, только с пробросом порта. Скрипт считает, в какую версию попал каждый запрос, поэтому о маршрутизации судим по содержимому ответа, а не по коду 200.
 
 ```bash
-mkdir -p /tmp/lab-03-4 && cat > /tmp/lab-03-4/gw.py <<'EOF'
-import urllib.request, collections, json, sys
+cat > ~/lab/k8s/03-4/gw.py <<'EOF'
+import urllib.request, urllib.error, collections, json
 BASE = 'http://lab-control-plane:30080'
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a): return None
-op = urllib.request.build_opener(NoRedirect)
+opener = urllib.request.build_opener(NoRedirect)
+
 def get(path, host='shop.localhost', hdr={}):
-    r = urllib.request.Request(BASE + path, headers={'Host': host, **hdr})
+    req = urllib.request.Request(BASE + path, headers={'Host': host, **hdr})
     try:
-        resp = op.open(r, timeout=3); return resp.status, resp.read().decode(), resp.headers
+        r = opener.open(req, timeout=3)
+        return r.status, r.read().decode(), r.headers
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode(), e.headers
-def ver(body): return json.loads(body)['pod'].rsplit('-', 2)[0]
-c = collections.Counter(ver(get('/api/orders')[1]) for _ in range(1000)); print('weights 90/10 over 1000:', dict(c))
-print('x-canary: true ->', dict(collections.Counter(ver(get('/api/orders', hdr={'x-canary': 'true'})[1]) for _ in range(20))))
+
+def version(body): return json.loads(body)['pod'].rsplit('-', 2)[0]
+def split(n, hdr={}):
+    c = collections.Counter(version(get('/api/orders', hdr=hdr)[1]) for _ in range(n))
+    return dict(c)
+
+print('split over 1000:', split(1000))
+print('x-canary: true ->', split(20, {'x-canary': 'true'}))
 code, _, h = get('/'); print('GET / ->', code, h['location'])
-code, body, _ = get('/api/orders', host='unknown.localhost'); print('unknown host ->', code)
+print('unknown host ->', get('/api/orders', host='unknown.localhost')[0])
 EOF
-gw() { docker run --rm --network kind -v /tmp/lab-03-4:/w python:3.12-slim python /w/gw.py; }
+gw() { docker run --rm --network kind -v ~/lab/k8s/03-4:/w python:3.12-slim python /w/gw.py; }
+T='{range .status.parents[*].conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
 ```
 
-### Шаг 1. Маршрут с ловушкой приоритета
+| Часть скрипта или команды | Значение |
+|---|---|
+| `BASE = …lab-control-plane:30080` | NodePort Envoy на узле kind, достижимый из сети kind |
+| `NoRedirect` | не следовать редиректам, чтобы увидеть сам ответ 302 |
+| `Host: shop.localhost` | выбрать маршрут по заголовку Host |
+| `rsplit('-', 2)[0]` | из имени пода вида `api-2-0-<хэш>-<id>` оставить `api-2-0` |
+| `split(n, hdr)` | отправить n запросов и посчитать ответы по версиям |
+| `gw()` | запустить скрипт в контейнере в сети kind |
+| `T=…` | шаблон jsonpath для условий маршрута |
+
+Не закрывайте терминал до конца работ: функция `gw` и переменная `T` живут только в нём. Если вы остановились раньше работы 3, выполните её блок «Уборка».
+
+### Лабораторная работа 1. HTTPRoute и приоритет правил
+
+**Цель.** Прочитать состояние Gateway, опубликовать маршрут со своим хостом и убедиться, что порядок правил в YAML ничего не решает. Вы воспроизведёте поломку, при которой заголовочное правило не срабатывает, найдёте причину и исправите её.
+
+**Что понадобится.**
+
+- Стенд 00-1 с Gateway `lab` в состоянии Programmed.
+- Подготовка из начала раздела: namespace `lab-03-4`, две версии приложения, функция `gw`.
+- Около 30 минут.
+
+**Схема опыта.** Один маршрут `shop` на хосте `shop.localhost` содержит три правила. Клиент шлёт запросы и считает, куда они попали.
+
+```
+клиент ─► Host: shop.localhost ─► Envoy ─┬─ правило 1: заголовок x-canary, пути нет ─► api-2-1
+                                         ├─ правило 2: /api, веса 90/10 ─► api-2-0 / api-2-1
+                                         └─ правило 3: /  ─► редирект 302 на /api/orders
+```
+
+Схема показывает три правила маршрута. Запрос с `x-canary: true` должен попасть в первое, но его перехватит второе, потому что у него есть путь.
+
+**Риски.** Работа меняет только кластер стенда и три вещи на хосте.
+
+- **Что меняется:** namespace `lab-03-4` с двумя версиями приложения и маршрутом; на хосте — каталог `~/lab/k8s/03-4`, два тега образов в Docker и реестре, namespace по умолчанию у контекста `kind-lab` в `~/.kube/config`.
+- **Надолго ли:** до уборки в конце работы 3.
+- **Безопасность:** привилегии не нужны; маршрут слушает только хост `shop.localhost` на стенде.
+- **Влияние на систему:** другие контексты kubectl и существующий маршрут `orders-api` не затронуты.
+- **Откат:** блоки «Уборка» этой работы и работы 3.
+
+#### Шаг 1. Прочитать состояние Gateway
+
+Перед маршрутом смотрим, в каком состоянии вход. Команда собирает шаблон jsonpath по частям (длинная строка не помещается в одну), затем выводит для каждого listener'а число привязанных маршрутов и его условия.
 
 ```bash
-kubectl apply -f - <<'EOF'
+G='{range .status.listeners[*]}{.name}: attachedRoutes={.attachedRoutes} '
+G+='{range .conditions[*]}{.type}={.status} {end}{"\n"}{end}'
+kubectl -n envoy-gateway-system get gateway lab -o jsonpath="$G"
+```
+
+| Часть команды | Значение |
+|---|---|
+| `G+=…` | дописать вторую половину шаблона в переменную |
+| `.status.listeners[*]` | пройти по всем listener'ам Gateway |
+| `{.attachedRoutes}` | сколько маршрутов привязано к listener'у |
+| `.conditions[*]` | типы и значения условий listener'а |
+
+Результат:
+
+```
+http: attachedRoutes=1 Programmed=True Accepted=True ResolvedRefs=True
+```
+
+Разбор вывода:
+
+1. У Gateway один listener `http` (порт 80, §2).
+2. `attachedRoutes=1` — на пустом стенде привязан один маршрут, `orders-api` из 00-1.
+3. Все три условия True: Gateway принят, настроен и все ссылки разрешены.
+
+#### Шаг 2. Опубликовать маршрут с ловушкой приоритета
+
+Создаём маршрут `shop` с тремя правилами. Первое выбирает версию 2.1 по заголовку без пути, второе делит запросы на `/api` в соотношении 90/10, третье отправляет корень на `/api/orders` редиректом. Веса подробно разобраны в §3, они нужны здесь только для замера. После применения читаем условия маршрута и запускаем клиент.
+
+```bash
+cat > ~/lab/k8s/03-4/shop.yaml <<'EOF'
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata: {name: shop}
@@ -240,47 +588,454 @@ spec:
   parentRefs: [{name: lab, namespace: envoy-gateway-system}]
   hostnames: ["shop.localhost"]
   rules:
-  - matches: [{headers: [{name: x-canary, value: "true"}]}]
+  - matches:
+    - headers: [{name: x-canary, value: "true"}]
     backendRefs: [{name: api-2-1, port: 80}]
-  - matches: [{path: {type: PathPrefix, value: /api}}]
+  - matches:
+    - path: {type: PathPrefix, value: /api}
     backendRefs:
     - {name: api-2-0, port: 80, weight: 90}
     - {name: api-2-1, port: 80, weight: 10}
-  - matches: [{path: {type: PathPrefix, value: /}}]
-    filters: [{type: RequestRedirect, requestRedirect: {path: {type: ReplaceFullPath, replaceFullPath: /api/orders}, statusCode: 302}}]
+  - matches:
+    - path: {type: PathPrefix, value: /}
+    filters:
+    - type: RequestRedirect
+      requestRedirect:
+        path: {type: ReplaceFullPath, replaceFullPath: /api/orders}
+        statusCode: 302
 EOF
+kubectl apply -f ~/lab/k8s/03-4/shop.yaml
 sleep 3
-kubectl get httproute shop -o jsonpath='{range .status.parents[*].conditions[*]}{.type}={.status} {.reason}{"\n"}{end}'
+kubectl get httproute shop -o jsonpath="$T"
 gw
 ```
 
-Проверено: `Accepted=True`, `ResolvedRefs=True`; веса 901/99; `x-canary: true -> {'api-2-0': 19, 'api-2-1': 1}` — заголовок не работает (§3); `GET / -> 302`; `unknown host -> 404`.
+| Часть манифеста или команды | Значение |
+|---|---|
+| `parentRefs: [{name: lab, …}]` | привязать маршрут к Gateway `lab` |
+| `hostnames: ["shop.localhost"]` | маршрут отвечает только на этот хост |
+| правило 1: `headers` без `path` | заголовок `x-canary: true` → версия 2.1; пути нет |
+| правило 2: `weight: 90` и `10` | 90 % запросов на 2.0, 10 % на 2.1 |
+| правило 3: `RequestRedirect` | ответить 302 на `/api/orders` вместо бэкенда |
+| `sleep 3` | дать контроллеру время передать конфигурацию прокси |
 
-### Шаг 2. Починить приоритет
+Результат:
 
-```bash
-kubectl patch httproute shop --type=json -p '[{"op":"replace","path":"/spec/rules/0/matches/0","value":{"path":{"type":"PathPrefix","value":"/api"},"headers":[{"name":"x-canary","value":"true"}]}}]'
-sleep 3; gw
+```
+Accepted=True Accepted: Route is accepted
+ResolvedRefs=True ResolvedRefs: Resolved all the Object references for the Route
+split over 1000: {'api-2-1': 99, 'api-2-0': 901}
+x-canary: true -> {'api-2-0': 19, 'api-2-1': 1}
+GET / -> 302 http://shop.localhost/api/orders
+unknown host -> 404
 ```
 
-Проверено: `x-canary: true -> {'api-2-1': 20}`.
+Разбор вывода:
 
-### Шаг 3. Ссылка в чужой namespace
+1. Оба условия True, то есть маршрут принят и бэкенды найдены. Статус зелёный, но маршрутизация неверна.
+2. Строка `split` подтверждает веса: 901 и 99 из 1000, то есть около 90 и 10 процентов.
+3. Строка `x-canary` — поломка. Все 20 запросов с заголовком должны были попасть в `api-2-1`, а 19 ушли в `api-2-0`: они совпали со вторым правилом и разделились по весам.
+4. Редирект и 404 работают: корень отвечает 302 с нужным адресом, а чужой хост не совпал ни с одним маршрутом.
+
+Причина — приоритет (§3). У правила 1 нет пути, поэтому оно считается префиксом `/` и проигрывает правилу 2 с префиксом `/api`, хотя заголовок совпал.
+
+#### Шаг 3. Исправить приоритет
+
+Добавляем в первое правило тот же путь `/api`. Тогда длина префикса у правил 1 и 2 одинакова, и первое выигрывает за счёт совпадения по заголовку. Заменяем только условие первого правила JSON-патчем.
 
 ```bash
-kubectl apply -f - <<'EOF'
+kubectl patch httproute shop --type=json -p \
+  '[{"op":"replace","path":"/spec/rules/0/matches/0","value":
+     {"path":{"type":"PathPrefix","value":"/api"},
+      "headers":[{"name":"x-canary","value":"true"}]}}]'
+sleep 3
+gw
+```
+
+| Часть команды | Значение |
+|---|---|
+| `--type=json` | патч в формате JSON Patch: операции над путями |
+| `"op":"replace"` | заменить значение целиком |
+| `/spec/rules/0/matches/0` | первое условие первого правила |
+| `"path": …"/api"` | добавить путь, равный пути правила с весами |
+
+Результат:
+
+```
+httproute.gateway.networking.k8s.io/shop patched
+split over 1000: {'api-2-1': 99, 'api-2-0': 901}
+x-canary: true -> {'api-2-1': 20}
+GET / -> 302 http://shop.localhost/api/orders
+unknown host -> 404
+```
+
+Разбор вывода:
+
+1. Строка `x-canary` изменилась: все 20 запросов теперь в `api-2-1`.
+2. Строка `split` не изменилась, потому что правка не касалась правила с весами; запросы без заголовка по-прежнему делятся 90/10.
+3. Порядок правил в YAML остался прежним. Помогла не перестановка, а специфичность: путь плюс заголовок побеждает путь без заголовка.
+
+#### Итог
+
+Что вы узнали:
+
+| Что узнали | Как проверить |
+|---|---|
+| Статус Gateway и число привязанных маршрутов | `attachedRoutes` в `status.listeners` |
+| Зелёные условия не доказывают верную маршрутизацию | клиент считает версии по содержимому ответа |
+| Правило без пути проигрывает правилу с путём | `x-canary` уходил в общий канал 90/10 |
+| Победу решает специфичность, а не порядок в YAML | путь `/api` в правиле с заголовком |
+| Нет совпадения хоста → 404, корень → 302 | строки `unknown host` и `GET /` |
+
+#### Уборка
+
+Удаляем только маршрут: namespace и приложения понадобятся в работах 2 и 3.
+
+```bash
+kubectl delete httproute shop
+```
+
+Результат:
+
+```
+httproute.gateway.networking.k8s.io "shop" deleted
+```
+
+Разбор вывода: маршрут удалён, и хост `shop.localhost` снова отвечает 404. Gateway и маршрут `orders-api` не затронуты.
+
+#### Вопросы для самопроверки
+
+1. Маршрут показывает `Accepted=True` и `ResolvedRefs=True`, а запросы с заголовком идут не в ту версию. Почему и как проверить?
+
+<details><summary>Ответ</summary>
+
+Условия говорят только о том, что маршрут принят и ссылки разрешены, но не о том, какое правило победит. Скорее всего, победило правило с более длинным путём или большим числом совпадений. Проверяют клиентом, который считает версии по содержимому ответа, а не по коду 200.
+
+</details>
+
+2. В каком порядке Gateway API выбирает правило, если подходят несколько?
+
+<details><summary>Ответ</summary>
+
+Точный путь, затем самый длинный префикс, затем метод, затем больше совпадений по заголовкам, затем больше по параметрам запроса. При ничьей между маршрутами выигрывает более старый, потом тот, у которого раньше `namespace/name`; внутри одного маршрута при ничьей побеждает первое правило в YAML.
+
+</details>
+
+3. Какой путь имеет правило, в котором `path` не указан?
+
+<details><summary>Ответ</summary>
+
+`PathPrefix: /`. Его длина равна 1, поэтому оно проигрывает любому правилу с более длинным префиксом.
+
+</details>
+
+4. Почему запрос на хост `unknown.localhost` получил 404, а не ошибку соединения?
+
+<details><summary>Ответ</summary>
+
+Соединение принимает listener `http` на порту 80, он не привязан к хосту. Но ни у одного маршрута нет подходящего хоста, поэтому прокси отвечает 404 от имени Gateway.
+
+</details>
+
+### Лабораторная работа 2. Canary весами с замером распределения
+
+**Цель.** Менять долю трафика на новую версию правкой весов и проверять результат измерением. Вы пройдёте весь путь выкатки: 90/10, 50/50, 0/100 и откат, и убедитесь, что заголовочное правило даёт доступ к canary при любых весах.
+
+**Что понадобится.**
+
+- Подготовка из начала раздела: две версии приложения, функции `gw` и переменная `T`.
+- Манифест маршрута с исправленным приоритетом; он создаётся в шаге 1.
+- Около 20 минут. Клиент шлёт запросы по одному, поэтому дождитесь завершения каждого замера.
+
+**Схема опыта.** Маршрут `shop` делит запросы на `/api` между двумя Service. Мы меняем веса, а клиент считает, как они разошлись.
+
+```
+веса 90/10 ──► 50/50 ──► 0/100 ──► 100/0 (откат)
+   │            │          │          │
+   └── gw: split over 1000 в каждой точке; заголовочное правило даёт api-2-1 всегда
+```
+
+Схема показывает четыре точки выкатки. Первая точка измерена на стенде автора, остальные описаны по документации.
+
+**Риски.** Работа меняет только маршрут `shop` в кластере. Откат: уборка в конце работы.
+
+#### Шаг 1. Применить маршрут с исправленным приоритетом и замерить 90/10
+
+Создаём маршрут заново, уже с путём `/api` в первом правиле. Это тот же манифест, что в работе 1 после исправления, только записанный целиком.
+
+```bash
+cat > ~/lab/k8s/03-4/shop.yaml <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: {name: shop}
+spec:
+  parentRefs: [{name: lab, namespace: envoy-gateway-system}]
+  hostnames: ["shop.localhost"]
+  rules:
+  - matches:
+    - path: {type: PathPrefix, value: /api}
+      headers: [{name: x-canary, value: "true"}]
+    backendRefs: [{name: api-2-1, port: 80}]
+  - matches:
+    - path: {type: PathPrefix, value: /api}
+    backendRefs:
+    - {name: api-2-0, port: 80, weight: 90}
+    - {name: api-2-1, port: 80, weight: 10}
+  - matches:
+    - path: {type: PathPrefix, value: /}
+    filters:
+    - type: RequestRedirect
+      requestRedirect:
+        path: {type: ReplaceFullPath, replaceFullPath: /api/orders}
+        statusCode: 302
+EOF
+kubectl apply -f ~/lab/k8s/03-4/shop.yaml
+sleep 3
+gw
+```
+
+| Часть команды | Значение |
+|---|---|
+| `cat > shop.yaml` | записать маршрут целиком, с путём в правиле 1 |
+| `kubectl apply -f` | создать маршрут (в работе 1 он удалён) |
+| `gw` | замерить 1000 запросов и 20 запросов с заголовком |
+
+Результат:
+
+```
+httproute.gateway.networking.k8s.io/shop created
+split over 1000: {'api-2-1': 99, 'api-2-0': 901}
+x-canary: true -> {'api-2-1': 20}
+GET / -> 302 http://shop.localhost/api/orders
+unknown host -> 404
+```
+
+Разбор вывода:
+
+1. Доли 901 и 99 из 1000 совпадают с весами 90 и 10 в пределах случайного разброса. Для доли 10 % одно стандартное отклонение на 1000 запросов равно примерно 9 запросам, и 99 лежит внутри него.
+2. Все 20 запросов с заголовком идут в `api-2-1` независимо от весов: правило с заголовком победило.
+3. Распределение посчитано по запросам. Поэтому две реплики на версию — то же, что одна или десять: Envoy делит запросы между Service, а не между подами.
+
+#### Шаг 2. Увеличить долю canary до 50/50
+
+Следующий этап выкатки: если на 10 % всё хорошо, переводим половину трафика. Правим только веса во втором правиле. Это единственное изменение, которое нужно для выкатки.
+
+```bash
+kubectl patch httproute shop --type=json -p \
+  '[{"op":"replace","path":"/spec/rules/1/backendRefs/0/weight","value":50},
+    {"op":"replace","path":"/spec/rules/1/backendRefs/1/weight","value":50}]'
+sleep 3
+gw
+```
+
+| Часть команды | Значение |
+|---|---|
+| `rules/1` | второе правило, то есть правило с весами |
+| `backendRefs/0/weight` | вес первого бэкенда, `api-2-0` |
+| `backendRefs/1/weight` | вес второго бэкенда, `api-2-1` |
+| два `replace` в одном патче | оба веса меняются одной атомарной правкой |
+
+Ожидаемый результат (в прогоне автора этого шага не было; числа первой строки вычислены):
+
+```
+httproute.gateway.networking.k8s.io/shop patched
+split over 1000: {'api-2-0': ≈500, 'api-2-1': ≈500}
+x-canary: true -> {'api-2-1': 20}
+…
+```
+
+Разбор вывода:
+
+1. Каждое из двух чисел в строке `split` должно быть около 500. Одно стандартное отклонение для доли 50 % на 1000 запросов равно примерно 16, поэтому значения от 468 до 532 (два отклонения) считаются нормой.
+2. Сумма двух чисел всегда равна 1000: потерянных запросов нет.
+3. Заголовочное правило не изменилось: все 20 запросов по-прежнему в `api-2-1`.
+
+#### Шаг 3. Довести выкатку до 0/100 и откатить
+
+Завершаем выкатку: весь трафик на новую версию, затем возвращаем всё на старую, как при обнаружении ошибки. Вес 0 не удаляет бэкенд из списка, а только лишает его запросов. Поэтому откат — это та же правка весов.
+
+```bash
+kubectl patch httproute shop --type=json -p \
+  '[{"op":"replace","path":"/spec/rules/1/backendRefs/0/weight","value":0},
+    {"op":"replace","path":"/spec/rules/1/backendRefs/1/weight","value":100}]'
+sleep 3
+gw
+kubectl patch httproute shop --type=json -p \
+  '[{"op":"replace","path":"/spec/rules/1/backendRefs/0/weight","value":100},
+    {"op":"replace","path":"/spec/rules/1/backendRefs/1/weight","value":0}]'
+sleep 3
+gw
+```
+
+| Часть команды | Значение |
+|---|---|
+| первый патч: `0` и `100` | вся доля на `api-2-1`: выкатка завершена |
+| второй патч: `100` и `0` | вся доля на `api-2-0`: откат на стабильную версию |
+| `gw` после каждого патча | замер на каждом этапе |
+
+Ожидаемый результат (в прогоне автора этого шага не было; значения следуют из весов 0 и 100):
+
+```
+split over 1000: {'api-2-1': 1000}
+x-canary: true -> {'api-2-1': 20}
+…
+split over 1000: {'api-2-0': 1000}
+x-canary: true -> {'api-2-1': 20}
+…
+```
+
+Разбор вывода:
+
+1. При весах 0 и 100 все 1000 запросов уходят в `api-2-1`. Здесь результат не случайный, а точный: доля нулевого бэкенда равна нулю.
+2. После отката все 1000 запросов уходят в `api-2-0`, но тестировщики с заголовком по-прежнему видят версию 2.1.
+3. Такое состояние, веса 100/0 и заголовочное правило, нужно для начала выкатки: canary уже принимает целевой трафик, а обычные пользователи его ещё не видят.
+
+#### Итог
+
+Что вы узнали:
+
+| Что узнали | Как проверить |
+|---|---|
+| Доля задаётся весами, а не числом подов | `weight` в `backendRefs` |
+| Распределение случайное, разброс ≈ 9 на 1000 при 10 % | замер `split over 1000` |
+| Выкатка и откат — правка двух чисел | `kubectl patch` весов |
+| Вес 0 даёт точное «ничего» | при 100/0 все 1000 запросов в `api-2-0` |
+| Заголовочное правило не зависит от весов | `x-canary: true` всегда в `api-2-1` |
+
+#### Уборка
+
+Удаляем маршрут, как в работе 1. Версии приложения остаются для работы 3.
+
+```bash
+kubectl delete httproute shop
+```
+
+Результат:
+
+```
+httproute.gateway.networking.k8s.io "shop" deleted
+```
+
+Разбор вывода: маршрут удалён, и хост `shop.localhost` снова отвечает 404.
+
+#### Вопросы для самопроверки
+
+1. Версия 2.1 запущена в одной реплике, версия 2.0 в десяти. Какую долю запросов получит 2.1 при весах 90 и 10?
+
+<details><summary>Ответ</summary>
+
+Около 10 %. Веса делят запросы между Service, а не между подами, поэтому число реплик на долю не влияет. Нагрузку на единственную реплику нужно учитывать отдельно: она получит всё, что отведено версии.
+
+</details>
+
+2. Почему замер из 1000 запросов не даёт ровно 100 запросов на canary при весе 10?
+
+<details><summary>Ответ</summary>
+
+Выбор бэкенда случайный для каждого запроса. Для доли 10 % разброс на 1000 запросов — около 9 запросов (одно стандартное отклонение), поэтому 99 или 105 нормальны. Для проверки правильности весов нужен замер побольше или допуск в несколько процентов.
+
+</details>
+
+3. Как вести canary только для тестировщиков, не затрагивая обычных пользователей?
+
+<details><summary>Ответ</summary>
+
+Поставить веса 100/0 и оставить правило с заголовком (и тем же путём, что у правила с весами). Запросы с заголовком идут в canary, остальные — в стабильную версию.
+
+</details>
+
+4. Чем canary весами отличается от canary долей реплик из 02-2?
+
+<details><summary>Ответ</summary>
+
+При долях реплик точность зависит от числа подов (1 из 10 подов — 10 %) и от балансировки соединений в kube-proxy. Веса не зависят от числа подов, меняются одним полем и работают на уровне запросов, но требуют L7-входа и двух Service.
+
+</details>
+
+### Лабораторная работа 3. ReferenceGrant
+
+**Цель.** Увидеть, как Gateway API защищает чужие namespace. Вы направите маршрут в Service, который лежит в `orders`, получите отказ, выдадите разрешение владельцем целевого namespace и отзовёте его.
+
+**Что понадобится.**
+
+- Подготовка из начала раздела: namespace `lab-03-4`, функции `gw`, переменная `T`.
+- Демо-приложение `orders` из 00-1: Service `orders-api` в namespace `orders`.
+- Образ `curlimages/curl:8.11.1` (Docker скачает его при первом запуске).
+- Около 20 минут.
+
+**Схема опыта.** Маршрут `cross` живёт в `lab-03-4`, а его бэкенд — Service `orders-api` в `orders`. Мы проверяем ответ до разрешения, после него и после отзыва.
+
+```
+cross.localhost ─► Envoy ─► HTTPRoute cross (ns lab-03-4)
+                                  │ backendRefs: orders/orders-api
+                                  ▼
+          нет ReferenceGrant → 500       есть ReferenceGrant → 200
+```
+
+Схема показывает одну ссылку в двух состояниях. Ссылка допустима только при наличии разрешения в `orders`.
+
+**Риски.** Работа добавляет объект в общий namespace `orders`.
+
+- **Что меняется:** в `orders` на время работы появляется ReferenceGrant; в `lab-03-4` — маршрут `cross`. Пока разрешение есть, приложение `orders-api` доступно ещё и по хосту `cross.localhost`.
+- **Надолго ли:** до шага 3 или до уборки.
+- **Безопасность:** хост доступен только с вашей машины через `127.0.0.1:8088`; существующий маршрут `orders-api` не затронут.
+- **Влияние на систему:** другие объекты `orders` не меняются.
+- **Откат:** шаг 3 и блок «Уборка»; команда `kubectl apply -f ~/lab/k8s/orders-api/k8s/` возвращает манифесты стенда, если вы изменили что-то ещё.
+
+#### Шаг 1. Маршрут в чужой namespace без разрешения
+
+Создаём маршрут `cross` с бэкендом из другого namespace. Затем читаем условия маршрута с сообщениями и запрашиваем адрес через клиент `curl`. Функция `httpcode` печатает только код ответа.
+
+```bash
+httpcode() { docker run --rm --network kind curlimages/curl:8.11.1 -s -o /dev/null \
+  -w '%{http_code}\n' -H "Host: $1" "http://lab-control-plane:30080$2"; }
+cat > ~/lab/k8s/03-4/cross.yaml <<'EOF'
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata: {name: cross}
 spec:
   parentRefs: [{name: lab, namespace: envoy-gateway-system}]
   hostnames: ["cross.localhost"]
-  rules: [{backendRefs: [{name: orders-api, namespace: orders, port: 80}]}]
+  rules:
+  - backendRefs: [{name: orders-api, namespace: orders, port: 80}]
 EOF
+kubectl apply -f ~/lab/k8s/03-4/cross.yaml
 sleep 3
-kubectl get httproute cross -o jsonpath='{range .status.parents[*].conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
-docker run --rm --network kind curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}\n' -H 'Host: cross.localhost' http://lab-control-plane:30080/api/orders
-kubectl apply -f - <<'EOF'
+kubectl get httproute cross -o jsonpath="$T"
+httpcode cross.localhost /api/orders
+```
+
+| Часть команды | Значение |
+|---|---|
+| `httpcode()` | функция: запрос с заданным Host и путём, вывод только кода |
+| `-w '%{http_code}\n'` | напечатать код ответа вместо тела |
+| `backendRefs: … namespace: orders` | бэкенд лежит в другом namespace |
+| `jsonpath="$T"` | условия маршрута с причиной и сообщением |
+
+Результат:
+
+```
+httproute.gateway.networking.k8s.io/cross created
+Accepted=True Accepted: Route is accepted
+ResolvedRefs=False RefNotPermitted: Failed to process route rule 0 backendRef 0: Backend ref to Service orders/orders-api not permitted by any ReferenceGrant.
+500
+```
+
+Строка `ResolvedRefs` длинная, но приведена целиком: разбор опирается на все её части.
+
+Разбор вывода:
+
+1. `Accepted=True` — маршрут привязан к Gateway: namespace `lab-03-4` разрешён в allowedRoutes (§2).
+2. `ResolvedRefs=False RefNotPermitted` — ссылка на бэкенд запрещена, а не повреждена. Сервис существует.
+3. Сообщение называет правило 0, бэкенд 0 и объект `orders/orders-api`, то есть точно указывает, чего не хватает.
+4. Код 500: так прокси отвечает на запросы к недопустимому бэкенду (§5).
+
+#### Шаг 2. Выдать разрешение владельцем namespace
+
+Владелец `orders` создаёт ReferenceGrant: разрешает маршрутам HTTPRoute из `lab-03-4` ссылаться на Service `orders-api`. Поле `to` содержит имя, поэтому разрешён только этот Service. После применения повторяем проверку.
+
+```bash
+cat > ~/lab/k8s/03-4/grant.yaml <<'EOF'
 apiVersion: gateway.networking.k8s.io/v1
 kind: ReferenceGrant
 metadata: {name: allow-lab-03-4, namespace: orders}
@@ -288,191 +1043,135 @@ spec:
   from: [{group: gateway.networking.k8s.io, kind: HTTPRoute, namespace: lab-03-4}]
   to: [{group: "", kind: Service, name: orders-api}]
 EOF
+kubectl apply -f ~/lab/k8s/03-4/grant.yaml
 sleep 4
-kubectl get httproute cross -o jsonpath='{range .status.parents[*].conditions[*]}{.type}={.status} {.reason}{"\n"}{end}'
-docker run --rm --network kind curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}\n' -H 'Host: cross.localhost' http://lab-control-plane:30080/api/orders
+kubectl get httproute cross -o jsonpath="$T"
+httpcode cross.localhost /api/orders
+```
+
+| Часть манифеста | Значение |
+|---|---|
+| `namespace: orders` | разрешение лежит в namespace цели |
+| `from: … kind: HTTPRoute, namespace: lab-03-4` | кому: маршрутам из `lab-03-4` |
+| `to: … kind: Service, name: orders-api` | на что: только этот Service |
+| `group: ""` | основная группа API, где живёт Service |
+
+Ожидаемый результат (в прогоне автора были проверены только итоговые состояния `ResolvedRefs=True` и код 200; текст сообщения приведён по вычисленному):
+
+```
+referencegrant.gateway.networking.k8s.io/allow-lab-03-4 created
+Accepted=True Accepted: Route is accepted
+ResolvedRefs=True ResolvedRefs: Resolved all the Object references for the Route
+200
+```
+
+Разбор вывода:
+
+1. Объект создан в `orders`, то есть владельцем цели, а не автором маршрута.
+2. `ResolvedRefs` стало True: ссылка допустима, контроллер обновил прокси без правки маршрута.
+3. Код 200 подтверждает, что запрос дошёл до `orders-api`.
+4. Автор маршрута свою ссылку не менял: изменился только набор разрешений. Это и есть модель безопасности: публиковать маршрут может команда, но дать себе доступ к чужому сервису не может.
+
+#### Шаг 3. Отозвать разрешение
+
+Разрешение можно забрать, и маршрут снова перестанет работать. Это проверка, что доступ действительно держится на ReferenceGrant, а не на чём-то ещё.
+
+```bash
 kubectl -n orders delete referencegrant allow-lab-03-4
+sleep 4
+kubectl get httproute cross -o jsonpath="$T"
+httpcode cross.localhost /api/orders
 ```
 
-Проверено: вывод в §4 (`500` → `200`).
+| Часть команды | Значение |
+|---|---|
+| `-n orders delete referencegrant …` | удалить разрешение в namespace цели |
+| `sleep 4` | дождаться, пока контроллер пересчитает ссылки |
 
-### Шаг 4. Ingress без контроллера
+Ожидаемый результат (в прогоне автора этого шага не было):
 
-```bash
-kubectl get ingressclass
-kubectl apply -f - <<'EOF'
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: shop-legacy
-  annotations: {nginx.ingress.kubernetes.io/rewrite-target: /}
-spec:
-  ingressClassName: nginx
-  rules:
-  - host: legacy.localhost
-    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: api-2-0, port: {number: 80}}}}]}
-EOF
-kubectl get ingress shop-legacy; kubectl get ingress shop-legacy -o jsonpath='{.status}{"\n"}'
+```
+referencegrant.gateway.networking.k8s.io "allow-lab-03-4" deleted
+Accepted=True Accepted: Route is accepted
+ResolvedRefs=False RefNotPermitted: Failed to process route rule 0 backendRef 0: …
+500
 ```
 
-Проверено: `No resources found` для IngressClass, у Ingress пустой `ADDRESS`, `{"loadBalancer":{}}`.
+Разбор вывода:
 
-### Шаг 5. TLS через cert-manager
+1. Условие вернулось к `RefNotPermitted`, а код — к 500: состояние совпадает с шагом 1.
+2. Маршрут при этом остался принятым. Отзыв разрешения ломает только ссылку, а не привязку к Gateway.
+3. Для владельца `orders` это способ закрыть доступ без обращения к команде, которая создала маршрут.
 
-```bash
-cat > /tmp/lab-03-4/cm-values.yaml <<'EOF'
-crds: {enabled: true}
-config:
-  apiVersion: controller.config.cert-manager.io/v1alpha1
-  kind: ControllerConfiguration
-  enableGatewayAPI: true
-EOF
-helm upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager --version v1.21.2 \
-  -n cert-manager --create-namespace -f /tmp/lab-03-4/cm-values.yaml --wait --timeout 5m
-kubectl apply -f - <<'EOF'
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata: {name: selfsigned}
-spec: {selfSigned: {}}
----
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata: {name: lab-ca, namespace: cert-manager}
-spec:
-  isCA: true
-  commonName: lab-ca
-  secretName: lab-ca
-  privateKey: {algorithm: ECDSA, size: 256}
-  issuerRef: {name: selfsigned, kind: ClusterIssuer}
----
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata: {name: lab-ca}
-spec: {ca: {secretName: lab-ca}}
-EOF
-kubectl -n cert-manager wait --for=condition=Ready certificate/lab-ca
-kubectl -n envoy-gateway-system annotate gateway lab cert-manager.io/cluster-issuer=lab-ca
-kubectl -n envoy-gateway-system patch gateway lab --type=json -p '[{"op":"add","path":"/spec/listeners/-","value":{"name":"https-shop","protocol":"HTTPS","port":443,"hostname":"shop.localhost","allowedRoutes":{"namespaces":{"from":"All"}},"tls":{"mode":"Terminate","certificateRefs":[{"name":"shop-localhost-tls"}]}}}]'
-until kubectl -n envoy-gateway-system get certificate shop-localhost-tls 2>/dev/null; do sleep 2; done
-kubectl -n envoy-gateway-system wait --for=condition=Ready certificate/shop-localhost-tls
-kubectl -n envoy-gateway-system get certificate shop-localhost-tls -o jsonpath='dnsNames={.spec.dnsNames} notAfter={.status.notAfter} renewal={.status.renewalTime}{"\n"}'
+#### Итог
 
-kubectl -n cert-manager get secret lab-ca -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/lab-03-4/lab-ca.crt
-NP=$(kubectl -n envoy-gateway-system get svc -l gateway.envoyproxy.io/owning-gateway-name=lab -o jsonpath='{.items[0].spec.ports[?(@.port==443)].nodePort}')
-IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' lab-control-plane)
-docker run --rm --network kind -v /tmp/lab-03-4:/w curlimages/curl:8.11.1 -sv --cacert /w/lab-ca.crt \
-  --resolve shop.localhost:$NP:$IP https://shop.localhost:$NP/api/orders -o /dev/null 2>&1 | grep -E 'SSL connection|issuer|expire|ALPN'
-docker run --rm --network kind curlimages/curl:8.11.1 -s --resolve shop.localhost:$NP:$IP https://shop.localhost:$NP/ -o /dev/null -w '%{errormsg}\n'
-```
+Что вы узнали:
 
-Проверено: вывод в §5. Порт 443 Envoy получил случайный NodePort (30708) — на хост `kind.yaml` пробрасывает только 30080; HTTPS в лабе проверяем из сети kind.
+| Что узнали | Как проверить |
+|---|---|
+| Ссылка в чужой namespace без разрешения запрещена | `RefNotPermitted`, код 500 |
+| Разрешение создаёт владелец цели, а не автор маршрута | ReferenceGrant в `orders` |
+| Привязка к Gateway и ссылка на бэкенд проверяются отдельно | `Accepted` и `ResolvedRefs` |
+| Разрешение можно сузить до одного Service | поле `name` в `to` |
+| Отзыв разрешения немедленно ломает ссылку | шаг 3 |
 
-### Уборка
+#### Уборка
+
+Удаляем все объекты работ 1–3, namespace, каталог, теги образов и функции. В конце проверяем, что сквозной сценарий стенда цел.
 
 ```bash
-kubectl -n envoy-gateway-system patch gateway lab --type=json -p '[{"op":"remove","path":"/spec/listeners/1"},{"op":"remove","path":"/metadata/annotations/cert-manager.io~1cluster-issuer"}]'
-kubectl -n envoy-gateway-system delete certificate shop-localhost-tls; kubectl -n envoy-gateway-system delete secret shop-localhost-tls
-kubectl delete clusterissuer selfsigned lab-ca
-helm -n cert-manager uninstall cert-manager
-kubectl delete ns cert-manager
-kubectl get crd -o name | grep cert-manager.io | xargs kubectl delete
+kubectl -n orders delete referencegrant allow-lab-03-4 --ignore-not-found
+kubectl delete httproute cross shop --ignore-not-found
 kubectl config set-context --current --namespace=default
 kubectl delete ns lab-03-4
-rm -rf /tmp/lab-03-4
-curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders     # 200 — сквозной сценарий цел
+rm -rf ~/lab/k8s/03-4
+unset -f gw httpcode
+docker rmi localhost:5001/lab-03-4/orders-api:2.0 localhost:5001/lab-03-4/orders-api:2.1
+curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders
 ```
 
----
+Результат (последняя строка):
 
-## 🔥 Кейс из прода: «после переезда с ingress-nginx на Gateway API пропала канарейка»
+```
+200
+```
 
-**Контекст.** 40 сервисов переводили с ingress-nginx на Gateway API (Envoy Gateway) с помощью `ingress2gateway` и ручной доводки. У платёжного сервиса был canary через аннотации ingress-nginx: второй Ingress с `canary: "true"` и `canary-by-header: X-Canary`. После переезда QA с заголовком `X-Canary` попадали в стабильную версию, а 10% случайных пользователей — в canary, где шёл эксперимент с новым платёжным провайдером.
+Разбор вывода: `200` значит, что маршрут `orders-api` и приложение на месте. Теги в реестре стенда остаются, они исчезнут при пересоздании стенда (00-1). Namespace `orders` не удалялся, и ReferenceGrant из него убран.
 
-**Разбор.**
-1. HTTPRoute после конвертации: правило с одним заголовком (без пути) и правило `/pay` с весами 90/10 — ровно как в шаге 1 лабы.
-2. По приоритету Gateway API правило с путём `/pay` важнее правила без пути — заголовок не срабатывал. В ingress-nginx логика canary-аннотаций была другой: заголовок проверялся раньше весов.
-3. Тесты миграции проверяли только «отвечает ли 200», а не «в какую версию попал запрос».
+#### Вопросы для самопроверки
 
-**Фикс.**
-- В правило с заголовком добавили тот же `path`, что и у правила с весами (шаг 2 лабы).
-- В приёмочные проверки миграции — распределение версий: 1000 запросов с заголовком и без, ожидаемые доли (скрипт как `gw.py`).
-- Эксперимент с провайдером — не на весах, а на заголовке/cookie для конкретных пользователей.
+1. Где создают ReferenceGrant: рядом с маршрутом или рядом с Service?
 
-**Что запомнить.**
-- Gateway API выбирает правило по приоритету (путь → метод → заголовки → query), а не по порядку в YAML.
-- Аннотации ingress-nginx при миграции — не «конвертируются», а переписываются и проверяются.
-- Проверяйте маршрутизацию по содержимому ответа (версия, под), а не по коду 200.
+<details><summary>Ответ</summary>
 
----
+Рядом с Service, в namespace цели. Разрешение даёт владелец объекта, на который ссылаются, поэтому автор маршрута не может выдать его себе сам.
 
-## 💼 Вопросы с собеседования
+</details>
 
-### 🟢 Junior
+2. Маршрут из другого namespace привязывается к Gateway. Нужен ли для этого ReferenceGrant?
 
-**1. Зачем нужен Ingress или Gateway, если есть Service типа LoadBalancer?**
-LoadBalancer — L4, один внешний IP на сервис. Ingress/Gateway — L7: один вход на много сервисов, маршрутизация по хосту и пути, TLS-терминация, редиректы, веса.
+<details><summary>Ответ</summary>
 
-**2. Что нужно, чтобы Ingress заработал?**
-Контроллер (ingress-nginx, Traefik и т. д.) и IngressClass; сам объект Ingress без контроллера ничего не делает.
+Нет. Привязку к Gateway регулирует `allowedRoutes` у listener'а, а ReferenceGrant нужен для ссылок на бэкенды и секреты в чужом namespace.
 
-### 🟡 Middle
+</details>
 
-**3. Чем Gateway API лучше Ingress?**
-Разделение ролей (GatewayClass/Gateway — платформа, Route — команды), богатая маршрутизация в стандарте (заголовки, веса, rewrite, редиректы), протоколы кроме HTTP (gRPC, TCP, UDP, TLS passthrough), явные разрешения между namespace (ReferenceGrant), переносимость между реализациями без аннотаций.
+3. В `to` не указано имя. Что разрешено?
 
-**4. Как сделать canary 10% средствами Gateway API?**
-Два `backendRefs` в одном правиле HTTPRoute с весами 90/10; для тестировщиков — отдельное правило с совпадением по заголовку **и тому же пути**. Веса — на уровне запросов. Автоматизация — Argo Rollouts/Flagger с анализом метрик.
+<details><summary>Ответ</summary>
 
-**5. Маршрут создан, но трафик не идёт. Что смотрите?**
-`status.parents[].conditions` маршрута: `Accepted=False` — namespace не разрешён `allowedRoutes`, не совпал hostname или имя listener'а; `ResolvedRefs=False` — нет Service/порта или нужен ReferenceGrant. Затем `status.listeners` Gateway (`attachedRoutes`, `Programmed`), логи контроллера и прокси.
+Все объекты указанного вида в namespace цели. Для Service это все Service namespace, поэтому имя лучше задавать.
 
-### 🔴 Senior
+</details>
 
-**6. Как устроен выпуск и продление сертификатов cert-manager?**
-Issuer/ClusterIssuer (ACME, CA, Vault…) → Certificate (dnsNames, срок, ключ) → CertificateRequest → подписанный Secret `kubernetes.io/tls`; контроллер продлевает за треть срока до окончания. Для ACME — решатели http01 (временный маршрут через Gateway/Ingress) или dns01 (wildcard, закрытые сети). Для Gateway — gateway-shim: аннотация на Gateway, Certificate на каждый HTTPS-listener с hostname. Мониторинг — срок и `Ready`.
+4. Почему при `RefNotPermitted` маршрут остаётся принятым (`Accepted=True`)?
 
-**7. Как спланировать миграцию с ingress-nginx?**
-Инвентаризация аннотаций и snippets; выбор реализации Gateway API; генерация HTTPRoute (`ingress2gateway`) и ручной перевод того, чего нет в стандарте (rate limit, auth — в Policy реализации); проверка приоритета правил и таймаутов; параллельный запуск на отдельном LB с переносом DNS по хостам; приёмка по содержимому ответов; перенос TLS на gateway-shim; вывод ingress-nginx.
+<details><summary>Ответ</summary>
 
-**8. Зачем ReferenceGrant?**
-Чтобы маршрут (или Gateway за TLS-секретом) в одном namespace не мог ссылаться на объекты другого без согласия владельца. Без него любая команда на общем Gateway могла бы направить трафик в чужой Service или вытащить чужой сертификат.
+Привязка к Gateway и разрешение ссылки — разные проверки с разными условиями. Маршрут привязан, но один из его бэкендов недопустим, поэтому запросы к нему получают 500, а остальные правила маршрута работают.
 
----
+</details>
 
-## ⚠️ Подводные камни
+## → Дальше
 
-- Порядок правил в HTTPRoute не определяет выбор — приоритет по пути, методу, заголовкам, query.
-- Правило без `path` = `PathPrefix: /` и проигрывает любым более длинным путям.
-- Ingress без контроллера и IngressClass — молча ничего не делает.
-- Ссылка на Service в чужом namespace без ReferenceGrant — `ResolvedRefs=False`, Envoy отвечает 500.
-- Envoy нормализует пути (`..`, двойные слэши) до маршрутизации.
-- Аннотации ingress-nginx (canary, rewrite, snippets) не переносятся 1:1.
-- cert-manager с Gateway требует `enableGatewayAPI: true`; без него аннотация на Gateway игнорируется.
-- `helm uninstall cert-manager` не удаляет CRD — удаляйте отдельно, иначе следующая установка конфликтует с остатками (или наоборот: удаление CRD удаляет все Certificate кластера).
-- Таймауты разных контроллеров отличаются — переносите явно.
-
----
-
-## Чеклист
-
-- [ ] Объясню разницу Ingress и Gateway API и роли объектов Gateway API.
-- [ ] Прочитаю статусы Gateway и HTTPRoute и найду причину непринятого маршрута.
-- [ ] Настрою canary весами и заголовком с правильным приоритетом и измерю распределение.
-- [ ] Разрешу ссылку в чужой namespace через ReferenceGrant.
-- [ ] Выпущу сертификат cert-manager'ом для HTTPS-listener'а и проверю TLS.
-- [ ] Составлю план миграции с ingress-nginx.
-
----
-
-## Задание со звёздочкой
-
-Автоматизируйте canary orders-api без внешних инструментов:
-
-1. В namespace `orders` создайте `orders-api-canary` (образ 2.1, 1 реплика) и HTTPRoute с весами 100/0.
-2. Напишите (в Markdown, как шаги CI) процедуру: веса 90/10 → проверка доли 5xx по логам Envoy (`kubectl -n envoy-gateway-system logs deploy/envoy-… | grep ' 5[0-9][0-9] '`) за 2 минуты → 50/50 → 0/100 или откат на 100/0.
-3. Сломайте canary (образ отвечает 500 на `/api/orders`) и убедитесь, что процедура откатывает.
-4. Сравните с Argo Rollouts + Gateway API plugin: что они делают сверх вашей процедуры?
-
----
-
-→ Следующая часть: **03-5. NetworkPolicy** — kindnet стенда реализует NetworkPolicy через nftables: default deny в namespace, разрешение только из Gateway, ловушка с DNS в egress, отладка «почему не проходит»; база — networks 08-6 (Calico).
+Эта часть настроила вход по HTTP: listener на порту 80 принимает запросы и разводит их по Service. Следующая часть, 03-5, добавляет к тому же listener'у шифрование: HTTPS-listener, сертификаты от cert-manager и TLS до самого бэкенда через BackendTLSPolicy. Она идёт сразу за этой, потому что TLS настраивается на Gateway, который вы уже освоили. Секрет с сертификатом может лежать в другом namespace, и тогда снова нужен ReferenceGrant. Там же разобран переход с Ingress: инвентаризация аннотаций ingress-nginx, перенос правил и инструмент ingress2gateway.
