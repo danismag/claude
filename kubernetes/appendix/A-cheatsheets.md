@@ -181,7 +181,7 @@ etcdutl snapshot restore snap.db --data-dir /var/lib/etcd-restored \
 - `snapshot status` и `snapshot restore` есть только в etcdutl: из etcdctl 3.6 их убрали.
 - Снимок хранят как пароль: Secret в нём лежат открытым текстом, если нет шифрования.
 
-Подробно: карточка etcdctl в 01-1 §4, снимки, восстановление и тревоги — 10-2 §3–5. Команда `restore` в 10-2 дополняется флагами `--name`, `--initial-cluster` и `--initial-advertise-peer-urls`.
+Подробно: карточка etcdctl в 01-1 §4, снимки, восстановление и тревоги — 10-2 §3–5. В 10-2 команду `restore` запускают в одноразовом поде из образа etcd и добавляют флаги `--name`, `--initial-cluster` и `--initial-advertise-peer-urls`.
 
 ## A.6. kubeadm
 
@@ -354,7 +354,7 @@ $VEL uninstall --namespace lab-04-3 --force        # удалить Velero, CRD 
 - Том не скопирован: нет аннотации `backup.velero.io/backup-volumes` (режим opt-in). Восстановленный PVC пуст.
 - Фаза `Unavailable`: неверный `s3Url`, ключи или нет `s3ForcePathStyle=true`.
 - Фаза `PartiallyFailed` считается ошибкой: часть объектов или томов не сохранена.
-- Клиент и сервер из разных релизов.
+- Клиент и сервер из разных релизов: ставьте оба из одного выпуска.
 
 Подробно: карточка Velero и работа 3 в 04-3, поломки — 04-3 §5.
 
