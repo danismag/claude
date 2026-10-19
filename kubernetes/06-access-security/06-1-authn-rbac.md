@@ -904,13 +904,13 @@ kubectl auth can-i --list -n lab-06-1 --as lab-anna --as-group lab-06-1-devs
 Результат (сокращён; порядок строк может отличаться):
 
 ```
-Resources                                       Non-Resource URLs   Resource Names   Verbs
-selfsubjectreviews.authentication.k8s.io        []                  []               [create]
-selfsubjectaccessreviews.authorization.k8s.io   []                  []               [create]
-selfsubjectrulesreviews.authorization.k8s.io    []                  []               [create]
-pods/log                                        []                  []               [get]
-pods                                           []                 []              [get list watch]
-                                                [/healthz]          []               [get]
+Resources                                       Non-Resource URLs  Resource Names  Verbs
+selfsubjectreviews.authentication.k8s.io        []                 []              [create]
+selfsubjectaccessreviews.authorization.k8s.io   []                 []              [create]
+selfsubjectrulesreviews.authorization.k8s.io    []                 []              [create]
+pods/log                                        []                 []              [get]
+pods                                            []                 []              [get list watch]
+                                                [/healthz]         []              [get]
 …
 ```
 
@@ -1271,10 +1271,9 @@ k get pod no-token -o jsonpath='{.spec.volumes}{"\n"}'
 ```
 ls: /var/run/secrets/kubernetes.io/serviceaccount: No such file or directory
 command terminated with exit code 1
-
 ```
 
-Разбор: тома нет, поэтому файлов нет, а второй вывод пустой. Такой под не может обратиться к API, даже если у SA есть права. Для приложений, которым API не нужен, это правильное состояние.
+Разбор: тома нет, поэтому файлов нет, а вторая команда ничего не печатает, кроме пустой строки. Такой под не может обратиться к API, даже если у SA есть права. Для приложений, которым API не нужен, это правильное состояние.
 
 #### Шаг 5. Привязать токен к поду
 
@@ -1435,7 +1434,7 @@ lab-06-1: no
 
 ```bash
 kubectl get rolebindings,clusterrolebindings -A -o wide \
-  | grep -E 'cluster-admin|system:masters|system:authenticated|system:unauthenticated|system:serviceaccounts'
+  | grep -E 'cluster-admin|system:masters|system:(un)?authenticated|system:serviceaccounts'
 ```
 
 | Часть команды | Значение |
@@ -1447,12 +1446,13 @@ kubectl get rolebindings,clusterrolebindings -A -o wide \
 Результат (ожидаемый, сокращён; колонки `AGE` и `NAMESPACE` убраны):
 
 ```
-clusterrolebinding…/cluster-admin            ClusterRole/cluster-admin   …   system:masters
-clusterrolebinding…/kubeadm:cluster-admins   ClusterRole/cluster-admin   …   kubeadm:cluster-admins
-clusterrolebinding…/system:basic-user        ClusterRole/system:basic-user   …   system:authenticated
-clusterrolebinding…/system:discovery         ClusterRole/system:discovery    …   system:authenticated
-clusterrolebinding…/system:public-info-viewer   ClusterRole/system:public-info-viewer  …
-clusterrolebinding…/system:service-account-issuer-discovery  …
+NAME                                              ROLE                        GROUPS
+clusterrolebinding…/cluster-admin                 ClusterRole/cluster-admin   system:masters
+clusterrolebinding…/kubeadm:cluster-admins        ClusterRole/cluster-admin   kubeadm:cluster-admins
+clusterrolebinding…/system:basic-user             ClusterRole/system:basic-…  system:authenticated
+clusterrolebinding…/system:discovery              ClusterRole/system:disco…   system:authenticated
+clusterrolebinding…/system:public-info-viewer     ClusterRole/system:publi…   system:authenticated…
+…
 ```
 
 Разбор:
@@ -1463,7 +1463,7 @@ clusterrolebinding…/system:service-account-issuer-discovery  …
 
 #### Шаг 3. Роли, которые читают Secret
 
-Команда выбирает из ClusterRole и Role все роли, у которых хотя бы одно правило даёт `get`, `list` или `watch` на Secret, и записывает имена в файл.
+Команда выбирает все ClusterRole и Role, где хоть одно правило даёт чтение Secret, и записывает их имена в файл.
 
 ```bash
 kubectl get clusterroles,roles -A -o json | jq -r '
@@ -1530,7 +1530,7 @@ kubectl get clusterrolebindings,rolebindings -A -o json | jq -r --arg r "$ROLES"
 -         cluster-admin           cluster-admin           Group:system:masters
 -         kubeadm:cluster-admins  cluster-admin           Group:kubeadm:cluster-admins
 -         system:controller:…     system:controller:…     ServiceAccount:…
--         system:kube-controller-manager  system:kube-controller-manager  User:system:kube-controller-manager
+-         system:kube-controller-manager  …  User:system:kube-controller-manager
 lab-06-1  oops-edit               edit                    Group:lab-06-1-devs
 ```
 
@@ -1672,4 +1672,4 @@ kubectl config current-context
 
 ## → Дальше
 
-Доступ к API определяет, что человек или программа вправе делать с объектами, но не то, что произойдёт внутри уже созданного контейнера. Токен ServiceAccount и Secret, которые достались поду, остаются в его процессе, поэтому следующая часть, 06-2, переходит с уровня API на уровень узла и ограничивает сам процесс: пользователя, capabilities, системные вызовы и user namespaces. Часть 06-3 затем добавит политики допуска, которые не пропускают небезопасные поды в кластер, а 06-4 запишет в аудит, кто и что делал.
+Доступ к API определяет, что человек или программа вправе делать с объектами, но не то, что произойдёт внутри уже созданного контейнера. Токен ServiceAccount и Secret остаются в процессе пода. Поэтому следующая часть, 06-2, переходит с уровня API на уровень узла и ограничивает сам процесс: пользователя, capabilities, системные вызовы и user namespaces. Часть 06-3 затем добавит политики допуска, которые не пропускают небезопасные поды в кластер, а 06-4 запишет в аудит, кто и что делал.

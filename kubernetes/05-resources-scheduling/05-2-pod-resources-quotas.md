@@ -123,7 +123,7 @@ cgroup пода       memory.max = 200Mi   ◄── превышена сумм
 
 ### Resize на месте: желаемое, принятое, фактическое
 
-**Resize на месте** (in-place resize) — изменение CPU и памяти работающего контейнера без пересоздания пода. Функция InPlacePodVerticalScaling: alpha в 1.27, beta в 1.33, stable (GA) в 1.35, на стенде 1.36 включена всегда. Меняются только CPU и память; Windows не поддерживается.
+**Resize на месте** (in-place resize) — изменение CPU и памяти работающего контейнера без пересоздания пода. Функция InPlacePodVerticalScaling: alpha в 1.27, beta в 1.33, GA в 1.35, на стенде 1.36 включена всегда. Меняются только CPU и память; Windows не поддерживается.
 
 У пода при этом три набора чисел, и их надо различать.
 
@@ -154,7 +154,7 @@ kubectl patch --subresource resize
 
 ### Swap: память, которую можно сбросить на диск
 
-**Swap** (подкачка) — область диска, куда ядро выгружает редко используемые страницы памяти. Поддержка в Kubernetes называется NodeSwap и стала stable в 1.34. По умолчанию kubelet не стартует на узле с включённым swap, пока не задано `failSwapOn: false`.
+**Swap** (подкачка) — область диска, куда ядро выгружает редко используемые страницы памяти. Поддержка в Kubernetes называется NodeSwap и стала GA в 1.34. По умолчанию kubelet не стартует на узле с включённым swap, пока не задано `failSwapOn: false`.
 
 Поведение задаёт `memorySwap.swapBehavior` в конфигурации kubelet. **NoSwap** (по умолчанию) запрещает подам использовать swap, хотя системные процессы и сам kubelet его используют. **LimitedSwap** разрешает его Burstable-подам.
 
@@ -389,7 +389,7 @@ kubectl get pod shared -o jsonpath="$T"
 
 Если под получил `Failed` и `reason: Evicted`, а в колонке STATUS стоит `Error`, ищите причину в `status.message`: `Pod ephemeral local storage usage exceeds the total limit of containers …`. Возможны два источника: лимит самого пода или давление диска на узле (05-5).
 
-Пороги выселения по давлению диска по умолчанию (Linux): `nodefs.available<10%`, `imagefs.available<15%`, `nodefs.inodesFree<5%` и `imagefs.inodesFree<5%`. Диск заполняют обычно логи без ротации, слой записи контейнера и `emptyDir` без `sizeLimit`.
+Пороги выселения по давлению диска и их значения по умолчанию разобраны в 05-5 §2. Диск заполняют обычно логи без ротации, слой записи контейнера и `emptyDir` без `sizeLimit`.
 
 ---
 
@@ -399,7 +399,7 @@ kubectl get pod shared -o jsonpath="$T"
 
 ### Resize
 
-- Стадия in-place resize — stable (GA) с 1.35, гейт `InPlacePodVerticalScaling` включён и заблокирован.
+- Стадия in-place resize — GA с 1.35, гейт `InPlacePodVerticalScaling` включён и заблокирован.
 - `resizePolicy` — `NotRequired`, если не указано другое.
 - Меняются только CPU и память; QoS-класс не меняется никогда.
 - Запрос сверх allocatable узла в 1.36 отклоняется на admission.
@@ -410,7 +410,7 @@ kubectl get pod shared -o jsonpath="$T"
 
 - PodLevelResources — beta с 1.34, включено по умолчанию; ресурсы — CPU, память, hugepages; Windows не поддерживается.
 - CPU Manager, Memory Manager и Topology Manager учитывают ресурсы пода только с гейтом `PodLevelResourceManagers` (alpha в 1.36, выключен).
-- NodeSwap — stable с 1.34; по умолчанию `swapBehavior: NoSwap`, а kubelet не стартует с swap без `failSwapOn: false`.
+- NodeSwap — GA с 1.34; по умолчанию `swapBehavior: NoSwap`, а kubelet не стартует с swap без `failSwapOn: false`.
 - Swap получают только Burstable-поды в режиме `LimitedSwap`.
 - Kernel 6.3 и новее нужен для опции `noswap` у tmpfs.
 
@@ -426,15 +426,14 @@ kubectl get pod shared -o jsonpath="$T"
 ### Диск
 
 - Выселение по лимиту пода срабатывает после периодического измерения kubelet: на стенде это заняло около 20–25 секунд.
-- Пороги проверяются раз в `housekeeping-interval`, по умолчанию 10 секунд.
-- Пороги hard eviction по умолчанию (Linux): `memory.available<100Mi`, `nodefs.available<10%`, `imagefs.available<15%`, `nodefs.inodesFree<5%`, `imagefs.inodesFree<5%`.
+- Пороги вытеснения по давлению узла и период их проверки (по умолчанию 10 секунд) — в 05-5 §2 и §6.
 - `emptyDir` в памяти считается как память пода, а не как диск.
 
 ---
 
 ## Лабораторные работы
 
-Работы идут на стенде 00-1 в namespace `lab-05-2`; для работы 3 дополнительно создаётся `lab-05-2q`. Хост они не меняют: все изменения происходят внутри кластера kind, а удаление namespace убирает всё созданное. Образ `python:3.12-slim` узлы тянут из Docker Hub. Если он недоступен, положите образ в реестр стенда командами из вводной части 05-1, подставив `lab-05-2` вместо `lab-05-1`, и замените имя в манифестах на `localhost:5001/lab-05-2/python:3.12-slim`.
+Работы идут на стенде 00-1 в namespace `lab-05-2`; для работы 3 дополнительно создаётся `lab-05-2q`. Хост они не меняют: все изменения происходят внутри кластера kind, а удаление namespace убирает всё созданное. Образ `python:3.12-slim` узлы тянут из Docker Hub. Если он недоступен, положите его в реестр стенда командами из раздела «Лабораторные работы» части 05-1 с префиксом `lab-05-2` вместо `lab-05-1`. Затем замените имя в манифестах на `localhost:5001/lab-05-2/python:3.12-slim`.
 
 Выводы в работах 1 и 3 взяты с прогона на стенде автора. Там стояли kind 0.32.0, Kubernetes 1.36.1 и containerd 2.3.1. Узлы имели по 12 CPU и около 15,5 ГиБ памяти. Имена подов и точное время у вас будут другими.
 
