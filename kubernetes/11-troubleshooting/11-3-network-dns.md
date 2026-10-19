@@ -7,13 +7,13 @@
 Эта часть выстраивает слои сети из модуля 03 в один порядок поиска причины. Каждый слой там разобран отдельно: сеть подов (03-1), Service (03-2), DNS (03-3), Gateway API (03-4) и NetworkPolicy (03-6). Здесь они стоят на одном пути запроса, а симптом подсказывает, с какого слоя начинать. Соседняя часть 11-2 разбирает под, который не запускается, а эта часть — под, который работает, но недоступен. Часть 11-4 спускается ниже, к узлу и control plane, а массовые сетевые поломки собраны в тренажёрах 12-2.
 
 ```
-1. под: IP, маршрут, MTU            03-1   нет связи, зависают большие пакеты
-2. Service: selector, port          03-2   мгновенный отказ или пустой ответ
-3. EndpointSlice: ready, serving    03-2   нет адресов или нет готовых
-4. kube-proxy: правила узла         03-2   REJECT, DNAT на ClusterIP
-5. DNS: resolv.conf, CoreDNS        03-3   имя не находится, долгое ожидание
-6. NetworkPolicy                    03-6   таймаут вместо отказа
-7. Gateway и HTTPRoute              03-4   404, 500, 503, 504 от Envoy
+1. под: IP, маршрут, MTU          03-1   нет связи, зависают большие пакеты
+2. Service: selector, port        03-2   мгновенный отказ или пустой ответ
+3. EndpointSlice: ready           03-2   нет адресов или нет готовых
+4. kube-proxy: правила узла       03-2   REJECT, DNAT на ClusterIP
+5. DNS: resolv.conf, CoreDNS      03-3   имя не находится, долгое ожидание
+6. NetworkPolicy                  03-6   таймаут вместо отказа
+7. Gateway и HTTPRoute            03-4   404, 500, 503, 504 от Envoy
 ```
 
 Схема 1. Семь слоёв в порядке проверки: идём сверху вниз, от пода наружу. Справа указана часть с механизмом и типичный симптом.
@@ -29,16 +29,16 @@
 **Слой** (layer) в этой части — звено пути запроса, которое ломается отдельно от остальных. Запрос снаружи идёт через Envoy и маршрут к поду, а сам под ходит в DNS и к базе данных. У Envoy путь короче, чем у обычного клиента: он читает EndpointSlice и подключается к IP подов напрямую, минуя ClusterIP и kube-proxy (03-4 §2). Правила kube-proxy поэтому важны клиентам внутри кластера и самому приложению, когда оно обращается к `postgres`.
 
 ```
-клиент ─► NodePort 30080 ─► Envoy ─► HTTPRoute: хост, путь, backendRef        слой 7
-                                      │ адреса берёт из EndpointSlice          слой 3
-                                      ▼  (Service даёт selector и port)        слой 2
-                        NetworkPolicy ingress ─► под orders-api :8000          слои 6, 1
-                                                   │ getaddrinfo("postgres.orders")
-                                                   ▼
-                        DNS: resolv.conf ─► CoreDNS                            слой 5
-                                                   │ ClusterIP postgres
-                                                   ▼
-                        правила kube-proxy ─► NetworkPolicy egress ─► postgres  слои 4, 6
+клиент ─► NodePort 30080 ─► Envoy ─► HTTPRoute: хост, путь, backendRef   слой 7
+                                      │ адреса из EndpointSlice           слой 3
+                                      ▼ (Service даёт selector и port)    слой 2
+                       NetworkPolicy ingress ─► под orders-api :8000     слои 6, 1
+                                                  │ getaddrinfo("postgres.orders")
+                                                  ▼
+                       DNS: resolv.conf ─► CoreDNS                       слой 5
+                                                  │ ClusterIP postgres
+                                                  ▼
+                       kube-proxy ─► NetworkPolicy egress ─► postgres    слои 4, 6
 ```
 
 Схема 2. Путь запроса к orders-api и его ответного вызова в базу. Справа номера слоёв из схемы 1: смотрите, какие слои встречаются на пути дважды.
@@ -55,11 +55,13 @@
 
 ## 2. Как устроены слои и чем они ломаются
 
-Механизмы слоёв описаны в модуле 03, поэтому здесь для каждого слоя дано только то, что нужно для диагностики: что он решает и по какому признаку видно поломку.
+Механизмы слоёв описаны в модуле 03. Здесь для каждого слоя дано только нужное для диагностики: что он решает и по какому признаку видно поломку.
 
 ### Под: IP, маршрут и MTU
 
-Первый слой отвечает на вопрос, доходит ли пакет от одного пода до другого. Под получает IP от CNI, а маршруты на узлах ведут пакет к нужному veth (03-1 §2). Поломка этого слоя затрагивает не один Service, а все поды сразу: поды не видят друг друга через узлы или большие ответы зависают при маленьких проходящих запросах. Второй признак указывает на **MTU** (maximum transmission unit) — размер пакета, который проходит без фрагментации (03-1 §5). Проверка проста: если прямой запрос на IP пода из другого пода работает, слой в порядке.
+Первый слой отвечает на вопрос, доходит ли пакет от одного пода до другого. Под получает IP от CNI, а маршруты на узлах ведут пакет к нужному veth (03-1 §2).
+
+Поломка этого слоя затрагивает не один Service, а все поды сразу. Поды не видят друг друга через узлы, либо большие ответы зависают, пока маленькие запросы проходят. Второй признак указывает на **MTU** (maximum transmission unit) — наибольший размер пакета, который проходит без фрагментации (03-1 §5). Если прямой запрос на IP пода из другого пода работает, слой в порядке.
 
 ### Service, EndpointSlice и kube-proxy
 
@@ -75,7 +77,7 @@ DNS нужен приложению внутри пода, а не Envoy: имя
 
 ### Gateway и HTTPRoute
 
-Gateway принимает запрос, HTTPRoute выбирает правило по хосту и пути, а `backendRef` называет Service (03-4 §2). Состояние маршрута записано в условиях `Accepted` и `ResolvedRefs`, и Envoy отвечает сам, если маршрут не нашёл бэкенд: 404 при несовпадении хоста и 500 при недопустимой ссылке. Эти слои первыми видны клиенту, но чаще всего оказываются не причиной, а следствием нижних.
+Gateway принимает запрос, HTTPRoute выбирает правило по хосту и пути, а `backendRef` называет Service (03-4 §2). Состояние маршрута записано в условиях `Accepted` и `ResolvedRefs`. Если маршрут не нашёл бэкенд, Envoy отвечает сам: 404 при несовпадении хоста и 500 при недопустимой ссылке. Клиент видит этот слой первым, но чаще всего он оказывается не причиной, а следствием нижних.
 
 ---
 
@@ -100,10 +102,14 @@ Gateway принимает запрос, HTTPRoute выбирает правил
 Первая группа команд проверяет под, Service и срез. Подставьте имя своего Service и адрес пода.
 
 ```bash
-kubectl -n orders get pods -l app=orders-api -o wide --show-labels       # слой 1: IP, узел, метки
-kubectl -n orders get svc orders-api -o jsonpath='{.spec.selector} {.spec.ports}{"\n"}'   # слой 2
+# слой 1: IP, узел, метки
+kubectl -n orders get pods -l app=orders-api -o wide --show-labels
+# слой 2: selector и порты
+kubectl -n orders get svc orders-api -o jsonpath='{.spec.selector} {.spec.ports}{"\n"}'
+# слой 3: адреса и условия
 kubectl -n orders get endpointslice -l kubernetes.io/service-name=orders-api \
-  -o jsonpath='{range .items[0].endpoints[*]}{.addresses[0]} {.conditions}{"\n"}{end}'    # слой 3
+  -o jsonpath='{range .items[0].endpoints[*]}{.addresses[0]} {.conditions}{"\n"}{end}'
+# прямой запрос на IP пода из другого пода
 kubectl run net --rm -it --restart=Never --image=nicolaka/netshoot:v0.13 -- \
   curl -s -m 3 -w ' %{http_code} %{time_total}s\n' http://<podIP>:8000/api/orders
 ```
@@ -118,11 +124,16 @@ kubectl run net --rm -it --restart=Never --image=nicolaka/netshoot:v0.13 -- \
 Вторая группа проверяет правила kube-proxy, DNS и политики.
 
 ```bash
-docker exec lab-worker iptables-save | grep 'orders/orders-api'     # слой 4: правила узла (03-2 §4)
-kubectl -n orders exec <pod> -- cat /etc/resolv.conf                # слой 5: nameserver, search, ndots
-kubectl -n orders exec <pod> -- getent hosts postgres.orders        # то же, что видит приложение
-kubectl -n kube-system get endpointslice -l kubernetes.io/service-name=kube-dns   # есть ли CoreDNS
-kubectl -n orders get networkpolicy -o wide                         # слой 6: что выбирает под
+# слой 4: правила узла (03-2 §4)
+docker exec lab-worker iptables-save | grep 'orders/orders-api'
+# слой 5: nameserver, search, ndots
+kubectl -n orders exec <pod> -- cat /etc/resolv.conf
+# то, что видит приложение
+kubectl -n orders exec <pod> -- getent hosts postgres.orders
+# есть ли готовые поды CoreDNS
+kubectl -n kube-system get endpointslice -l kubernetes.io/service-name=kube-dns
+# слой 6: какие политики выбирают под
+kubectl -n orders get networkpolicy -o wide
 ```
 
 Что в выводе:
@@ -135,11 +146,16 @@ kubectl -n orders get networkpolicy -o wide                         # слой 6
 Третья группа проверяет Gateway, маршрут и логи Envoy.
 
 ```bash
-kubectl get gateway -A                                              # слой 7: ADDRESS и PROGRAMMED
-kubectl -n orders get httproute orders-api \
-  -o jsonpath='{range .status.parents[0].conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
-kubectl -n envoy-gateway-system logs -l gateway.envoyproxy.io/owning-gateway-name=lab -c envoy --tail=5
-kubectl -n envoy-gateway-system logs deploy/envoy-gateway --tail=20   # почему контроллер отклонил объект
+# слой 7: колонки ADDRESS и PROGRAMMED
+kubectl get gateway -A
+# условия маршрута
+kubectl -n orders get httproute orders-api -o jsonpath=\
+'{range .status.parents[0].conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
+# лог прокси Envoy
+kubectl -n envoy-gateway-system logs -l gateway.envoyproxy.io/owning-gateway-name=lab \
+  -c envoy --tail=5
+# лог контроллера: почему он отклонил объект
+kubectl -n envoy-gateway-system logs deploy/envoy-gateway --tail=20
 ```
 
 Что в выводе:
@@ -184,12 +200,12 @@ Envoy отвечает клиенту сам, поэтому его ответ �
 
 | Симптом | Код | Время | Флаг | Слой |
 |---|---|---|---|---|
-| срез пуст | 503 | 1 мс | `-` | 2–3 |
-| Service ведёт на закрытый порт | 503 | 1 мс | `UF` | 2 |
-| пакеты к поду режет политика | 503 | 10 с | `UF` | 6 |
-| бэкенд принял запрос, но молчит | 504 | 15 с | `UT` | 1, 5 |
-| хост не подошёл ни к одному маршруту | 404 | 1 мс | `NR` | 7 |
-| `backendRef` указывает на несуществующий Service | 500 | 1 мс | `-` | 7 |
+| срез пуст | 503 | 1 мс | - | 2–3 |
+| Service ведёт на закрытый порт | 503 | 1 мс | UF | 2 |
+| пакеты к поду режет политика | 503 | 10 с | UF | 6 |
+| бэкенд принял запрос, но молчит | 504 | 15 с | UT | 1, 5 |
+| хост не подошёл ни к одному маршруту | 404 | 1 мс | NR | 7 |
+| ссылка backendRef на несуществующий Service | 500 | 1 мс | - | 7 |
 
 Время отделяет отказ от потери пакетов. Мгновенный ответ значит, что кто-то активно отказал: kube-proxy, ядро пода или сам Envoy. Ответ ровно через 10 или 15 секунд значит, что сработал таймаут, и пакеты шли в пустоту либо приложение не успело ответить.
 
@@ -202,7 +218,7 @@ kubectl -n envoy-gateway-system logs -l gateway.envoyproxy.io/owning-gateway-nam
   -c envoy --tail=5
 ```
 
-**Флаги ответа** (response flags) — короткие коды, которыми Envoy объясняет, почему ответ такой. По документации Envoy `UH` значит «нет здоровых хостов в кластере», `UF` — «ошибка подключения к бэкенду», `UT` — «таймаут запроса», `NR` — «маршрут не найден», `UO` — «сработал circuit breaker». Поле `response_code_details` уточняет причину, например `upstream_reset_before_response_started{connection_timeout}` у запроса, который не дошёл до пода за 10 секунд.
+**Флаги ответа** (response flags) — короткие коды, которыми Envoy объясняет, почему ответ такой. По документации Envoy флаг `UH` значит «нет здоровых хостов в кластере», `UF` — «ошибка подключения к бэкенду», `UT` — «таймаут запроса». Флаг `NR` значит «маршрут не найден», а `UO` — «сработал circuit breaker». Поле `response_code_details` уточняет причину, например `upstream_reset_before_response_started{connection_timeout}` у запроса, который не дошёл до пода за 10 секунд.
 
 Значение `direct_response` в деталях особое. Оно значит, что Envoy Gateway сам вписал ответ в маршрут, потому что у бэкенда нет адресов или ссылка недопустима. Такой ответ подсказывает смотреть на конфигурацию, то есть Service, EndpointSlice и статус HTTPRoute, а не на сеть.
 
@@ -214,13 +230,13 @@ kubectl -n envoy-gateway-system logs -l gateway.envoyproxy.io/owning-gateway-nam
 - **504** — флаг `UT`: время ответа вышло. По умолчанию Envoy ждёт ответ маршрута 15 секунд (03-4 §3). Ищите, что тормозит в самом приложении: DNS, база, пул соединений.
 - **502** — у Envoy редкий: документация связывает его с флагом `UPE`, ошибкой HTTP-протокола в ответе бэкенда. На стенде он не встречался. Если 502 приходит от облачного балансировщика перед Gateway, причину ищут в его логах.
 
-Таймауты (10 и 15 секунд) видны в длительности ответа, поэтому сверяйте их с таймаутами клиента: клиент с таймаутом 5 секунд оборвёт запрос раньше, чем Envoy успеет ответить.
+Таймауты в 10 и 15 секунд видны в длительности ответа. Сверяйте их с таймаутами клиента: клиент с таймаутом 5 секунд оборвёт запрос раньше Envoy.
 
 ### 504 при неготовых эндпоинтах: что известно о panic mode
 
 Когда все поды Service теряют готовность, ожидают быстрый 503, но на стенде приходил 504 через 15 секунд. Так вели себя поды с `READY 0/1`, которые не прошли пробу из-за недоступной базы: Envoy продолжал отправлять им запросы, а приложение не успевало ответить. При пустом срезе, напротив, ответ приходил мгновенно.
 
-Вероятная причина — **panic mode** (режим паники) Envoy. По документации Envoy обычно балансирует только между доступными хостами, но если их доля падает ниже порога паники (по умолчанию 50 %), он игнорирует здоровье и использует все хосты. Порог 0 % отключает режим; тогда при недоступных хостах Envoy сразу отвечает 503 с текстом `no healthy upstream`.
+Вероятная причина — **panic mode** (режим паники) Envoy. По документации Envoy обычно балансирует только между доступными хостами. Если их доля падает ниже порога паники (по умолчанию 50 %), он игнорирует здоровье и использует все хосты. Порог 0 % отключает режим, и тогда Envoy сразу отвечает 503 с текстом `no healthy upstream`.
 
 Что подтверждено, а что нет. По исходникам Envoy Gateway (ветка main, версия 1.9.2 не сверялась) неготовый эндпоинт не пропадает из конфигурации, а передаётся Envoy с признаком `draining`. Документация Envoy не говорит, считает ли режим паники такие хосты недоступными, поэтому связь «NotReady → паника → 504» остаётся гипотезой. Проверить её можно через admin-интерфейс прокси (в Envoy Gateway порт 19000): `/clusters` показывает флаги здоровья хостов, `/config_dump` — `healthy_panic_threshold` кластера. На стенде это не проверялось.
 
@@ -234,11 +250,15 @@ kubectl -n envoy-gateway-system logs -l gateway.envoyproxy.io/owning-gateway-nam
 
 ### Мгновенный 503: Service и срез
 
-Мгновенный 503 с пустым телом значит, что у бэкенда нет адресов. Откройте срез Service: если в `endpoints` стоит `null`, сравните `selector` с метками подов. Обычная причина — метку переименовали в Deployment или в Helm-шаблоне и забыли про Service. Если адреса есть, но порт чужой, Envoy получает мгновенный 503 с текстом `remote connection failure`: сверьте `targetPort` с портом, который слушает контейнер. Имя порта в `targetPort` устойчивее числа (03-2 §3). Подробности — в 03-2 §5.
+Мгновенный 503 с пустым телом значит, что у бэкенда нет адресов. Откройте срез Service: если в `endpoints` стоит `null`, сравните `selector` с метками подов. Обычная причина — метку переименовали в Deployment или в Helm-шаблоне и забыли про Service.
+
+Если адреса есть, а порт чужой, Envoy тоже отвечает мгновенно, но с текстом `remote connection failure`. Тогда сверьте `targetPort` с портом, который слушает контейнер. Имя порта в `targetPort` устойчивее числа (03-2 §3); остальные причины разобраны в 03-2 §5.
 
 ### Таймаут: NetworkPolicy и MTU
 
-Ответ через 10 секунд значит, что пакеты пропадают без отказа. Первая гипотеза — NetworkPolicy: поды остаются Ready, потому что kubelet проверяет пробы с узла, а трафик узла политики пропускают. Найдите политики, которые выбирают под, и сверьте их с эталоном из 03-6: вход к orders-api разрешён от `envoy-gateway-system` на порт 8000, а набор лежит в `~/lab/k8s/03-6/orders-netpol.yaml`. Вторая гипотеза — MTU: маленькие запросы проходят, а большие зависают (03-1 §5). Различает их размер пакета: политика режет любые пакеты, MTU только большие.
+Ответ через 10 секунд значит, что пакеты пропадают без отказа. Первая гипотеза — NetworkPolicy: поды остаются Ready, потому что kubelet проверяет пробы с узла, а трафик узла политики пропускают. Найдите политики, которые выбирают под, и сверьте их с эталоном из 03-6. В нём вход к orders-api разрешён от `envoy-gateway-system` на порт 8000, а сам набор лежит в `~/lab/k8s/03-6/orders-netpol.yaml`.
+
+Вторая гипотеза — MTU: маленькие запросы проходят, а большие зависают (03-1 §5). Гипотезы различает размер пакета, потому что политика режет любые пакеты, а MTU только большие.
 
 ### DNS: имя не находится или резолв ждёт
 
@@ -330,7 +350,7 @@ pod/py condition met
 
 - **Что меняется:** в namespace `orders` по очереди меняются selector Service `orders-api`, создаётся NetworkPolicy `t-deny-ingress`, меняется `backendRef` в HTTPRoute `orders-api`; в `lab-11-3` создаётся под `py`.
 - **Надолго ли:** каждая поломка живёт до своего решения; блок «Уборка» возвращает всё.
-- **Безопасность:** привилегий не нужно; политика только сужает доступ, и под `py` не имеет прав в `orders`.
+- **Безопасность:** привилегий не нужно; политика только сужает доступ.
 - **Влияние на систему:** пока поломка активна, `orders.localhost:8088` не отвечает или отвечает ошибкой; другие namespace не затрагиваются.
 - **Откат:** решение каждого шага возвращает объект; в уборке `kubectl apply -f ~/lab/k8s/orders-api/k8s/` восстанавливает манифесты.
 
@@ -348,7 +368,7 @@ pod/py condition met
 ```
 C (curl) ─► Envoy ─► HTTPRoute ─► Service ─► EndpointSlice ─► под orders-api
               ▲           ▲           ▲            ▲
-         поломка 3    поломка 1   (NetworkPolicy между Envoy и подом: поломка 2)
+         поломка 3    поломка 1   (между Envoy и подом стоит NetworkPolicy: поломка 2)
 py (под) ─► DNS ─► postgres.orders                  поломка 4
 ```
 
@@ -419,7 +439,8 @@ service/orders-api patched
 Мгновенный 503 с пустым телом значит, что Envoy сам знает: бэкенду некуда идти (§4). Проверяем слои по порядку: срез и selector.
 
 ```bash
-ko get endpointslice -l kubernetes.io/service-name=orders-api -o jsonpath='{.items[*].endpoints}'; echo
+ko get endpointslice -l kubernetes.io/service-name=orders-api \
+  -o jsonpath='{.items[*].endpoints}'; echo
 ko get svc orders-api -o jsonpath='{.spec.selector}{"\n"}'
 ko get pods -l app=orders-api --show-labels
 ```
@@ -479,7 +500,7 @@ sleep 5; C; ko get pods -l app=orders-api
 
 ```
 networkpolicy.networking.k8s.io/t-deny-ingress created
-503 10.001259s upstream connect error or disconnect/reset before headers. reset reason: connection timeout
+503 10.001259s upstream connect error … reset reason: connection timeout
 ```
 
 Разбор вывода:
@@ -557,15 +578,15 @@ httproute.gateway.networking.k8s.io/orders-api patched
 Код 500 у Envoy Gateway означает недопустимую ссылку бэкенда, а не отсутствие подов (03-4 §5). Состояние читаем в условиях маршрута.
 
 ```bash
-ko get httproute orders-api \
-  -o jsonpath='{range .status.parents[0].conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
+ko get httproute orders-api -o jsonpath=\
+'{range .status.parents[0].conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
 ```
 
 Результат:
 
 ```
 Accepted=True Accepted: Route is accepted
-ResolvedRefs=False BackendNotFound: Failed to process route rule 0 backendRef 0: service orders/orders-ap not found.
+ResolvedRefs=False BackendNotFound: … backendRef 0: service orders/orders-ap not found.
 ```
 
 Разбор:
@@ -666,10 +687,10 @@ kubernetes.default                 -> 10.96.0.1
 
 | Поломка | Слой | Признак | Первая команда |
 |---|---|---|---|
-| selector не совпал | 2–3 | 503 за 1 мс, срез `null` | срез Service |
-| политика закрыла вход | 6 | 503 за 10 с, поды `1/1` | список политик |
-| `backendRef` на пустое место | 7 | 500 за 1 мс | условия HTTPRoute |
-| короткое имя из другого namespace | 5 | `not found` | `getent` по цепочке имён |
+| selector не совпал | 2–3 | 503 за 1 мс, срез null | срез Service |
+| политика закрыла вход | 6 | 503 за 10 с, поды 1/1 | список политик |
+| ссылка на несуществующий Service | 7 | 500 за 1 мс | условия HTTPRoute |
+| короткое имя из другого namespace | 5 | имя не найдено | getent по цепочке имён |
 
 **Уборка.** Команда возвращает объекты `orders` к исходному состоянию, удаляет namespace части и снимает функции.
 
@@ -677,12 +698,12 @@ kubernetes.default                 -> 10.96.0.1
 ko delete networkpolicy t-deny-ingress --ignore-not-found
 kubectl apply -f ~/lab/k8s/orders-api/k8s/
 kubectl delete ns lab-11-3
-rm -rf ~/lab/k8s/11-3
 C
+rm -rf ~/lab/k8s/11-3
 unset -f k ko C R
 ```
 
-Проверка: `C` перед удалением функций должна вернуть `200`. Если вы выполнили решения всех шагов, `apply` ничего не изменит, и в его выводе будут строки `unchanged`.
+Проверка: `C` перед удалением каталога должна вернуть `200`. Если вы выполнили решения всех шагов, `apply` ничего не изменит, и в его выводе будут строки `unchanged`.
 
 **Вопросы для самопроверки.**
 
@@ -705,4 +726,4 @@ unset -f k ko C R
 
 ## → Дальше
 
-Все слои этой части лежат над узлом: поды, Service и правила kube-proxy работают на нём и зависят от него. Часть 11-4 опускается ниже и разбирает, что происходит, когда узел переходит в `NotReady`, kubelet и containerd перестают отвечать, а API-сервер или etcd тормозят. Она идёт следующей, потому что сетевая диагностика из этой части предполагает здоровый узел, а когда это не так, методика слоёв упирается в журналы узла и компонентов control plane.
+Все слои этой части лежат над узлом: поды, Service и правила kube-proxy работают на нём и зависят от него. Часть 11-4 опускается ниже и разбирает, что происходит, когда узел переходит в `NotReady`, kubelet и containerd перестают отвечать, а API-сервер или etcd тормозят. Она идёт следующей, потому что сетевая диагностика предполагает здоровый узел. Когда узел нездоров, методика слоёв упирается в журналы узла и компонентов control plane.
