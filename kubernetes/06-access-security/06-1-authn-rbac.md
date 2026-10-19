@@ -986,11 +986,11 @@ k create role grab-secrets --verb=get --resource=secrets \
 | `create role pod-viewer … --as …` | создать роль от имени группы; права на поды у неё есть |
 | `create role grab-secrets` | роль с правом на Secret, которого у группы нет |
 
-Результат (вторая ошибка — одна строка, здесь перенесена):
+Результат (первая строка ошибки здесь перенесена):
 
 ```
 role.rbac.authorization.k8s.io/pod-viewer created
-error: failed to create role: roles.rbac.authorization.k8s.io "grab-secrets" is forbidden:
+Error from server (Forbidden): roles.rbac.authorization.k8s.io "grab-secrets" is forbidden:
 user "lab-anna" (groups=["lab-06-1-devs" "system:authenticated"]) is attempting to grant
 RBAC permissions not currently held:
 {APIGroups:[""], Resources:["secrets"], Verbs:["get"]}
