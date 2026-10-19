@@ -1,6 +1,6 @@
 # 08-2. GitOps в масштабе
 
-> Модуль 08 «GitOps» · часть 2 из 2 · ~1,5 ч чтения + ~1,5 ч лабы (с повторной установкой Gitea и Argo CD) · Нужно: шаги 1–4 работы 1 из 08-1 (Gitea 1.27.0, Argo CD 3.5.5, репозиторий `~/lab/k8s/08-1/orders-gitops`), overlay prod из 07-3, образ `orders-api:2.1` в реестре стенда (03-4) · Опирается на: 08-1 (Application, sync, selfHeal, prune, `ignoreDifferences`), 07-3 (overlays и `digest`), 01-3 (finalizer)
+> Модуль 08 «GitOps» · часть 2 из 2 · ~1,5 ч чтения + ~1,5 ч лабы (с повторной установкой Gitea и Argo CD) · Нужно: шаги 1–4 работы 1 из 08-1 (Gitea 1.27.0, Argo CD 3.5.5, репозиторий `~/lab/k8s/08-1/orders-gitops`), overlay prod из 07-3, образ `orders-api:2.1` в реестре стенда (как в 07-3) · Опирается на: 08-1 (Application, sync, selfHeal, prune, `ignoreDifferences`), 07-3 (overlays и `digest`), 01-3 (finalizer)
 
 ## Где мы на карте
 
@@ -168,7 +168,7 @@ kubectl apply (один раз)
 
 ### Промоушен по окружениям
 
-**Промоушен** (promotion) — перенос проверенной версии из одного окружения в другое. В GitOps это коммит: в overlay следующего окружения записывается тот же **дайджест** (digest) образа, что проверен в предыдущем. Дайджест — хеш содержимого образа вида `sha256:…`, он однозначно определяет образ, в отличие от тега, который можно переписать (07-3).
+**Промоушен** (promotion) — перенос проверенной версии из одного окружения в другое. В GitOps это коммит: в overlay следующего окружения записывается тот же дайджест образа (07-3), что проверен в предыдущем. Дайджест вида `sha256:…` однозначно определяет образ, в отличие от тега, который можно переписать.
 
 ```
  CI: сборка ─► push образа ─► дайджест sha256:…
@@ -238,7 +238,7 @@ Flux расшифровывает SOPS сам, а Argo CD нужен плаги�
 | Модель | Application «что куда», центральный контроллер | набор контроллеров, источник и применение раздельно |
 | Интерфейс | свой UI, наглядный diff | своего UI нет, есть сторонние |
 | Много кластеров | один Argo CD управляет многими | обычно Flux в каждом кластере |
-| Helm | рендерит сам, список релизов Helm пуст (07-1) | HelmRelease создаёт настоящий релиз Helm |
+| Helm | рендерит сам, список релизов Helm пуст (08-1) | HelmRelease создаёт настоящий релиз Helm |
 | SOPS | через плагины | встроен |
 | Генерация приложений | ApplicationSet | Kustomization с подстановками, ResourceSet |
 
@@ -315,7 +315,7 @@ Flux расшифровывает SOPS сам, а Argo CD нужен плаги�
 
 ### Опрос и генераторы
 
-- **Опрос Git** — раз в 180 с (`timeout.reconciliation`, 08-1); ускоряют webhook и аннотация `refresh`.
+- **Опрос Git** — 120 с плюс до 60 с добавки (`timeout.reconciliation`, 08-1), в сумме до 3 минут; ускоряют webhook и аннотация `refresh`.
 - **Генератор git** — раз в 180 с (`requeueAfterSeconds`); webhook ApplicationSet по документации принимает события GitHub и GitLab.
 - **Генератор pullRequest** — `requeueAfterSeconds` по умолчанию 1800 с, `branch_slug` не длиннее 50 знаков.
 
@@ -330,7 +330,7 @@ Flux расшифровывает SOPS сам, а Argo CD нужен плаги�
 - **ESO** — линия v2.x, API `external-secrets.io/v1`.
 - **Sealed Secrets** — v0.40.0; новый ключ шифрования каждые 30 дней по умолчанию, старые ключи хранятся.
 - **SOPS** — v3.13.3; **Argo CD Image Updater** — v1.3.1; **Flux** — 2.9.6.
-- **CVE октября 2026** — обход ограничений AppProject через PreDelete и PostDelete хуки исправлен в 3.3.15, 3.4.10 и 3.5.4, поэтому 3.5.5 на стенде его содержит.
+- **CVE октября 2026** — исправления вошли в 3.3.15, 3.4.10 и 3.5.4, поэтому 3.5.5 на стенде их содержит (08-1 §6).
 - **CRD ApplicationSet** слишком велик для client-side apply: Argo CD ставят с `--server-side` (08-1).
 - **Argo CD 3.5** встраивает Helm 4 и игнорирует параметр `helm.version: v3`.
 
@@ -382,9 +382,9 @@ Application `orders-staging` из 08-1 удаляется на случай, е�
 
 **Что понадобится.**
 
-- стенд после 08-1 и подготовка выше;
-- overlays `staging` и `prod` в `apps/orders-api/overlays/`;
-- около 2 минут на ожидание синхронизации.
+- Стенд после 08-1 и подготовка выше.
+- Каталоги `staging` и `prod` в `apps/orders-api/overlays/`.
+- Около 20 минут, из них 2 минуты на ожидание синхронизации.
 
 **Схема опыта.**
 
@@ -549,9 +549,10 @@ prod replicas=3 image=localhost:5001/orders-api@sha256:ad4f8fd2…
 
 **Что понадобится.**
 
-- работа 1 выполнена: Application `orders-prod` существует;
-- образ `orders-api:2.1` в реестре стенда `127.0.0.1:5001`;
-- подготовленные функции `gpush` и данные Gitea.
+- Работа 1 выполнена: Application `orders-prod` существует.
+- Образ `orders-api:2.1` в реестре стенда `127.0.0.1:5001`.
+- Функция `gpush` и данные Gitea из подготовки.
+- Около 15 минут.
 
 **Схема опыта.**
 
@@ -631,7 +632,7 @@ git -C $R log --oneline -3 -- apps/orders-api/overlays/prod
 
 | Часть команды | Значение |
 |---|---|
-| `annotate … refresh=normal` | не ждать опроса в 180 с (08-1) |
+| `annotate … refresh=normal` | не ждать опроса Git, до 3 минут (08-1) |
 | `rollout status` | блокироваться, пока Deployment не обновится |
 | `exec … urlopen('…/version')` | спросить версию у самого пода |
 | `-o jsonpath … sync.revision` | какую ревизию Git применил Argo CD |
@@ -662,7 +663,7 @@ Synced/Healthy def057c16fdeeaf7ac9e4119fb6d73672ce1ed39
 | Промоушен — коммит одной строки с дайджестом | шаг 2 |
 | Ревизия Application равна хешу коммита | шаг 3, строка `Synced/Healthy` |
 | История выкаток читается из `git log` каталога | шаг 3 |
-| `refresh` заменяет ожидание опроса в 180 с | `after 6s` |
+| `refresh` заменяет ожидание опроса Git | `after 6s` |
 
 **Уборка.** Ничего не удаляется: состояние prod нужно работе 3.
 
@@ -683,13 +684,20 @@ Synced/Healthy def057c16fdeeaf7ac9e4119fb6d73672ce1ed39
 
 ### Лабораторная работа 3. Удаление окружения и защита от него
 
+**Риски.** Работа намеренно удаляет окружение staging, а в уборке снимает весь стенд GitOps.
+
+- **Что меняется:** шаги 1–5 удаляют и возвращают Application `orders-staging` и его объекты в `lab-08-2-staging`; уборка удаляет Argo CD с CRD, namespace `argocd`, `lab-08-1`, `lab-08-2-staging`, `lab-08-2-prod` и каталоги `~/lab/k8s/08-1` и `~/lab/k8s/08-2`.
+- **Надолго ли:** окружение пропадает на секунды; уборка необратима, репозиторий в Gitea исчезает вместе с томом.
+- **Безопасность и влияние:** удаляются только объекты работ 08-1 и 08-2 и CRD с группой `argoproj.io`; namespace `orders` и стенд не затронуты. Если Argo CD нужен другим вашим проектам, пропустите уборку.
+- **Откат:** повторить подготовку и работы 08-1 с шага 1.
+
 **Цель.** Увидеть, как удаление каталога из Git сносит окружение, и включить защиту `preserveResourcesOnDeletion` и `applicationsSync`. После этого убрать стенд GitOps целиком.
 
 **Что понадобится.**
 
-- работы 1 и 2 выполнены;
-- каталог `overlays/staging` в репозитории и два Application;
-- около 10 минут.
+- Работы 1 и 2 выполнены.
+- Каталог `overlays/staging` в репозитории и два Application.
+- Около 20 минут, из них 5 минут на уборку.
 
 **Схема опыта.**
 
@@ -716,7 +724,7 @@ kubectl -n argocd annotate applicationset orders-api \
 until ! kubectl -n argocd get app orders-staging >/dev/null 2>&1; do sleep 1; done
 echo "Application gone after $(( $(date +%s)-t0 ))s"
 echo "resources in lab-08-2-staging: $(kubectl -n lab-08-2-staging \
-  get deploy,svc,httproute --no-headers 2>/dev/null | wc -l)"
+  get deploy,svc --no-headers 2>/dev/null | wc -l)"
 ```
 
 | Часть команды | Значение |
@@ -725,7 +733,7 @@ echo "resources in lab-08-2-staging: $(kubectl -n lab-08-2-staging \
 | `mv … staging-saved` | убрать каталог из репозитория, сохранив копию вне его |
 | `annotate applicationset … application-set-refresh=true` | заставить контроллер сразу запустить генератор |
 | `until ! kubectl … get app` | ждать, пока Application перестанет существовать |
-| `get deploy,svc,httproute … wc -l` | посчитать оставшиеся объекты в namespace |
+| `get deploy,svc … wc -l` | посчитать оставшиеся Deployment и Service в namespace |
 
 Результат:
 
@@ -739,7 +747,7 @@ resources in lab-08-2-staging: 0
 
 1. Finalizer `resources-finalizer.argocd.argoproj.io` — он делает удаление Application каскадным.
 2. `gone after 4s` — Application исчез через 4 секунды после того, как контроллер перечитал Git.
-3. `resources … : 0` — вместе с ним удалены Deployment, Service и HTTPRoute: окружения больше нет.
+3. `resources … : 0` — вместе с ним удалены Deployment и Service: окружения больше нет.
 4. Никто не нажимал «удалить»: действие выполнил генератор, который перестал находить каталог.
 
 #### Шаг 2. Вернуть каталог
@@ -769,7 +777,7 @@ kubectl -n argocd get app orders-staging
 
 #### Шаг 3. Включить preserveResourcesOnDeletion
 
-Команда добавляет защиту в ApplicationSet через Git и просит корневое Application перечитать Git: без этого `root` применит новый файл только через 180 с. Затем она проверяет finalizer у существующего Application. Эту работу с шага 3 вы выполняете сами, результаты в шагах 3–5 — ожидаемые.
+Команда добавляет защиту в ApplicationSet через Git и просит корневое Application перечитать Git: без этого `root` применит новый файл только при следующем опросе Git, до 3 минут. Затем она проверяет finalizer у существующего Application. Эту работу с шага 3 вы выполняете сами, результаты в шагах 3–5 — ожидаемые.
 
 ```bash
 sed -i '/^  goTemplate: true/a\  syncPolicy:\n    preserveResourcesOnDeletion: true' \
@@ -814,7 +822,7 @@ kubectl -n argocd annotate applicationset orders-api \
   argocd.argoproj.io/application-set-refresh=true --overwrite
 sleep 15
 kubectl -n argocd get app
-kubectl -n lab-08-2-staging get deploy,svc,httproute --no-headers | wc -l
+kubectl -n lab-08-2-staging get deploy,svc --no-headers | wc -l
 ```
 
 | Часть команды | Значение |
@@ -822,7 +830,7 @@ kubectl -n lab-08-2-staging get deploy,svc,httproute --no-headers | wc -l
 | `mv … staging-saved` | убрать каталог из репозитория, сохранив копию |
 | `application-set-refresh=true` | запустить генератор сразу |
 | `get app` | какие Application остались |
-| `get deploy,svc,httproute … wc -l` | сколько объектов окружения уцелело |
+| `get deploy,svc … wc -l` | сколько объектов окружения уцелело |
 
 Ожидаемый результат:
 
@@ -830,13 +838,13 @@ kubectl -n lab-08-2-staging get deploy,svc,httproute --no-headers | wc -l
 NAME            SYNC STATUS   HEALTH STATUS
 orders-prod     Synced        Healthy
 root            Synced        Healthy
-3
+2
 ```
 
 Разбор:
 
 1. В списке нет `orders-staging` — Application удалён, как и в шаге 1.
-2. Число 3 (Deployment, Service, HTTPRoute) — ресурсы остались в кластере без управления Argo CD.
+2. Число 2 (Deployment и Service) — ресурсы остались в кластере без управления Argo CD.
 3. Поды продолжают обслуживать запросы, хотя GitOps за ними больше не следит.
 
 Теперь вернём каталог. ApplicationSet создаст Application заново, и Argo CD найдёт уцелевшие ресурсы по аннотации отслеживания (08-1), поэтому поды пересоздавать не нужно.
@@ -909,6 +917,7 @@ kubectl delete -n argocd \
   -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.5/manifests/install.yaml
 kubectl delete ns argocd lab-08-1 lab-08-2-staging lab-08-2-prod
 kubectl get crd -o name | grep argoproj.io | xargs -r kubectl delete
+[ -f ~/lab/k8s/08-1/pf.pid ] && kill "$(cat ~/lab/k8s/08-1/pf.pid)"
 rm -rf ~/lab/k8s/08-1 ~/lab/k8s/08-2
 unset -f gpush; unset GIT_URL GITEA_USER GITEA_PASS R O D t0
 kubectl get ns,crd | grep -E 'argo|lab-08-' || echo clean
@@ -922,11 +931,14 @@ curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders
 | `delete -n argocd -f …install.yaml` | удалить компоненты Argo CD той же версии, включая CRD |
 | `delete ns argocd lab-08-1 …` | удалить namespace Argo CD, Gitea с томом и окружений |
 | `grep argoproj.io … xargs delete` | удалить CRD Argo CD, если они остались |
+| `kill … pf.pid` | остановить порт-форвард 08-1, если шаг 3 работы 4 пропущен |
 | `rm -rf ~/lab/k8s/08-1 ~/lab/k8s/08-2` | убрать локальный репозиторий, пароль Gitea и файлы работ |
 | `unset -f gpush; unset …` | убрать функцию и переменные из оболочки |
 | `curl … /api/orders` | проверить, что демо-приложение стенда работает |
 
 Результат: `clean` и `200`. Первое слово значит, что namespace и CRD Argo CD удалены, а `200` — что namespace `orders` и вход стенда не затронуты.
+
+Уборка не трогает две вещи на хосте. Если работа 1 из 08-1 брала образ Redis с Docker Hub, уберите его командой `docker rmi public.ecr.aws/docker/library/redis:8.2.3-alpine redis:8.2.3-alpine`. CLI `argocd` в `/usr/local/bin` остаётся как инструмент, подобно `kubectl`; удалить его можно командой `sudo rm /usr/local/bin/argocd`.
 
 **Вопросы для самопроверки.**
 
