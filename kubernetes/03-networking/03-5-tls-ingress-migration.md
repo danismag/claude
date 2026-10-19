@@ -1,6 +1,6 @@
 # 03-5. TLS и миграция с Ingress
 
-> Модуль 03 «Сеть» · часть 5 из 6 · ~1,5 ч чтения + ~1,5 ч лабы · Нужно: стенд 00-1 (Envoy Gateway 1.9.2, Gateway `lab`), helm и docker из 00-1, доступ к `quay.io` и образам `python:3.12-slim`, `curlimages/curl:8.11.1`, openssl на хосте · Опирается на: 03-2 (Service), 03-4 (Gateway, HTTPRoute, ReferenceGrant)
+> Модуль 03 «Сеть» · часть 5 из 6 · ~1,5 ч чтения + ~2,5 ч лабы · Нужно: стенд 00-1 (Envoy Gateway 1.9.2, Gateway `lab`), helm и docker из 00-1, доступ к `quay.io` и образам `python:3.12-slim`, `curlimages/curl:8.11.1`, openssl на хосте · Опирается на: 03-2 (Service), 03-4 (Gateway, HTTPRoute, ReferenceGrant)
 
 ## Где мы на карте
 
@@ -30,11 +30,11 @@ Ingress (старый вход) ──ingress2gateway──► Gateway + HTTPRou
 
 **TLS** (Transport Layer Security, протокол шифрования соединения) на входе работает на двух участках: на первом клиент проверяет Gateway, на втором Gateway проверяет бэкенд. **TLS termination** (завершение TLS) значит, что Gateway расшифровывает запрос и читает заголовки и пути. Затем он выбирает маршрут и отправляет запрос в бэкенд открытым текстом или новым шифрованным соединением.
 
-Первый участок есть почти везде. Второй нужен, когда сеть внутри кластера нельзя считать доверенной: требования регулятора, общие узлы, чужие сетевые плагины. Вариант без расшифровки на Gateway называется **passthrough** (сквозная передача): Gateway пересылает зашифрованные байты и выбирает бэкенд только по имени сервера, поэтому маршрутизировать по путям не может.
+Первый участок есть почти везде. Второй нужен, когда сеть внутри кластера нельзя считать доверенной: требования регулятора, общие узлы, чужие сетевые плагины. Вариант без расшифровки на Gateway называется **passthrough** (сквозная передача). Gateway пересылает зашифрованные байты и выбирает бэкенд только по имени сервера, поэтому маршрутизировать по путям не может.
 
 ### Сертификаты нельзя продлевать руками
 
-**Сертификат** (certificate) — подписанный удостоверяющим центром документ, который связывает имя хоста с открытым ключом. Срок публичных сертификатов сокращает CA/Browser Forum: до 200 дней с 15 марта 2026, до 100 дней с 15 марта 2027 и до 47 дней с 15 марта 2029. При 47 днях ручная замена на десятках хостов превращается в постоянные аварии. Поэтому сертификатами управляет **cert-manager** — набор контроллеров Kubernetes, который выпускает сертификаты и продлевает их до истечения.
+**Сертификат** (certificate) — подписанный удостоверяющим центром документ, который связывает имя хоста с открытым ключом. Срок публичных сертификатов сокращает CA/Browser Forum. С 15 марта 2026 он не больше 200 дней, с 15 марта 2027 — 100 дней, а с 15 марта 2029 — 47 дней. При 47 днях ручная замена на десятках хостов превращается в постоянные аварии. Поэтому сертификатами управляет **cert-manager** — набор контроллеров Kubernetes, который выпускает сертификаты и продлевает их до истечения.
 
 ### Ingress и почему он уходит
 
@@ -71,13 +71,13 @@ listeners:
 2. `mode: Terminate` — Gateway расшифровывает трафик; для `HTTPS` другое значение API не примет.
 3. `certificateRefs` — секрет `shop-localhost-tls` из namespace Gateway. Секрет из другого namespace берётся только по ReferenceGrant его владельца (03-4 §3).
 
-Режим `Passthrough` допустим только у listener с протоколом `TLS`. HTTPRoute там не работает, потому что Gateway не видит расшифрованных заголовков, и вместо него берут **TLSRoute** (маршрут по имени сервера, стабильный с Gateway API 1.5). Поле `certificateRefs` в этом режиме не нужно: сертификат хранит сам бэкенд.
+Режим `Passthrough` допустим только у listener с протоколом `TLS`. HTTPRoute там не работает, потому что Gateway не видит заголовков. Вместо него берут **TLSRoute** — маршрут по имени сервера, стабильный с Gateway API 1.5. Поле `certificateRefs` в этом режиме не нужно: сертификат хранит сам бэкенд.
 
 Клиентский сертификат на входе (взаимный TLS, mTLS) проверяет сам Gateway. В Gateway API 1.5 это задают в поле `spec.tls.frontend` Gateway: общая настройка и отдельные настройки для портов (`perPort`). Режим по умолчанию `AllowValidOnly` пускает только клиентов с действительным сертификатом. Для веб-входа это не нужно, а для внутренних API помогает отсечь чужих клиентов ещё до маршрутизации.
 
 ### Выбор сертификата по SNI
 
-Сертификат выбирается до расшифровки, по имени, которое клиент сам называет в начале соединения. Это поле **SNI** (Server Name Indication, имя сервера в первом сообщении TLS); оно идёт открытым текстом. Envoy Gateway собирает все listener одного порта в один слушатель Envoy, а каждый HTTPS-listener превращает в отдельную **цепочку фильтров** (filter chain) со своим именем и сертификатом.
+Сертификат выбирается до расшифровки, по имени, которое клиент сам называет в начале соединения. Это поле **SNI** (Server Name Indication, имя сервера в первом сообщении TLS); оно идёт открытым текстом. Envoy Gateway собирает все listener одного порта в один слушатель Envoy. Каждый HTTPS-listener становится в нём отдельной **цепочкой фильтров** (filter chain) со своим именем и сертификатом.
 
 ```
 ClientHello, SNI=shop.localhost
@@ -344,7 +344,7 @@ kubectl get ingress -A -o json | jq '[.items[].metadata.annotations // {} | keys
 | Секрет не создаётся | режим Gateway API выключен | конфигурация контроллера cert-manager |
 | ResolvedRefs=False у listener | секрет в другом namespace без ReferenceGrant | статус Gateway |
 | Recv failure, сброс соединения | SNI не совпал с hostname listener | запрос curl с нужным именем через resolve |
-| unable to get local issuer | клиент не знает CA или нет промежуточного | `openssl s_client -showcerts` |
+| unable to get local issuer | клиент не знает CA или нет промежуточного | цепочка в выводе openssl s_client |
 | 503 при BackendTLSPolicy | бэкенд не говорит TLS или CA не тот | статус политики, логи Envoy |
 
 Таблица 1. Поломки TLS на входе и первая проверка для каждой.
@@ -437,7 +437,7 @@ mkdir -p ~/lab/k8s/03-5
 
 - Стенд 00-1: кластер `kind-lab`, Gateway `lab` в namespace `envoy-gateway-system`, helm 4.
 - Образ `localhost:5001/orders-api:2.0` из реестра стенда, образ `curlimages/curl:8.11.1`.
-- Доступ к `quay.io` для чарта cert-manager (около 100 МБ образов).
+- Доступ к `quay.io` для чарта и четырёх образов cert-manager.
 - Около 10 минут на установку и 50 минут на разбор.
 
 **Схема опыта.**
@@ -532,7 +532,7 @@ deployment "api" successfully rolled out
 
 #### Шаг 2. Установить cert-manager
 
-Ставим cert-manager Helm-чартом версии v1.21.2. Значения лежат в файле: CRD ставятся вместе с чартом, а `enableGatewayAPI: true` включает gateway-shim.
+Ставим cert-manager Helm-чартом версии v1.21.2. Значения лежат в файле: CRD ставятся вместе с чартом, а `gatewayAPI: {enabled: true}` включает gateway-shim.
 
 ```bash
 cat > ~/lab/k8s/03-5/cm-values.yaml <<'EOF'
@@ -540,7 +540,7 @@ crds: {enabled: true}
 config:
   apiVersion: controller.config.cert-manager.io/v1alpha1
   kind: ControllerConfiguration
-  enableGatewayAPI: true
+  gatewayAPI: {enabled: true}
 EOF
 helm upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
   --version v1.21.2 -n cert-manager --create-namespace \
@@ -553,16 +553,16 @@ helm -n cert-manager list
 | Часть команды | Значение |
 |---|---|
 | `crds: {enabled: true}` | чарт сам ставит CRD cert-manager |
-| `enableGatewayAPI: true` | включить gateway-shim |
+| `gatewayAPI: {enabled: true}` | включить gateway-shim |
 | `oci://quay.io/jetstack/charts/cert-manager` | чарт из OCI-реестра |
 | `--version v1.21.2` | версия закреплена, без `latest` |
 | `--wait --timeout 5m` | ждать готовности подов до 5 минут |
 
-Результат (установка занимала 31 секунду):
+Результат: установка на стенде заняла 31 секунду, а `helm list` выводит одну строку (ожидаемый вид, время обновления сокращено).
 
 ```
-NAME          NAMESPACE     REVISION  STATUS    CHART                   APP VERSION
-cert-manager  cert-manager  1         deployed  cert-manager-v1.21.2    v1.21.2
+NAME          NAMESPACE     REVISION  UPDATED  STATUS    CHART                 APP VERSION
+cert-manager  cert-manager  1         …        deployed  cert-manager-v1.21.2  v1.21.2
 ```
 
 Разбор вывода:
@@ -758,29 +758,30 @@ docker run --rm --network kind -v ~/lab/k8s/03-5:/w curlimages/curl:8.11.1 -s \
 
 #### Шаг 6. Пересоздать секрет (проверка автовосстановления)
 
-Удаляем секрет с сертификатом: cert-manager должен заметить пропажу и выпустить его заново. Результат этого шага ожидаемый, он выведен по документации cert-manager и на стенде не снимался.
+Удаляем секрет с сертификатом: cert-manager должен заметить пропажу и выпустить его заново. Этот шаг вы выполняете сами, результат в нём — ожидаемый. Для плановой смены ключа так не делают: для неё есть `cmctl renew`.
 
 ```bash
 kubectl -n envoy-gateway-system delete secret shop-localhost-tls
+until kubectl -n envoy-gateway-system get secret shop-localhost-tls 2>/dev/null; do sleep 2; done
 kubectl -n envoy-gateway-system wait --for=condition=Ready \
   certificate/shop-localhost-tls --timeout=60s
-kubectl -n envoy-gateway-system get secret shop-localhost-tls
 ```
 
 Ожидаемый результат:
 
 ```
 secret "shop-localhost-tls" deleted
-certificate.cert-manager.io/shop-localhost-tls condition met
 NAME                 TYPE                DATA   AGE
-shop-localhost-tls   kubernetes.io/tls   2      …
+shop-localhost-tls   kubernetes.io/tls   3      …
+certificate.cert-manager.io/shop-localhost-tls condition met
 ```
 
 Разбор вывода:
 
-1. cert-manager сравнивает Certificate с секретом и при расхождении запускает новый выпуск.
-2. В секрете два ключа, `tls.crt` и `tls.key`, и новый возраст.
-3. Вывод: продление и восстановление идут одним механизмом, поэтому сертификат переживает потерю секрета.
+1. Цикл `until` ждёт секрет, а не условие: сразу после удаления Certificate ещё может числиться готовым.
+2. cert-manager сравнивает Certificate с секретом и при расхождении запускает новый выпуск.
+3. В секрете три ключа: `tls.crt`, `tls.key` и `ca.crt` с корнем, который issuer типа `ca` добавляет сам.
+4. Вывод: продление и восстановление идут одним механизмом, поэтому сертификат переживает потерю секрета.
 
 #### Итог
 
@@ -796,7 +797,7 @@ shop-localhost-tls   kubernetes.io/tls   2      …
 
 #### Уборка
 
-Убираем listener и аннотацию из Gateway, сертификат и секрет, issuer'ы и cert-manager с его CRD, затем namespace и файлы. CRD удаляются отдельно: `helm uninstall` их не трогает. Последняя команда проверяет сквозной сценарий стенда.
+Убираем listener и аннотацию из Gateway, сертификат и секрет, issuer'ы и cert-manager с его CRD, затем namespace и файлы. CRD удаляются отдельно: `helm uninstall` их не трогает. Последняя команда проверяет, что вход стенда работает.
 
 ```bash
 kubectl -n envoy-gateway-system patch gateway lab --type=json -p '[
@@ -814,7 +815,7 @@ rm -rf ~/lab/k8s/03-5
 curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders
 ```
 
-Разбор: последняя команда должна вернуть `200`, значит, сквозной сценарий стенда цел. Если вы продолжаете с работой 2, не выполняйте `rm -rf` и `delete ns lab-03-5` сейчас, а пересоздайте их в начале работы 2. Удаление CRD удаляет и все Certificate кластера, поэтому делайте это только на стенде.
+Разбор: последняя команда должна вернуть `200`, значит, приложение стенда отвечает через Gateway. Работа 2 начинается с пустого namespace, поэтому уборку выполняйте полностью. Удаление CRD удаляет и все Certificate кластера, поэтому делайте это только на стенде.
 
 #### Вопросы для самопроверки
 
@@ -822,7 +823,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders
 
 <details><summary>Ответ</summary>
 
-Он создаёт Certificate для каждого HTTPS-listener с hostname. Имя секрета берётся из `certificateRefs` листенера, а issuer из аннотации `cert-manager.io/cluster-issuer` на Gateway. Без `enableGatewayAPI: true` в конфигурации контроллера аннотация не действует.
+Он создаёт Certificate для каждого HTTPS-listener с hostname. Имя секрета берётся из `certificateRefs` листенера, а issuer из аннотации `cert-manager.io/cluster-issuer` на Gateway. Без `gatewayAPI.enabled: true` (или старого `enableGatewayAPI: true`) в конфигурации контроллера аннотация не действует.
 
 </details>
 
@@ -1107,7 +1108,7 @@ ResolvedRefs=True ResolvedRefs
 
 1. `Accepted=True` значит, что политика допустима и применена.
 2. `ResolvedRefs=True` значит, что ConfigMap с корнем найден и прочитан.
-3. Если ConfigMap назван неверно, второе условие станет `False` с причиной `InvalidCACertificateRef`.
+3. Если ConfigMap назван неверно или в нём нет ключа `ca.crt`, второе условие станет `False` с причиной `InvalidCACertificateRef`. Когда не разрешилась ни одна ссылка, `Accepted` тоже становится `False` с причиной `NoValidCACertificate`.
 
 #### Шаг 6. Сломать проверку имени
 
@@ -1199,14 +1200,14 @@ Envoy не получил ответ от апстрима и сообщает �
 
 ### Лабораторная работа 3. Из Ingress в Gateway API
 
-Первая половина работы (шаги 1–2) выполнена на стенде, её вывод реальный. Шаги 3–5 с ingress2gateway вы выполняете сами, результаты в них — ожидаемые.
+Шаги 3–5 с ingress2gateway вы выполняете сами, результаты в них — ожидаемые.
 
 **Цель.** Увидеть, что Ingress без контроллера мёртв, и перевести его на Gateway API. Вы создадите Ingress с аннотацией ingress-nginx, убедитесь, что он не работает, и конвертируете его инструментом ingress2gateway в HTTPRoute.
 
 **Что понадобится.**
 
 - Стенд 00-1 с Gateway `lab`.
-- Для шагов 3–5: Go 1.22 или новее (команда `go install`) либо готовый бинарник из релизов проекта.
+- Для шагов 3–5: Go 1.25.5 или новее (команда `go install`) либо готовый бинарник из релизов проекта.
 - Образ `localhost:5001/orders-api:2.0`.
 - Около 40 минут.
 
@@ -1353,7 +1354,7 @@ shop-legacy   nginx   legacy.localhost             80      …
 - **Откуда берёт данные.** Из файлов (`--input-file`) или из кластера (`--namespace`, `--all-namespaces`) через текущий контекст kubectl.
 - **Команды для скриптов.** `ingress2gateway print` пишет манифесты в stdout, а предупреждения в stderr, поэтому вывод можно перенаправлять в файл.
 - **Частые ошибки.** Принять вывод за готовый: предупреждения нужно читать, а `gatewayClassName` и имена листенеров править. Забыть, что regex и таймауты переводятся приблизительно.
-- **Установка.** Ubuntu и Manjaro: `go install github.com/kubernetes-sigs/ingress2gateway@v1.0.0` (бинарник попадёт в `~/go/bin`) или готовый файл со страницы релизов проекта; в Manjaro Go ставится пакетом `go`.
+- **Установка.** Ubuntu и Manjaro: `go install github.com/kubernetes-sigs/ingress2gateway@v1.0.0`, бинарник попадёт в `~/go/bin`. Нужен Go 1.25.5 или новее: в Manjaro он ставится пакетом `go`, а пакет `golang` в Ubuntu 24.04 старее, поэтому там проще взять готовый файл со страницы релизов проекта.
 
 ```bash
 go install github.com/kubernetes-sigs/ingress2gateway@v1.0.0
@@ -1417,12 +1418,21 @@ ingress2gateway print --input-file ingress.yaml \
 | `--emitter envoy-gateway` | добавить расширения Envoy Gateway |
 | `> gateway.yaml` | манифесты — в файл, предупреждения — на экран |
 
-Ожидаемый результат (по описанию выпуска 1.0; точные тексты зависят от версии):
+Ожидаемый результат (по примеру из объявления о выпуске 1.0, сокращено; точные тексты зависят от версии):
 
 ```
-… warning: configuration-snippet is not supported; check your implementation
-… info: regex paths are case-insensitive prefix matches in ingress-nginx; output uses (?i) and .*
-… info: proxy-read-timeout approximated as timeouts.request
+┌─ WARN  ────────────────────────────────────────
+│  Unsupported annotation nginx.ingress.kubernetes.io/configuration-snippet
+…
+┌─ INFO  ────────────────────────────────────────
+│  Using case-insensitive regex path matches. You may want to change this.
+…
+┌─ WARN  ────────────────────────────────────────
+│  ingress-nginx only supports TCP-level timeouts; i2gw has made a best-effort
+│  translation to Gateway API timeouts.request. …
+…
+┌─ WARN  ────────────────────────────────────────
+│  Gateway API does not support configuring URL normalization (RFC 3986, …
 ```
 
 Разбор вывода:
@@ -1430,13 +1440,14 @@ ingress2gateway print --input-file ingress.yaml \
 1. Предупреждение про `configuration-snippet`: заголовок `X-Frame-Options` придётся задавать средствами реализации (в Envoy Gateway — через политики), конвертер его не перенёс.
 2. Regex-путь переведён с сохранением регистронезависимости, поэтому в пути появился префикс `(?i)` и окончание `.*`.
 3. Таймаут чтения стал `timeouts.request` приблизительно: у nginx он относился к TCP, у Gateway API — к запросу.
+4. Последнее предупреждение напоминает, что нормализацию URL Gateway API не задаёт и её надо проверить у реализации.
 
 #### Шаг 5. Прочитать результат и проверить его на кластере
 
 Смотрим, что получилось в `gateway.yaml`, и проверяем HTTPRoute на сервере без применения. Результат ожидаемый: имена объектов и поля зависят от версии конвертера, поэтому сверяйте их с вашим файлом.
 
 ```bash
-grep -E '^kind:|name:|gatewayClassName|type: RequestRedirect|timeouts|request:' gateway.yaml
+grep -E '^kind:|^  name:|gatewayClassName|type: RequestRedirect|request:' gateway.yaml
 kubectl apply --dry-run=server -f gateway.yaml
 ```
 
@@ -1444,27 +1455,35 @@ kubectl apply --dry-run=server -f gateway.yaml
 
 | Часть команды | Значение |
 |---|---|
-| `grep -E '…'` | оставить виды объектов, имена, редирект и таймаут |
+| `grep -E '…'` | оставить виды объектов, их имена, класс, редирект и таймаут |
 | `--dry-run=server` | проверить объекты на API-сервере, ничего не создавая |
 
 Ожидаемый результат:
 
 ```
 kind: Gateway
+  name: nginx
   gatewayClassName: nginx
 kind: HTTPRoute
-    timeouts: …
+  name: shop-legacy-legacy-localhost
+      request: …
 kind: HTTPRoute
-      - type: RequestRedirect
+  name: shop-legacy-legacy-localhost-ssl-redirect
+      type: RequestRedirect
+…
+gateway.gateway.networking.k8s.io/nginx created (server dry run)
+httproute.gateway.networking.k8s.io/shop-legacy-legacy-localhost created (server dry run)
+…
 ```
 
 Разбор вывода:
 
-1. Gateway содержит HTTPS-listener на 443 с `certificateRefs: legacy-tls` из секции `tls` Ingress.
-2. Один HTTPRoute несёт путь-regex, CORS-фильтр и таймаут, второй выполняет редирект HTTP на HTTPS (код 308): так вёл себя ingress-nginx для Ingress с TLS.
+1. Gateway назван по классу Ingress и содержит HTTP-listener на 80 и HTTPS-listener на 443 с `certificateRefs: legacy-tls` из секции `tls`.
+2. Первый HTTPRoute несёт путь-regex, CORS-фильтр и таймаут, второй выполняет редирект HTTP на HTTPS с кодом 308, как ingress-nginx для Ingress с TLS.
 3. `gatewayClassName` взят из `ingressClassName`, то есть `nginx`; такого класса у стенда нет, поэтому Gateway из файла применять нельзя.
-4. Правильный путь на стенде: оставить в файле только HTTPRoute и заменить `parentRefs` на Gateway `lab` в `envoy-gateway-system`, а listener `legacy.localhost` добавить в `lab` вручную, как в работе 1.
-5. Пробный `--dry-run=server` покажет ошибку на объектах Gateway с неизвестным классом и подтвердит схему HTTPRoute; сам кластер не изменится.
+4. `--dry-run=server` проверяет только схему: API-сервер примет и Gateway с несуществующим классом, а ошибку класса увидит лишь контроллер. Кластер при этом не меняется.
+5. Правильный путь на стенде: оставить в файле только HTTPRoute и заменить `parentRefs` на Gateway `lab` в `envoy-gateway-system`, а listener `legacy.localhost` добавить в `lab` вручную, как в работе 1.
+6. Эмиттер `envoy-gateway` может добавить в файл объекты политик Envoy Gateway; их проверяют так же.
 
 #### Итог
 
@@ -1474,9 +1493,9 @@ kind: HTTPRoute
 |---|---|
 | Ingress без контроллера не создаёт трафика | пустой `ADDRESS`, ответ 404 |
 | API принимает Ingress без IngressClass | команда `get ingressclass` |
-| Конвертер переводит около 30 аннотаций | `print` с провайдером ingress-nginx |
+| Конвертер переводит больше 30 аннотаций | `print` с провайдером ingress-nginx |
 | Сниппеты и размер тела переписываются вручную | предупреждения в stderr |
-| Результат требует правки и проверки | `--dry-run=server`, сравнение ответов |
+| Dry-run не проверяет класс Gateway | `apply --dry-run=server` |
 
 #### Уборка
 
