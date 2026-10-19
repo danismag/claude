@@ -72,7 +72,7 @@ CA, 10 лет:   ca            etcd-ca          front-proxy-ca
 
 ### Продление при обновлении
 
-Команды `kubeadm upgrade apply` и `kubeadm upgrade node` продлевают листовые сертификаты и kubeconfig'и узла автоматически (10-3). Отключает это флаг `--certificate-renewal=false`. Отсюда правило: кластер, который обновляют хотя бы раз в год, истёкших сертификатов не видит. Кластер, который «работает, значит не трогаем», ломается ровно через год после установки.
+Команды `kubeadm upgrade apply` и `kubeadm upgrade node` продлевают листовые сертификаты и kubeconfig-файлы узла автоматически (10-3). Отключает это флаг `--certificate-renewal=false`. Отсюда правило: кластер, который обновляют хотя бы раз в год, истёкших сертификатов не видит. Кластер, который «работает, значит не трогаем», ломается ровно через год после установки.
 
 На узлах control plane файлы свои у каждого узла, поэтому в кластере из трёх таких узлов обновление и продление идут на каждом отдельно.
 
@@ -138,10 +138,12 @@ sudo kubeadm certs renew all
 sudo kubeadm certs renew apiserver
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `certs check-expiration` | показать срок каждого сертификата и CA |
-| `certs renew all` | выпустить новые листовые сертификаты и kubeconfig'и |
+| `certs renew all` | выпустить новые листовые сертификаты и kubeconfig-файлы |
 | `certs renew apiserver` | продлить один сертификат по имени |
 
 Продление берёт ключи CA из `/etc/kubernetes/pki` на самом узле и не требует работающего API-сервера. Если сертификаты уже истекли, kubeadm не может прочитать конфигурацию из кластера, предупреждает об этом и использует значения по умолчанию. Если CA хранится вне кластера, команда `kubeadm certs generate-csr` готовит ключи и запросы, которые подписывает внешний CA.
@@ -171,6 +173,8 @@ mv manifests/etcd.yaml /root/ ─► kubelet останавливает под �
 sudo kubeadm kubeconfig user --client-name=anna --org=lab-readers \
   --validity-period=720h > anna.conf
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -212,7 +216,7 @@ cordon+drain ──► работа, перезагрузка ──► пров
 4. Вывести старый узел из работы (drain) и удалить его объект: `kubectl delete node <имя>`.
 5. На старой машине выполнить `kubeadm reset` и вывести её из эксплуатации.
 
-Для узла control plane добавляется etcd. Новый узел подключают флагом `--control-plane` с ключом `--certificate-key`, который выдаёт `kubeadm init phase upload-certs --upload-certs` (ключ действует 2 часа). Старый узел убирают, пока в кластере остаётся большинство членов etcd (10-2): `kubeadm reset` на нём сам удаляет его членство в etcd. Перед заменой делают снимок etcd (10-2).
+Для узла control plane добавляется etcd. Новый узел подключают флагом `--control-plane` с ключом `--certificate-key`, который выдаёт `kubeadm init phase upload-certs --upload-certs` (ключ действует 2 часа). Старый узел убирают, пока в кластере остаётся большинство членов etcd (10-2): `kubeadm reset` на нём сам удаляет его членство в etcd. Перед заменой делают снапшот etcd (10-2).
 
 ---
 
@@ -307,7 +311,7 @@ kubectl -n kube-node-lease get lease lab-worker2 -o jsonpath='{.spec.renewTime}{
 ### Значения по умолчанию
 
 - **CA** — 10 лет (`87600h`).
-- **Листовые сертификаты и kubeconfig'и** — 1 год (`8760h`).
+- **Листовые сертификаты и kubeconfig-файлы** — 1 год (`8760h`).
 - **Ротация kubelet** — на отметке 70–90 % срока; срок нового сертификата ограничен `--cluster-signing-duration` (1 год).
 - **Токен подключения** — 24 часа; ключ `upload-certs` — 2 часа.
 - **Heartbeat** — Lease 40 с, обновление примерно раз в 10 с; `node-monitor-grace-period` — 50 с (01-2).
@@ -340,6 +344,8 @@ W=lab-worker2
 mkdir -p ~/lab/k8s/10-4
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `k() { … }` | функция-обёртка: `kubectl` с контекстом стенда |
@@ -350,7 +356,7 @@ mkdir -p ~/lab/k8s/10-4
 
 ### Лабораторная работа 1. Сроки сертификатов: что и когда истекает
 
-**Цель.** Увидеть, какие сертификаты есть в кластере и сколько им осталось. Вы найдёте листовые сертификаты и CA, клиентский сертификат kubelet с его ротацией и группы двух админских kubeconfig'ов.
+**Цель.** Увидеть, какие сертификаты есть в кластере и сколько им осталось. Вы найдёте листовые сертификаты и CA, клиентский сертификат kubelet с его ротацией и группы двух админских kubeconfig-файлов.
 
 **Что понадобится.**
 
@@ -358,7 +364,7 @@ mkdir -p ~/lab/k8s/10-4
 - Подготовка из начала раздела.
 - Около 20 минут.
 
-**Схема опыта.** Три источника сроков: `kubeadm` на узле control plane, каталог kubelet на рабочем узле и kubeconfig'и администратора.
+**Схема опыта.** Три источника сроков: `kubeadm` на узле control plane, каталог kubelet на рабочем узле и kubeconfig-файлы администратора.
 
 ```
 lab-control-plane:  kubeadm certs check-expiration ──► листовые сертификаты и CA
@@ -376,6 +382,8 @@ lab-worker:         /var/lib/kubelet/pki             ──► клиентск�
 ```bash
 docker exec $CP kubeadm certs check-expiration
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -426,6 +434,8 @@ docker exec lab-worker openssl x509 -noout -subject -enddate \
 docker exec lab-worker grep -E 'rotateCertificates|serverTLSBootstrap' /var/lib/kubelet/config.yaml
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `ls /var/lib/kubelet/pki` | список файлов kubelet с сертификатами |
@@ -454,7 +464,7 @@ rotateCertificates: true
 4. Срок около года; ротация начнётся между 70 % и 90 % срока.
 5. Строки `serverTLSBootstrap` в конфиге нет: серверная ротация выключена, значение по умолчанию — `false`.
 
-#### Шаг 3. Группы админских kubeconfig'ов
+#### Шаг 3. Группы админских kubeconfig-файлов
 
 Читаем из обоих файлов на узле control plane имя и группу, записанные в клиентском сертификате.
 
@@ -464,6 +474,8 @@ for f in admin super-admin; do
     | awk '{print \$2}' | base64 -d | openssl x509 -noout -subject"
 done
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -494,6 +506,8 @@ kind get kubeconfig --name lab | grep client-certificate-data | awk '{print $2}'
   | base64 -d | openssl x509 -noout -enddate
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `kind get kubeconfig --name lab` | вывести kubeconfig кластера `lab` |
@@ -511,7 +525,7 @@ notAfter=Oct 14 15:47:30 2027 GMT
 1. Дата окончания совпадает с датой `admin.conf` из шага 1: `15:47` в таблице kubeadm и `15:47:30` здесь.
 2. Копия в `~/.kube/config` живёт собственным годом: после продления в работе 2 она останется прежней и будет работать до этой даты.
 
-**Итог.**
+**Итог.** Что вы узнали:
 
 | Что узнали | Где видно |
 |---|---|
@@ -525,14 +539,26 @@ notAfter=Oct 14 15:47:30 2027 GMT
 **Вопросы для самопроверки.**
 
 1. Почему в `kubeadm certs check-expiration` нет сертификата kubelet?
+
+<details><summary>Ответ</summary>
+
+Сертификат kubelet не выписывает kubeadm, а запрашивает и обновляет сам kubelet по CSR (§2).
+
+</details>
+
 2. Что отличает `super-admin.conf` от `admin.conf` с точки зрения RBAC?
+
+<details><summary>Ответ</summary>
+
+Группа `system:masters` обходит RBAC и не отзывается правилами; у `admin.conf` группа `kubeadm:cluster-admins`, её права выдаёт обычная привязка.
+
+</details>
+
 3. Что значит `RESIDUAL TIME` у CA, равное `9y`?
 
 <details><summary>Ответ</summary>
 
-1. Сертификат kubelet не выписывает kubeadm, а запрашивает и обновляет сам kubelet по CSR (§2).
-2. Группа `system:masters` обходит RBAC и не отзывается правилами; у `admin.conf` группа `kubeadm:cluster-admins`, её права выдаёт обычная привязка.
-3. До окончания CA осталось около девяти лет; листовые сертификаты, подписанные им, живут от года.
+До окончания CA осталось около девяти лет; листовые сертификаты, подписанные им, живут от года.
 
 </details>
 
@@ -576,6 +602,8 @@ docker exec $CP cp -a /etc/kubernetes /root/k8s-backup-10-4
 docker exec $CP test -f /root/k8s-backup-10-4/pki/ca.crt && echo copied
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `cp -a /etc/kubernetes …` | скопировать каталог вместе с правами |
@@ -604,6 +632,8 @@ docker exec $CP openssl x509 -in /etc/kubernetes/pki/apiserver.crt -noout -start
 docker exec $CP sh -c \
   'openssl s_client -connect 127.0.0.1:6443 </dev/null 2>/dev/null | openssl x509 -noout -startdate'
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -637,9 +667,11 @@ notBefore=Oct 14 16:00:31 2026 GMT
 docker exec $CP kubeadm certs renew all
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
-| `kubeadm certs renew all` | продлить все листовые сертификаты и kubeconfig'и |
+| `kubeadm certs renew all` | продлить все листовые сертификаты и kubeconfig-файлы |
 
 Результат (последние строки):
 
@@ -668,6 +700,8 @@ for f in etcd kube-apiserver kube-controller-manager kube-scheduler; do
   until k get --raw /readyz >/dev/null 2>&1; do sleep 2; done; echo "$f restarted"
 done
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -700,6 +734,8 @@ docker exec $CP ls /etc/kubernetes/manifests
 k get nodes --no-headers | awk '{print $1, $2}'
 curl -s -o /dev/null -w 'orders: %{http_code}\n' http://orders.localhost:8088/api/orders
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -736,6 +772,8 @@ docker exec $CP sh -c "grep client-certificate-data /etc/kubernetes/admin.conf \
   | awk '{print \$2}' | base64 -d | openssl x509 -noout -enddate"
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `grep … admin.conf` | строка с сертификатом в файле на узле |
@@ -752,7 +790,7 @@ notAfter=Oct 14 … 2027 GMT
 1. Дата позже, чем `15:47:30` из работы 1: срок отсчитывается от момента продления.
 2. Копия на хосте при этом не изменилась: она работает до своей прежней даты, а чтобы получить новую, надо забрать файл заново. Для личного доступа администраторам выдают отдельные сертификаты (§3).
 
-**Итог.**
+**Итог.** Что вы узнали:
 
 | Что узнали | Где видно |
 |---|---|
@@ -771,16 +809,34 @@ docker exec $CP rm -rf /root/k8s-backup-10-4
 **Вопросы для самопроверки.**
 
 1. Почему после `renew apiserver` порт 6443 сразу отдаёт новый сертификат?
+
+<details><summary>Ответ</summary>
+
+API-сервер перечитывает серверный сертификат с диска без перезапуска.
+
+</details>
+
 2. Какие четыре компонента нужно перезапустить и почему?
+
+<details><summary>Ответ</summary>
+
+Etcd, `kube-apiserver`, `kube-controller-manager` и `kube-scheduler`: etcd, controller-manager и scheduler читают сертификаты и kubeconfig при старте, а API-сервер перезапускают, чтобы обновить остальные клиентские сертификаты.
+
+</details>
+
 3. Что произойдёт с копией `admin.conf` на рабочей станции после `renew all`?
+
+<details><summary>Ответ</summary>
+
+Ничего: старая копия продолжает работать до своей даты окончания, потому что отзыва нет.
+
+</details>
+
 4. Как выполнить перезапуск на кластере из трёх узлов control plane?
 
 <details><summary>Ответ</summary>
 
-1. API-сервер перечитывает серверный сертификат с диска без перезапуска.
-2. Etcd, `kube-apiserver`, `kube-controller-manager` и `kube-scheduler`: etcd, controller-manager и scheduler читают сертификаты и kubeconfig при старте, а API-сервер перезапускают, чтобы обновить остальные клиентские сертификаты.
-3. Ничего: старая копия продолжает работать до своей даты окончания, потому что отзыва нет.
-4. Продление и перезапуск идут на каждом узле отдельно и по одному узлу за раз, чтобы сохранить кворум etcd и доступность API.
+Продление и перезапуск идут на каждом узле отдельно и по одному узлу за раз, чтобы сохранить кворум etcd и доступность API.
 
 </details>
 
@@ -830,6 +886,8 @@ cordon+drain ──► docker restart $W ──► Lease и DaemonSet свежи
 echo $! > ~/lab/k8s/10-4/load.pid
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `end=$(( … + 150 ))` | цикл работает 150 с |
@@ -840,7 +898,7 @@ echo $! > ~/lab/k8s/10-4/load.pid
 
 Команда ничего не печатает, кроме номера задания оболочки.
 
-Разбор:
+Разбор вывода:
 
 1. Пока цикл работает, результат лежит в `~/lab/k8s/10-4/load.txt`, но пуст: итог печатается в конце.
 2. Номер процесса лежит в файле, поэтому цикл можно остановить и дождаться (шаг 5).
@@ -853,6 +911,8 @@ echo $! > ~/lab/k8s/10-4/load.pid
 k drain $W --ignore-daemonsets --delete-emptydir-data --timeout=120s
 k get node $W --no-headers | awk '{print $1, $2}'
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -889,6 +949,8 @@ k -n kube-node-lease get lease $W -o jsonpath='{.spec.renewTime}{"\n"}'
 k get node $W -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}{"\n"}'
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `docker restart $W` | остановить и запустить контейнер узла |
@@ -922,6 +984,8 @@ RESTARTS:.status.containerStatuses[0].restartCount
 k uncordon $W
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `--field-selector spec.nodeName=$W` | поды только этого узла |
@@ -952,6 +1016,8 @@ while kill -0 "$(cat ~/lab/k8s/10-4/load.pid)" 2>/dev/null; do sleep 2; done
 cat ~/lab/k8s/10-4/load.txt
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `kill -0 PID` | проверить, жив ли процесс, не посылая сигнал |
@@ -970,7 +1036,7 @@ orders during maintenance: ok=678 fail=0
 2. `fail=0`: за всё время drain и перезагрузки клиент не получил ни одной ошибки. Это и есть цель обслуживания: приложение его не заметило.
 3. Условие, при котором так получается, — запас на других узлах и работающие проверки готовности подов (05-5).
 
-**Итог.**
+**Итог.** Что вы узнали:
 
 | Что узнали | Где видно |
 |---|---|
@@ -993,16 +1059,34 @@ unset CP W
 **Вопросы для самопроверки.**
 
 1. Почему `uncordon` выполняют только после проверки узла?
+
+<details><summary>Ответ</summary>
+
+До проверки на узле могут быть неготовы kubelet, containerd или CNI, а поды DaemonSet не запущены; поды, севшие на такой узел, не заработают.
+
+</details>
+
 2. Чем опасно доверять одному полю `Ready` после перезагрузки?
+
+<details><summary>Ответ</summary>
+
+Условие `Ready` меняется с задержкой; пока controller-manager не отметил тишину (50 с), оно показывает старое состояние. Проверяйте heartbeat в Lease и подов DaemonSet.
+
+</details>
+
 3. Что нужно проверить перед drain, чтобы он не завис (05-5)?
+
+<details><summary>Ответ</summary>
+
+Бюджеты PDB с нулевым `ALLOWED DISRUPTIONS`, место на других узлах и поды с локальными томами.
+
+</details>
+
 4. Чем замена узла отличается от его обслуживания?
 
 <details><summary>Ответ</summary>
 
-1. До проверки на узле могут быть неготовы kubelet, containerd или CNI, а поды DaemonSet не запущены; поды, севшие на такой узел, не заработают.
-2. Условие `Ready` меняется с задержкой; пока controller-manager не отметил тишину (50 с), оно показывает старое состояние. Проверяйте heartbeat в Lease и подов DaemonSet.
-3. Бюджеты PDB с нулевым `ALLOWED DISRUPTIONS`, место на других узлах и поды с локальными томами.
-4. Обслуживание возвращает тот же узел; при замене сначала добавляют новый, потом выводят и удаляют старый (§3).
+Обслуживание возвращает тот же узел; при замене сначала добавляют новый, потом выводят и удаляют старый (§3).
 
 </details>
 

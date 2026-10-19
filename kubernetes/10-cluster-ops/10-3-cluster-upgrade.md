@@ -168,6 +168,8 @@ sudo kubeadm upgrade plan
 sudo kubeadm upgrade apply v1.36.5
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `apt-mark unhold kubeadm` | снять запрет на обновление пакета |
@@ -190,6 +192,8 @@ sudo apt-mark hold kubelet kubectl
 sudo systemctl daemon-reload && sudo systemctl restart kubelet
 kubectl uncordon NODE
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -246,6 +250,8 @@ kubectl get nodes
 kubectl -n kube-system get pods \
   -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image
 ```
+
+Разбор команды:
 
 | Команда | Что показывает |
 |---|---|
@@ -370,6 +376,8 @@ mkdir -p "$LAB"
 k get nodes
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `k() { kubectl --context kind-lab … }` | вызывать kubectl с контекстом стенда, не меняя текущий |
@@ -430,6 +438,8 @@ docker exec $CP sh -c 'mkdir -p /root/lab-10-3 && \
 docker exec $CP /root/lab-10-3/kubeadm upgrade plan
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `stable-1.36.txt` | файл с последним патчем ветки 1.36 |
@@ -473,6 +483,8 @@ for img in $(docker exec $CP /root/lab-10-3/kubeadm config images list 2>/dev/nu
 done
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `config images list` | образы, которые нужны этой версии kubeadm |
@@ -490,6 +502,8 @@ done
 docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' $CP
 docker exec $CP openssl x509 -in /etc/kubernetes/pki/etcd/server.crt -noout -ext subjectAltName
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -524,6 +538,8 @@ docker exec $CP sh -c 'IP=$(hostname -I | cut -d" " -f1)
     -o jsonpath="{.data.ClusterConfiguration}"; } > /root/lab-10-3/certs.yaml'
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `IP=$(hostname -I …)` | первый IP узла |
@@ -541,6 +557,8 @@ kubeadm init phase certs etcd-peer --config /root/lab-10-3/certs.yaml
 mv /etc/kubernetes/manifests/etcd.yaml /root/lab-10-3/ && sleep 15
 mv /root/lab-10-3/etcd.yaml /etc/kubernetes/manifests/'
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -583,6 +601,8 @@ docker exec $CP /root/lab-10-3/kubeadm-1.37.1 upgrade plan v1.37.1
 k get --raw /metrics | grep '^apiserver_requested_deprecated_apis'
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `kubeadm-1.37.1 upgrade plan v1.37.1` | проверить кластер для цели 1.37.1; ничего не меняет |
@@ -624,15 +644,26 @@ apiserver_requested_deprecated_apis{group="",removed_release="",resource="endpoi
 **Вопросы для самопроверки.**
 
 1. Почему kubeadm без заранее скачанных образов может выглядеть зависшим?
+
+<details><summary>Ответ</summary>
+
+На проверках kubeadm скачивает образы с `registry.k8s.io` и не показывает прогресс. Если узел не имеет образа, а скачивание медленное, команда ждёт без ошибки. Образы скачивают заранее (`config images pull` или `kind load`).
+
+</details>
+
 2. Почему API-сервер работает, а kubeadm падает на etcd при устаревших SAN?
+
+<details><summary>Ответ</summary>
+
+API-сервер подключается к etcd через `127.0.0.1`, а адрес `127.0.0.1` есть в SAN. Kubeadm подключается по IP узла, которого в SAN нет, поэтому проверка TLS не проходит.
+
+</details>
+
 3. Зачем нужен `upgrade plan` перед `upgrade apply`?
 
-<details>
-<summary>Ответ</summary>
+<details><summary>Ответ</summary>
 
-1. На проверках kubeadm скачивает образы с `registry.k8s.io` и не показывает прогресс. Если узел не имеет образа, а скачивание медленное, команда ждёт без ошибки. Образы скачивают заранее (`config images pull` или `kind load`).
-2. API-сервер подключается к etcd через `127.0.0.1`, а адрес `127.0.0.1` есть в SAN. Kubeadm подключается по IP узла, которого в SAN нет, поэтому проверка TLS не проходит.
-3. План проверяет, что обновление возможно, показывает целевую версию и список компонентов, которые придётся обновлять руками. Он ничего не меняет, поэтому его запускают всегда.
+План проверяет, что обновление возможно, показывает целевую версию и список компонентов, которые придётся обновлять руками. Он ничего не меняет, поэтому его запускают всегда.
 
 </details>
 
@@ -677,6 +708,8 @@ apiserver_requested_deprecated_apis{group="",removed_release="",resource="endpoi
   done; echo "orders during upgrade: ok=$ok fail=$fail" ) > "$LAB/load.txt" &
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `echo $BASHPID > load.pid` | записать PID подоболочки с циклом |
@@ -697,6 +730,8 @@ s=$(date +%s)
 docker exec $CP sh -c '/root/lab-10-3/kubeadm upgrade apply v1.36.5 -y \
   > /root/lab-10-3/upgrade.log 2>&1'; echo "exit=$? took $(( $(date +%s)-s ))s"
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -720,6 +755,8 @@ exit=0 took 105s
 ```bash
 docker exec $CP grep -E 'SUCCESS|upgrade/staticpods' /root/lab-10-3/upgrade.log
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -755,6 +792,8 @@ k -n kube-system get ds kube-proxy \
 k get nodes
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `version -o json \| jq -r …` | версия API-сервера из JSON |
@@ -785,6 +824,8 @@ lab-worker          Ready    <none>          …     v1.36.1
 ```bash
 wait; cat "$LAB/load.txt"
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -821,15 +862,26 @@ kill "$(cat "$LAB/load.pid")" 2>/dev/null; rm -f "$LAB/load.pid"
 **Вопросы для самопроверки.**
 
 1. Почему клиенты не получили ни одной ошибки?
+
+<details><summary>Ответ</summary>
+
+Запрос клиента идёт через Gateway, Service и под, а API-сервер на этом пути не участвует. Правила kube-proxy уже на узлах и работают без него.
+
+</details>
+
 2. Почему после `upgrade apply` kubelet остался на старой версии?
+
+<details><summary>Ответ</summary>
+
+Kubeadm обновляет компоненты control plane, kube-proxy и CoreDNS, а kubelet — отдельный процесс на узле, который обновляют пакетом или заменой файла.
+
+</details>
+
 3. Где лежат копии манифестов прежней версии?
 
-<details>
-<summary>Ответ</summary>
+<details><summary>Ответ</summary>
 
-1. Запрос клиента идёт через Gateway, Service и под, а API-сервер на этом пути не участвует. Правила kube-proxy уже на узлах и работают без него.
-2. Kubeadm обновляет компоненты control plane, kube-proxy и CoreDNS, а kubelet — отдельный процесс на узле, который обновляют пакетом или заменой файла.
-3. В `/etc/kubernetes/tmp/kubeadm-backup-manifests-<дата>` на узле control plane. Kubeadm их не удаляет.
+В `/etc/kubernetes/tmp/kubeadm-backup-manifests-<дата>` на узле control plane. Kubeadm их не удаляет.
 
 </details>
 
@@ -873,6 +925,8 @@ curl -sfL -o "$LAB/kubelet-1.36.5" https://dl.k8s.io/release/v1.36.5/bin/linux/a
 k -n orders get pods -o wide
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `curl -sfL -o …/kubelet-1.36.5` | скачать kubelet 1.36.5 в каталог работы |
@@ -911,6 +965,8 @@ upgrade_node() {
 }
 ```
 
+Разбор команды:
+
 | Часть функции | Значение |
 |---|---|
 | `drain … --force --timeout=180s` | вывести узел, ждать не больше трёх минут |
@@ -930,6 +986,8 @@ upgrade_node() {
 upgrade_node lab-worker3
 upgrade_node lab-worker
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -964,6 +1022,8 @@ upgrade_node lab-worker2
 upgrade_node lab-control-plane
 ```
 
+Разбор команды:
+
 | Часть команды | Значение |
 |---|---|
 | `upgrade_node lab-worker2` | второй рабочий узел |
@@ -988,6 +1048,8 @@ lab-control-plane done in 2s
 k get nodes
 curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders
 ```
+
+Разбор команды:
 
 | Часть команды | Значение |
 |---|---|
@@ -1025,7 +1087,7 @@ done
 unset -f upgrade_node k; unset CP LAB W s t
 ```
 
-Разбор:
+Разбор вывода:
 
 1. Цикл удаляет `/root/lab-10-3` в каждом узле вместе с бинарниками kubeadm, копиями kubelet и старыми сертификатами etcd.
 2. Следующая строка останавливает нагрузку, если она ещё идёт, и удаляет каталог хоста.
@@ -1036,17 +1098,34 @@ unset -f upgrade_node k; unset CP LAB W s t
 **Вопросы для самопроверки.**
 
 1. Почему узел с PostgreSQL обновляется дольше остальных?
+
+<details><summary>Ответ</summary>
+
+Том PostgreSQL привязан к узлу (local-path), поэтому под не может переехать и ждёт, пока узел вернётся после `uncordon`. Это простой базы, а не перенос.
+
+</details>
+
 2. В каком порядке обновлялись компоненты и почему так?
+
+<details><summary>Ответ</summary>
+
+Сначала control plane, потом kubelet: kubelet не может быть новее API-сервера, а отставать вправе на три минорные версии (§2).
+
+</details>
+
 3. Что на реальном узле заменяет подмену файла kubelet?
+
+<details><summary>Ответ</summary>
+
+Пакеты `kubelet` и `kubectl` нужной версии, `kubeadm upgrade node`, `systemctl daemon-reload` и `restart kubelet`.
+
+</details>
+
 4. Что показывает строка `kubelet swap+ready in 4s`?
 
-<details>
-<summary>Ответ</summary>
+<details><summary>Ответ</summary>
 
-1. Том PostgreSQL привязан к узлу (local-path), поэтому под не может переехать и ждёт, пока узел вернётся после `uncordon`. Это простой базы, а не перенос.
-2. Сначала control plane, потом kubelet: kubelet не может быть новее API-сервера, а отставать вправе на три минорные версии (§2).
-3. Пакеты `kubelet` и `kubectl` нужной версии, `kubeadm upgrade node`, `systemctl daemon-reload` и `restart kubelet`.
-4. Время от остановки kubelet до момента, когда узел снова сообщил в API версию v1.36.5.
+Время от остановки kubelet до момента, когда узел снова сообщил в API версию v1.36.5.
 
 </details>
 
