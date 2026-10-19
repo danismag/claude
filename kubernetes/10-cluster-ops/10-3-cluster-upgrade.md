@@ -4,7 +4,7 @@
 
 ## Где мы на карте
 
-Эта часть показывает, как поднять версию живого кластера и не уронить нагрузку. Она опирается на устройство control plane (01-1), на kubelet и static pods (01-2), на drain и бюджеты прерываний (05-5), на карточку kubeadm (10-1) и на снапшот etcd (10-2). Следующая часть, 10-4, продлевает сертификаты и разбирает обслуживание узла.
+Эта часть показывает, как поднять версию живого кластера и не уронить нагрузку. Она опирается на устройство control plane (01-1), kubelet и static pods (01-2), drain и бюджеты прерываний (05-5). Нужны также карточка kubeadm (10-1) и снапшот etcd (10-2). Следующая часть, 10-4, продлевает сертификаты и разбирает обслуживание узла.
 
 ```
 10-1 kubeadm: как собран кластер ──► 10-2 etcd: снапшот "до"
@@ -76,7 +76,7 @@ Kubernetes выпускает **минорную версию** (minor version, 
 
 Для kubelet и kube-proxy запас в три минорные версии действует с версии 1.28. У kubelet и kube-proxy старше 1.25 запас равен двум. Если экземпляры API-сервера в HA-кластере различаются, допустимый диапазон сужается до диапазона старшего по возрасту экземпляра.
 
-На стенде это видно сразу после обновления control plane: API-сервер v1.36.5, а kubelet всех узлов ещё v1.36.1, и кластер работает (лабораторная работа 2).
+На стенде это видно после обновления control plane. API-сервер уже v1.36.5, kubelet всех узлов ещё v1.36.1, и кластер работает (лабораторная работа 2).
 
 ### Порядок обновления компонентов
 
@@ -93,7 +93,7 @@ Kubernetes выпускает **минорную версию** (minor version, 
 
 Схема 3. Порядок для kubeadm-кластера; пункты 2 и 3 kubeadm выполняет сам одной командой.
 
-Kubelet можно не обновлять сразу: он вправе отставать на три минорные версии. Но кубелет, который отстал ровно на три версии, надо обновить до следующего обновления control plane, иначе после него перекос выйдет за допустимый.
+Kubelet можно не обновлять сразу: он вправе отставать на три минорные версии. Но kubelet, который отстал ровно на три версии, надо обновить до следующего обновления control plane, иначе после него перекос выйдет за допустимый.
 
 Минорное обновление kubelet на месте не поддерживается: узел сначала освобождают командой drain (05-5). Патч-обновление kubelet drain формально не требует, но в курсе мы выводим узел и в этом случае.
 
@@ -241,7 +241,8 @@ kubectl uncordon NODE
 ```bash
 kubectl version
 kubectl get nodes
-kubectl -n kube-system get pods -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image
+kubectl -n kube-system get pods \
+  -o custom-columns=NAME:.metadata.name,IMAGE:.spec.containers[0].image
 ```
 
 | Команда | Что показывает |
@@ -282,7 +283,7 @@ kubectl get --raw '/readyz?verbose' | grep -E 'etcd|ok$'
 
 ## 5. Что ломается и как найти причину
 
-Большинство поломок обновления укладывается в четыре группы: kubeadm ждёт образы, kubeadm не доходит до etcd, узел не проходит проверку окружения и клиенты не принимают новый API. Отдельно разберём откат.
+Поломки обновления укладываются в четыре группы: kubeadm ждёт образы, не доходит до etcd, узел не проходит проверку окружения, клиенты не принимают новый API. Отдельно разберём откат.
 
 ### kubeadm висит на скачивании образов
 
@@ -319,7 +320,7 @@ Kubeadm и kubelet 1.35 и новее отказываются работать 
 - **Обновление прошло, но всё плохо.** Остаётся восстановление из снапшота etcd, снятого до начала, с потерей всего, что изменилось после, и с прежними манифестами компонентов (10-2).
 - **Узлы.** Старый kubelet можно вернуть, если он укладывается в перекос; рабочие узлы в облаке откатывают возвратом нагрузки на старый пул (blue-green).
 
-В Kubernetes с 1.32 есть режим совместимости: новый бинарник control plane может эмулировать прошлую минорную версию (`--emulated-version`). Он нужен, чтобы дать откатиться бинарнику; в курсе мы его не разбираем. Самый надёжный откат — не нужен: репетиция обновления на копии кластера, стенде или staging, и по одной минорной версии.
+В Kubernetes с 1.32 есть режим совместимости: новый бинарник control plane может эмулировать прошлую минорную версию (`--emulated-version`). Он нужен, чтобы дать откатиться бинарнику; в курсе мы его не разбираем. Лучший откат — тот, который не понадобился: обновление сначала репетируют на копии кластера или в staging, и всегда по одной минорной версии.
 
 ---
 
@@ -347,7 +348,7 @@ Kubeadm и kubelet 1.35 и новее отказываются работать 
 
 ### Времена на стенде
 
-Патч-обновление control plane с 1.36.1 до 1.36.5 заняло 105 с, а клиенты не заметили его: 0 ошибок из 1359 запросов (лабораторная работа 2). Узел без состояния проходит цикл drain и замены kubelet за единицы секунд, а узел с PostgreSQL на локальном томе потребовал 139 с, и всё это время база была недоступна (лабораторная работа 3).
+Патч-обновление control plane с 1.36.1 до 1.36.5 заняло 105 с. Клиенты его не заметили: 0 ошибок из 1359 запросов (лабораторная работа 2). Узел без состояния проходит цикл за единицы секунд. Узел с PostgreSQL на локальном томе потребовал 139 с, и всё это время база была недоступна (лабораторная работа 3).
 
 ---
 
@@ -439,7 +440,7 @@ docker exec $CP /root/lab-10-3/kubeadm upgrade plan
 
 ```
 v1.36.5
-Components that must be upgraded manually after you have upgraded the control plane with 'kubeadm upgrade apply':
+Components that must be upgraded manually after you have upgraded the control plane with …
 COMPONENT   NODE                CURRENT   TARGET
 kubelet     lab-control-plane   v1.36.1   v1.36.5
 kubelet     lab-worker          v1.36.1   v1.36.5
@@ -574,7 +575,8 @@ sleep 20; docker exec $CP sh -c 'curl -s --cacert /etc/kubernetes/pki/etcd/ca.cr
 
 ```bash
 docker exec $CP sh -c 'curl -sfL -o /root/lab-10-3/kubeadm-1.37.1 \
-  https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kubeadm && chmod +x /root/lab-10-3/kubeadm-1.37.1'
+  https://dl.k8s.io/release/v1.37.1/bin/linux/amd64/kubeadm \
+  && chmod +x /root/lab-10-3/kubeadm-1.37.1'
 docker exec $CP /root/lab-10-3/kubeadm-1.37.1 upgrade plan v1.37.1
 k get --raw /metrics | grep '^apiserver_requested_deprecated_apis'
 ```
@@ -725,7 +727,7 @@ docker exec $CP grep -E 'SUCCESS|upgrade/staticpods' /root/lab-10-3/upgrade.log
 [upgrade/staticpods] Preparing for "etcd" upgrade
 [upgrade/staticpods] Renewing etcd-server certificate
 [upgrade/staticpods] Renewing etcd-peer certificate
-[upgrade/staticpods] Restarting the etcd static pod and backing up its manifest to "/etc/kubernetes/tmp/kubeadm-backup-manifests-…/etcd.yaml"
+[upgrade/staticpods] Restarting the etcd static pod and backing up its manifest to …
 [upgrade/staticpods] Component "etcd" upgraded successfully!
 [upgrade/staticpods] Preparing for "kube-apiserver" upgrade
 [upgrade/staticpods] Renewing apiserver certificate
@@ -1019,7 +1021,13 @@ kill "$(cat "$LAB/load.pid")" 2>/dev/null; rm -rf "$LAB"
 unset -f upgrade_node k; unset CP LAB W s t
 ```
 
-Разбор: первая строка удаляет каталог `/root/lab-10-3` в каждом узле вместе с бинарниками kubeadm, копиями kubelet и старыми сертификатами etcd; вторая останавливает нагрузку, если она ещё идёт, и удаляет каталог хоста; третья снимает функции и переменные. Копии манифестов в `/etc/kubernetes/tmp/kubeadm-backup-*` остаются: их создал kubeadm, и он их не удаляет. Если после работ `orders` не отвечает, выполните `kubectl apply -f ~/lab/k8s/orders-api/k8s/`.
+Разбор:
+
+1. Цикл удаляет `/root/lab-10-3` в каждом узле вместе с бинарниками kubeadm, копиями kubelet и старыми сертификатами etcd.
+2. Следующая строка останавливает нагрузку, если она ещё идёт, и удаляет каталог хоста.
+3. Последняя строка снимает функции и переменные.
+
+ Копии манифестов в `/etc/kubernetes/tmp/kubeadm-backup-*` остаются: их создал kubeadm, и он их не удаляет. Если после работ `orders` не отвечает, выполните `kubectl apply -f ~/lab/k8s/orders-api/k8s/`.
 
 **Вопросы для самопроверки.**
 

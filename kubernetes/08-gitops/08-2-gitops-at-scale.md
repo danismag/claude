@@ -42,7 +42,7 @@
 - **Генерация Application** — один шаблон вместо сотни ручных объектов (§2).
 - **Промоушен** — перенос проверенной версии между окружениями коммитом (§3).
 - **Секреты вне открытого текста** — шифрование или ссылки на внешнее хранилище (§3).
-- **Мультикластерность** — одно описание, много адресатов (§2).
+- **Многокластерность** — одно описание, много адресатов (§2).
 
 ### Чем отличается от 08-1
 
@@ -188,7 +188,7 @@ kubectl apply (один раз)
 
 Записывать дайджест можно тремя способами. Первый: шаг пайплайна CI делает коммит в config-репозиторий (курс `cicd`). Он прост, прозрачен и годится большинству команд.
 
-Второй способ — **Argo CD Image Updater**, отдельный контроллер, который следит за реестром и при появлении нового образа обновляет приложение. Он умеет два вида записи: в параметры Application в кластере или коммитом в Git. Первый вид обходит Git и ломает принцип «Git — источник истины», поэтому для prod выбирают запись в Git. В линии 1.x (v1.3.1 на 08.10.2026) правила слежения задают объектом собственного типа `ImageUpdater`, а не аннотациями на Application, как в старых версиях.
+Второй способ — **Argo CD Image Updater**, отдельный контроллер, который следит за реестром и при появлении нового образа обновляет приложение. Он умеет два вида записи: в параметры Application в кластере или коммитом в Git. Первый вид обходит Git и ломает принцип «Git — источник истины», поэтому для prod выбирают запись в Git. В линии 1.x (v1.3.1 на 08.10.2026) правила слежения задают объектом собственного типа `ImageUpdater`. В старых версиях для этого служили аннотации на Application.
 
 Третий способ — **Kargo**, платформа промоушена, где каждое понятие описано объектом Kubernetes. Warehouse следит за реестрами и репозиториями и упаковывает новые версии в Freight — набор конкретных ревизий образов и манифестов. Stage — цель промоушена, обычно окружение, а Promotion переносит Freight в следующую Stage; применяет изменение по-прежнему Argo CD. Kargo подходит, когда цепочка длинная, а правила переноса сложные. Для одного сервиса и двух окружений хватает коммита из CI.
 
@@ -223,7 +223,9 @@ Flux расшифровывает SOPS сам, а Argo CD нужен плаги�
 
 **Sealed Secrets** шифрует Secret открытым ключом контроллера, который работает в кластере. Утилита `kubeseal` создаёт `SealedSecret`, и расшифровать его может только контроллер этого кластера. По умолчанию шифр привязан к имени и namespace (режим strict): переименовать SealedSecret или перенести в другой namespace нельзя. Режимы `namespace-wide` и `cluster-wide` ослабляют эту привязку.
 
-Это просто и не требует внешних систем. Платой становится привязка к кластеру: без резервной копии закрытого ключа восстановить секреты в новом кластере нельзя. Контроллер создаёт новый ключ шифрования каждые 30 дней (флаг `--key-renew-period`, 0 выключает), старые ключи не удаляет. Готовые SealedSecret при этом не перешифровываются: это делают вручную командой `kubeseal --re-encrypt`. Смена ключа не заменяет ротацию самих паролей. Актуальная версия контроллера — v0.40.0 (сентябрь 2026).
+Это просто и не требует внешних систем. Платой становится привязка к кластеру: без резервной копии закрытого ключа восстановить секреты в новом кластере нельзя.
+
+Контроллер создаёт новый ключ шифрования каждые 30 дней (флаг `--key-renew-period`, 0 выключает), старые ключи не удаляет. Готовые SealedSecret при этом не перешифровываются: это делают вручную командой `kubeseal --re-encrypt`. Смена ключа не заменяет ротацию самих паролей. Актуальная версия контроллера — v0.40.0 (сентябрь 2026).
 
 Выбор такой: есть Vault или облачный менеджер — ESO; нет внешнего хранилища — SOPS с age или KMS, либо Sealed Secrets для одного кластера. Во всех вариантах Argo CD маскирует значения Secret в diff, но плагины рендеринга видят их открытыми. Поэтому права на `argocd-repo-server` и его логи защищают так же строго, как сами секреты.
 
@@ -276,7 +278,7 @@ Flux расшифровывает SOPS сам, а Argo CD нужен плаги�
         ─► finalizer: Argo CD удаляет ресурсы ─► finalizer снят ─► Application исчез
 ```
 
-Схема 8a. Цепочка удаления: каждое звено работает правильно, а итог — потерянное окружение.
+Схема 9. Цепочка удаления: каждое звено работает правильно, а итог — потерянное окружение.
 
 Причину находят по следам этой цепочки. Контроллер ApplicationSet пишет событие `Deleted` на ApplicationSet и строку в свой журнал с именем удалённого Application. Сам Application в этот момент уже исчез, поэтому событие ищут на ApplicationSet: `kubectl -n argocd get events --field-selector involvedObject.kind=ApplicationSet`. Затем `git log` по каталогу `argocd/` и по маске генератора показывает коммит, после которого набор параметров изменился.
 
@@ -336,7 +338,7 @@ Flux расшифровывает SOPS сам, а Argo CD нужен плаги�
 
 ## Лабораторные работы
 
-Работы начинаются со стенда, который оставила 08-1: Gitea в namespace `lab-08-1`, Argo CD 3.5.5 в `argocd` и репозиторий `~/lab/k8s/08-1/orders-gitops` с base и overlay staging. Если вы выполнили необязательную полную уборку 08-1, сначала повторите шаги 1–4 её работы 1. Окружения этой части живут в namespace `lab-08-2-staging` и `lab-08-2-prod`, временные файлы — в `~/lab/k8s/08-2/`. Полная уборка стенда GitOps — в конце работы 3, поэтому работы выполняйте по порядку.
+Работы начинаются со стенда, который оставила 08-1. Это Gitea в namespace `lab-08-1`, Argo CD 3.5.5 в `argocd` и репозиторий `~/lab/k8s/08-1/orders-gitops` с base и overlay staging. Если вы выполнили необязательную полную уборку 08-1, сначала повторите шаги 1–4 её работы 1. Окружения этой части живут в namespace `lab-08-2-staging` и `lab-08-2-prod`, временные файлы — в `~/lab/k8s/08-2/`. Полная уборка стенда GitOps — в конце работы 3, поэтому работы выполняйте по порядку.
 
 Сначала подготовка. Команды загружают пароль Gitea, задают функцию коммита, добавляют в репозиторий overlay prod из 07-3 и переводят оба overlay в namespace этой части. Оболочка не помнит функции и переменные между сессиями, поэтому `gpush` задаётся заново.
 
@@ -394,7 +396,7 @@ Application `orders-staging` из 08-1 удаляется на случай, е�
                        apps/orders-api/overlays/*
 ```
 
-Схема 8. Руками создан один объект `root`; остальные породили Git и генератор.
+Схема 10. Руками создан один объект `root`; остальные породили Git и генератор.
 
 #### Шаг 1. Записать ApplicationSet в Git
 
@@ -562,7 +564,7 @@ prod replicas=3 image=localhost:5001/orders-api@sha256:ad4f8fd2…
           Argo CD: sync ─► rollout ─► /version отвечает 2.1
 ```
 
-Схема 9. Дайджест берётся из реестра, записывается в Git, а в кластер его доставляет Argo CD.
+Схема 11. Дайджест берётся из реестра, записывается в Git, а в кластер его доставляет Argo CD.
 
 #### Шаг 1. Получить дайджест образа
 
@@ -694,11 +696,11 @@ Synced/Healthy def057c16fdeeaf7ac9e4119fb6d73672ce1ed39
 ```
  Шаг 1:  убрать overlays/staging из Git ─► Application исчез ─► ресурсы удалены
  Шаг 2:  вернуть каталог                ─► Application создан заново
- Шаг 3:  preserveResourcesOnDeletion    ─► Application исчез, ресурсы остались
- Шаг 4:  applicationsSync: create-update─► Application не удалён вовсе
+ Шаги 3–4: preserveResourcesOnDeletion ─► Application исчез, ресурсы остались
+ Шаг 5:  applicationsSync: create-update ─► Application не удалён вовсе
 ```
 
-Схема 10. Четыре исхода одного и того же действия «убрать каталог из Git» при разных настройках.
+Схема 12. Три исхода одного и того же действия «убрать каталог из Git» при разных настройках.
 
 #### Шаг 1. Убрать каталог и замерить удаление
 
@@ -767,16 +769,45 @@ kubectl -n argocd get app orders-staging
 
 #### Шаг 3. Включить preserveResourcesOnDeletion
 
-Команда добавляет защиту в ApplicationSet через Git, ждёт обновления Application и повторяет удаление каталога. Ожидаемый результат ниже на стенде автора не снимался.
+Команда добавляет защиту в ApplicationSet через Git и просит корневое Application перечитать Git: без этого `root` применит новый файл только через 180 с. Затем она проверяет finalizer у существующего Application. Эту работу с шага 3 вы выполняете сами, результаты в шагах 3–5 — ожидаемые.
 
 ```bash
 sed -i '/^  goTemplate: true/a\  syncPolicy:\n    preserveResourcesOnDeletion: true' \
   $R/argocd/orders-appset.yaml
 gpush "appset: preserveResourcesOnDeletion"
-kubectl -n argocd annotate applicationset orders-api \
-  argocd.argoproj.io/application-set-refresh=true --overwrite
+kubectl -n argocd annotate app root argocd.argoproj.io/refresh=normal --overwrite
 sleep 20
+kubectl -n argocd get applicationset orders-api \
+  -o jsonpath='{.spec.syncPolicy.preserveResourcesOnDeletion}{"\n"}'
 kubectl -n argocd get app orders-staging -o jsonpath='{.metadata.finalizers}{"\n"}'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `sed -i '/^  goTemplate: true/a\…'` | вставить блок `syncPolicy` после строки `goTemplate` (GNU sed) |
+| `preserveResourcesOnDeletion: true` | не ставить каскадный finalizer на Application |
+| `annotate app root … refresh=normal` | `root` сразу перечитывает Git и применяет новый ApplicationSet |
+| `get applicationset … preserveResourcesOnDeletion` | проверить, что поле дошло до кластера |
+| `get app orders-staging … finalizers` | проверить, что finalizer снят |
+
+Ожидаемый результат:
+
+```
+true
+
+```
+
+Разбор:
+
+1. `true` — `root` применил изменённый ApplicationSet из Git.
+2. Пустая строка — поля `finalizers` больше нет. Контроллер ApplicationSet при обновлении заменяет finalizer существующего Application на те, что дал шаблон, а шаблон с этой защитой finalizer не добавляет.
+3. Если вместо пустой строки виден `resources-finalizer…` или первая строка пуста, подождите и повторите обе команды. Шаг 4 начинайте только после пустого списка finalizer'ов, иначе удаление снова будет каскадным.
+
+#### Шаг 4. Повторить удаление каталога
+
+Команда снова убирает каталог `staging`, запускает генератор и считает, что осталось в namespace.
+
+```bash
 mv $R/apps/orders-api/overlays/staging ~/lab/k8s/08-2/staging-saved
 gpush "remove staging overlay again"
 kubectl -n argocd annotate applicationset orders-api \
@@ -788,16 +819,14 @@ kubectl -n lab-08-2-staging get deploy,svc,httproute --no-headers | wc -l
 
 | Часть команды | Значение |
 |---|---|
-| `sed -i '/^  goTemplate: true/a\…'` | вставить блок `syncPolicy` после строки `goTemplate` |
-| `preserveResourcesOnDeletion: true` | не вешать каскадный finalizer на Application |
-| `get app orders-staging … finalizers` | проверить, что finalizer снят |
+| `mv … staging-saved` | убрать каталог из репозитория, сохранив копию |
+| `application-set-refresh=true` | запустить генератор сразу |
 | `get app` | какие Application остались |
 | `get deploy,svc,httproute … wc -l` | сколько объектов окружения уцелело |
 
-Ожидаемый результат (на стенде автора не снимался):
+Ожидаемый результат:
 
 ```
-(пусто или [])
 NAME            SYNC STATUS   HEALTH STATUS
 orders-prod     Synced        Healthy
 root            Synced        Healthy
@@ -806,12 +835,11 @@ root            Synced        Healthy
 
 Разбор:
 
-1. Пустой список finalizer'ов — контроллер обновил существующий Application и снял каскад.
-2. В списке нет `orders-staging` — Application удалён, как и раньше.
-3. Число 3 (Deployment, Service, HTTPRoute) — ресурсы остались в кластере без владельца, а не удалены.
-4. Если в пункте 1 finalizer остался, ресурсы будут удалены, как в шаге 1: защиту проверяют до удаления каталога.
+1. В списке нет `orders-staging` — Application удалён, как и в шаге 1.
+2. Число 3 (Deployment, Service, HTTPRoute) — ресурсы остались в кластере без управления Argo CD.
+3. Поды продолжают обслуживать запросы, хотя GitOps за ними больше не следит.
 
-Теперь вернём каталог: ApplicationSet создаст Application заново и примет уцелевшие ресурсы, без пересоздания подов.
+Теперь вернём каталог. ApplicationSet создаст Application заново, и Argo CD найдёт уцелевшие ресурсы по аннотации отслеживания (08-1), поэтому поды пересоздавать не нужно.
 
 ```bash
 mv ~/lab/k8s/08-2/staging-saved $R/apps/orders-api/overlays/staging
@@ -824,14 +852,18 @@ kubectl -n argocd get app orders-staging
 
 Ожидаемый результат: `orders-staging` снова `Synced` и `Healthy`; возраст подов в `lab-08-2-staging` не сбросился.
 
-#### Шаг 4. Запретить ApplicationSet удалять Application
+#### Шаг 5. Запретить ApplicationSet удалять Application
 
-Команда добавляет `applicationsSync: create-update` и повторяет удаление каталога. Ожидаемый результат на стенде автора не снимался.
+Команда добавляет `applicationsSync: create-update`, ждёт, пока `root` применит его, и повторяет удаление каталога.
 
 ```bash
 sed -i '/preserveResourcesOnDeletion/a\    applicationsSync: create-update' \
   $R/argocd/orders-appset.yaml
 gpush "appset: applicationsSync create-update"
+kubectl -n argocd annotate app root argocd.argoproj.io/refresh=normal --overwrite
+sleep 20
+kubectl -n argocd get applicationset orders-api \
+  -o jsonpath='{.spec.syncPolicy.applicationsSync}{"\n"}'
 mv $R/apps/orders-api/overlays/staging ~/lab/k8s/08-2/staging-saved
 gpush "remove staging overlay third time"
 kubectl -n argocd annotate applicationset orders-api \
@@ -844,13 +876,14 @@ kubectl -n lab-08-2-staging get deploy --no-headers | wc -l
 | Часть команды | Значение |
 |---|---|
 | `applicationsSync: create-update` | ApplicationSet создаёт и обновляет Application, но не удаляет |
-| вторая строка `sed` | вставить поле после `preserveResourcesOnDeletion` |
+| первая строка `sed` | вставить поле после `preserveResourcesOnDeletion` |
+| `get applicationset … applicationsSync` | проверить, что политика дошла до кластера |
 | `get app orders-staging` | Application должен остаться |
 | `get deploy … wc -l` | Deployment должен остаться |
 
-Ожидаемый результат (на стенде автора не снимался): `orders-staging` остаётся в списке с ошибочным статусом, потому что путь источника не найден. Команда `get deploy` возвращает 1.
+Ожидаемый результат: первая строка — `create-update`. `orders-staging` остаётся в списке с ошибкой сравнения: путь источника в Git больше не существует, поэтому статус синхронизации — `Unknown`, а в условиях Application — `ComparisonError`. Команда `get deploy` возвращает 1. Если первая строка пуста, политика ещё не применена, и ApplicationSet удалит Application, как в шаге 4.
 
-Разбор: Application не удалён, ресурсы работают, а Argo CD сообщает об ошибке источника. Так сбой превращается из аварии в сигнал, который видно в статусе. Вернём каталог и очистим стенд.
+Разбор: Application не удалён, ресурсы работают, а Argo CD сообщает об ошибке источника. Так сбой превращается из аварии в сигнал, который видно в статусе. Вернём каталог перед уборкой.
 
 ```bash
 mv ~/lab/k8s/08-2/staging-saved $R/apps/orders-api/overlays/staging
@@ -863,37 +896,37 @@ gpush "restore staging overlay"
 |---|---|
 | Удаление каталога из Git каскадно удаляет окружение | шаг 1, 0 ресурсов за 4 с |
 | Возврат каталога пересоздаёт Application | шаг 2 |
-| `preserveResourcesOnDeletion` оставляет ресурсы | шаг 3 |
-| `applicationsSync: create-update` оставляет и Application | шаг 4 |
+| `preserveResourcesOnDeletion` снимает finalizer и с готовых Application | шаг 3 |
+| С этой защитой Application исчезает, а ресурсы остаются | шаг 4 |
+| `applicationsSync: create-update` оставляет и Application | шаг 5 |
 
-**Уборка.** Порядок важен. Сначала удаляется корневое Application без каскада, затем ApplicationSet, затем Argo CD, Gitea и CRD. Ресурсы окружений уйдут вместе с их namespace. Команды убирают стенд GitOps целиком, но не трогают `orders` и сам кластер.
-
-Репозиторий `$R` остаётся локально.
+**Уборка.** Это полная уборка стенда GitOps, на неё ссылается и необязательный блок уборки 08-1. Порядок важен: сначала удаляется корневое Application без каскада, затем ApplicationSet, затем Argo CD с CRD, Gitea и namespace окружений. Ресурсы окружений уйдут вместе с их namespace. Команды не трогают `orders` и сам кластер.
 
 ```bash
 kubectl -n argocd delete app root
 kubectl -n argocd delete applicationset orders-api
 kubectl delete -n argocd \
   -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.5/manifests/install.yaml
-kubectl delete ns argocd gitea lab-08-2-staging lab-08-2-prod
+kubectl delete ns argocd lab-08-1 lab-08-2-staging lab-08-2-prod
 kubectl get crd -o name | grep argoproj.io | xargs -r kubectl delete
-rm -f ~/lab/k8s/gitea.env
-rm -rf ~/lab/k8s/08-2
-unset -f gpush
+rm -rf ~/lab/k8s/08-1 ~/lab/k8s/08-2
+unset -f gpush; unset GIT_URL GITEA_USER GITEA_PASS R O D t0
+kubectl get ns,crd | grep -E 'argo|lab-08-' || echo clean
 curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders
 ```
 
 | Часть команды | Значение |
 |---|---|
 | `delete app root` | удалить корень, не трогая ApplicationSet |
-| `delete applicationset orders-api` | удалить генератор и его Application |
-| `delete -f …install.yaml` | удалить компоненты Argo CD |
-| `delete ns …` | удалить namespace Argo CD, Gitea и окружений вместе с содержимым |
-| `grep argoproj.io … xargs delete` | удалить CRD Argo CD |
-| `rm -f … gitea.env`, `rm -rf …/08-2` | убрать пароль и временные файлы работ |
+| `delete applicationset orders-api` | удалить генератор; его Application удалит сборщик мусора по ссылке-владельцу |
+| `delete -n argocd -f …install.yaml` | удалить компоненты Argo CD той же версии, включая CRD |
+| `delete ns argocd lab-08-1 …` | удалить namespace Argo CD, Gitea с томом и окружений |
+| `grep argoproj.io … xargs delete` | удалить CRD Argo CD, если они остались |
+| `rm -rf ~/lab/k8s/08-1 ~/lab/k8s/08-2` | убрать локальный репозиторий, пароль Gitea и файлы работ |
+| `unset -f gpush; unset …` | убрать функцию и переменные из оболочки |
 | `curl … /api/orders` | проверить, что демо-приложение стенда работает |
 
-Результат последней команды: `200`. Это значит, что namespace `orders` и вход стенда не затронуты.
+Результат: `clean` и `200`. Первое слово значит, что namespace и CRD Argo CD удалены, а `200` — что namespace `orders` и вход стенда не затронуты.
 
 **Вопросы для самопроверки.**
 
