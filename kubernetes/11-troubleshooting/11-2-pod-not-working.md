@@ -69,7 +69,7 @@
 
 - `PodScheduled=False` — шаг 1, причина `Unschedulable` или `SchedulingGated`.
 - `PodReadyToStartContainers=False` — шаг 2: том не смонтирован или песочница с сетью не создана.
-- `Initialized=False` — init-контейнер не завершился (02-1 §3).
+- `Initialized=False` — init-контейнер не завершился (02-1 §2).
 - `ContainersReady=False` — шаги 3–7: образ, конфигурация, запуск, падение или проба.
 - `Ready=False` при `ContainersReady=True` — не выполнен `readinessGate`; встречается редко.
 
@@ -369,7 +369,6 @@ kubectl get pod ИМЯ -o jsonpath='{.metadata.deletionTimestamp}{"\n"}{.metadat
 Подготовка: выбираем контекст стенда, создаём namespace и каталог, задаём функцию `k`, которая подставляет namespace в каждую команду.
 
 ```bash
-kubectl config use-context kind-lab
 kubectl create ns lab-11-2
 mkdir -p ~/lab/k8s/11-2
 k() { kubectl -n lab-11-2 "$@"; }
@@ -377,7 +376,6 @@ k() { kubectl -n lab-11-2 "$@"; }
 
 | Часть команды | Значение |
 |---|---|
-| `use-context kind-lab` | выбрать кластер стенда |
 | `create ns lab-11-2` | создать namespace работы |
 | `mkdir -p ~/lab/k8s/11-2` | каталог для манифестов |
 | `k() { … }` | короткая команда для `kubectl -n lab-11-2` |
