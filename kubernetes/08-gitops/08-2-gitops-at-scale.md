@@ -777,7 +777,7 @@ kubectl -n argocd get app orders-staging
 
 #### Шаг 3. Включить preserveResourcesOnDeletion
 
-Команда добавляет защиту в ApplicationSet через Git и просит корневое Application перечитать Git: без этого `root` применит новый файл только при следующем опросе Git, до 3 минут. Затем она проверяет finalizer у существующего Application. Эту работу с шага 3 вы выполняете сами, результаты в шагах 3–5 — ожидаемые.
+Команда добавляет защиту в ApplicationSet через Git и просит корневое Application перечитать Git. Без этого `root` применит новый файл только при следующем опросе, до 3 минут. Затем она проверяет finalizer у существующего Application. Эту работу с шага 3 вы выполняете сами, результаты в шагах 3–5 — ожидаемые.
 
 ```bash
 sed -i '/^  goTemplate: true/a\  syncPolicy:\n    preserveResourcesOnDeletion: true' \

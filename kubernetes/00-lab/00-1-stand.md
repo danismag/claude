@@ -780,11 +780,11 @@ lab-worker3         12    16315248Ki
 
 **Риски.** Работа собирает образ на хосте и создаёт объекты в кластере.
 
-- **Что меняется:** локальный образ Docker `localhost:5001/orders-api:2.0`, каталог `~/lab/k8s/orders-api`, namespace `orders` с подами, Secret, PVC и HTTPRoute.
+- **Что меняется:** локальные образы Docker `localhost:5001/orders-api:2.0` и `2.1`, каталог `~/lab/k8s/orders-api`, namespace `orders` с подами, Secret, PVC и HTTPRoute.
 - **Надолго ли:** до `lab-down.sh --purge`. Namespace `orders` остальные работы не удаляют.
 - **Безопасность:** пароль PostgreSQL лежит в манифесте открытым текстом, он учебный. Контейнер orders-api работает от пользователя 10001, не от root.
 - **Влияние на систему:** запросы памяти подов — 384 МиБ, пределы — 1 ГиБ, том — 1 ГиБ; хост и другие кластеры не затрагиваются.
-- **Откат:** `kubectl delete ns orders` и `docker image rm localhost:5001/orders-api:2.0`.
+- **Откат:** `kubectl delete ns orders` и `docker image rm localhost:5001/orders-api:2.0 localhost:5001/orders-api:2.1`.
 
 **Цель.** Собрать образ orders-api, отправить его в реестр стенда и развернуть приложение вместе с PostgreSQL в namespace `orders`, где оно служит демонстрационной нагрузкой для всех частей.
 
@@ -1024,6 +1024,8 @@ E
 
 docker build -t localhost:5001/orders-api:2.0 --build-arg APP_VERSION=2.0 .
 docker push localhost:5001/orders-api:2.0
+docker build -t localhost:5001/orders-api:2.1 --build-arg APP_VERSION=2.1 .
+docker push localhost:5001/orders-api:2.1
 curl -s http://127.0.0.1:5001/v2/orders-api/tags/list
 ```
 
@@ -1035,21 +1037,23 @@ curl -s http://127.0.0.1:5001/v2/orders-api/tags/list
 | `USER 10001` | запускать процесс не от root |
 | `-t localhost:5001/orders-api:2.0` | имя образа: адрес реестра, имя, тег |
 | `--build-arg APP_VERSION=2.0` | версия, которую отдаёт `/version` |
+| `orders-api:2.1` | тот же код с версией 2.1: вторая версия для выкаток в 07-x и 08-x |
 | `docker push …` | загрузить образ в реестр стенда |
 | `…/v2/orders-api/tags/list` | спросить у реестра, какие теги есть |
 
-Результат (push; сборка занимает около минуты, вывод сокращён):
+Результат (push; сборка занимает около минуты, вывод сокращён до строки первого push и ответа реестра; ответ с двумя тегами — ожидаемый):
 
 ```
 2.0: digest: sha256:ad4f8fd2cabaef73e735d9a623a3499270fd5f3a5d7f640719bfd0982e772465 size: 1991
-{"name":"orders-api","tags":["2.0"]}
+…
+{"name":"orders-api","tags":["2.0","2.1"]}
 ```
 
 Разбор вывода:
 
 1. `digest: sha256:…` — **дайджест** (digest), хэш содержимого образа. У вас он будет другой: он зависит от времени сборки и слоёв базового образа.
 2. `size: 1991` — размер манифеста образа в байтах, а не самого образа.
-3. Ответ реестра подтверждает тег `2.0`.
+3. Ответ реестра подтверждает теги `2.0` и `2.1`. Вторая сборка идёт из кэша слоёв и занимает секунды: меняется только переменная версии.
 
 Проверяем, что узел тянет образ из реестра.
 

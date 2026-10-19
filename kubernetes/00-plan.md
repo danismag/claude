@@ -49,7 +49,7 @@
 - **Вход** — Gateway API и Envoy Gateway 1.9.2, NodePort 30080 → `127.0.0.1:8088`.
 - **Дополнения** — metrics-server 0.8.0, local-path-provisioner (встроен в kind).
 - **Демо-приложение** — orders-api 2.0 и PostgreSQL 17 в namespace `orders`.
-- **Общие образы стенда** — `localhost:5001/orders-api:2.0` и `localhost:5001/busybox:1.37` (кладётся в 02-1); их используют многие части, поэтому они вне правила `lab-NN-M` и в уборке частей не удаляются.
+- **Общие образы стенда** — `localhost:5001/orders-api:2.0` и `2.1` (собираются в 00-1) и `localhost:5001/busybox:1.37` (кладётся в 02-1); их используют многие части, поэтому они вне правила `lab-NN-M` и в уборке частей не удаляются.
 - **Ресурсы** — около 2,5 ГиБ RAM на пустом стенде, до 5 ГиБ с Argo CD и CloudNativePG; около 3 ГБ диска.
 
 Подъём не сводится к одной команде, поэтому есть `lab/lab-up.sh` и `lab/lab-down.sh` (§2 AGENTS.md). Расширения (cert-manager, Argo CD, Gitea, KEDA, CloudNativePG) ставятся командами в начале своей лабораторной и удаляются в её уборке.
