@@ -39,7 +39,8 @@
 kubectl config get-contexts                        # список контекстов, звёздочка — текущий
 kubectl config use-context kind-lab                # сменить контекст, namespace не трогаем
 k() { kubectl -n orders "$@"; }                    # функция k: namespace только для неё
-k get pods -o wide                                 # поды с узлом и IP, -A вместо -n — все
+k get pods -o wide                                 # поды с узлом и IP пода
+kubectl get pods -A -o wide                        # поды всех namespace
 k describe pod NAME                                # состояние и события пода (внизу вывода)
 k logs deploy/orders-api --tail=20                 # лог одного пода из Deployment
 k exec -it pod/NAME -- sh                          # shell в контейнере
@@ -80,7 +81,7 @@ kind get nodes --name lab                          # контейнеры-узл
 kind export kubeconfig --name lab                  # вернуть контекст kind-lab в kubeconfig
 kind export logs ./kind-logs --name lab            # собрать логи всех узлов в каталог
 kind load docker-image IMAGE --name lab            # копировать образ с хоста в containerd узлов
-kind create cluster --wait 120s                    # создать кластер и ждать control plane до 120 с
+kind create cluster --wait 120s                    # в CI: кластер kind, ждать control plane 120 с
 kind delete cluster --name lab                     # удалить кластер (реестр останется без кластера)
 docker exec -it lab-worker bash                    # зайти на узел
 docker ps --format '{{.Names}} {{.Ports}}'         # контейнеры стенда и их порты
@@ -91,7 +92,7 @@ docker ps --format '{{.Names}} {{.Ports}}'         # контейнеры сте
 - `too many open files` в логах kubelet: мало `fs.inotify.max_user_instances` (00-1 §5).
 - `port is already allocated`: порт хоста занят другим контейнером.
 - После перезагрузки машины `kubectl` отвечает `connection refused`: узлы остановлены, их запускает `lab-up.sh`.
-- Образ, загруженный `kind load`, не удаляют через `crictl rmi --prune`: удаляйте по имени.
+- `permission denied` на сокете Docker: пользователь не входит в группу `docker`.
 
 Подробно: карточка kind в 00-2 §3, стенд — 00-1 §3–5 и приложение C.
 
@@ -135,7 +136,7 @@ docker exec $N journalctl -u kubelet -n 50 --no-pager          # последн�
 docker exec $N journalctl -u kubelet --since -10min --no-pager # журнал за 10 минут
 docker exec $N journalctl -u kubelet --since -1min --no-pager | grep PLEG   # поиск по тексту
 docker exec $N journalctl -u containerd -p err --no-pager      # только ошибки containerd
-docker exec $N journalctl -k --no-pager | grep -i 'out of memory'   # журнал ядра, OOM
+docker exec $N dmesg | grep -iE 'out of memory|oom.group'   # журнал ядра узла: OOM
 docker exec $N ls /var/log/pods                    # файлы логов контейнеров (не journald)
 kubectl get --raw "/api/v1/nodes/$N/proxy/logs/?query=kubelet&tailLines=50"   # через API
 ```
@@ -163,12 +164,13 @@ $X $E get /registry/configmaps --prefix --keys-only   # имена ключей 
 $X $E get /registry/pods --prefix --count-only     # только число ключей
 $X $E alarm list                                   # активные тревоги, например NOSPACE
 REV=$($X $E endpoint status -w json | jq '.[0].Status.header.revision')   # текущая ревизия
-$X $E compact $REV                                 # удалить историю до этой ревизии
-$X $E defrag                                       # дефрагментировать член, по одному за раз
+$X $E compact $REV --physical                      # удалить историю до ревизии, дождаться диска
+$X $E defrag                                       # перестроить файл члена из --endpoints
 $X $E alarm disarm                                 # снять тревогу после очистки
-etcdctl --endpoints=https://127.0.0.1:2379 snapshot save /backup/etcd.db   # снимок (в поде)
-etcdutl snapshot status /backup/etcd.db -w table   # хеш, ревизия, число ключей, размер
-etcdutl snapshot restore /backup/etcd.db --data-dir /var/lib/etcd-restored \
+$X $E snapshot save /var/lib/etcd/snap.db          # снимок в каталог данных узла
+$X etcdutl snapshot status /var/lib/etcd/snap.db -w table   # хеш, ревизия, ключи, размер
+docker cp lab-control-plane:/var/lib/etcd/snap.db ./snap.db   # копия снимка на хост
+etcdutl snapshot restore snap.db --data-dir /var/lib/etcd-restored \
   --bump-revision=1000000000 --mark-compacted      # восстановить в новый каталог
 ```
 
@@ -196,10 +198,11 @@ kubeadm config images list                         # образы, нужные 
 kubeadm certs check-expiration                     # сроки всех сертификатов
 sudo kubeadm certs renew all                       # продлить листовые сертификаты и kubeconfig
 sudo apt-mark unhold kubeadm                       # снять запрет обновления пакета
+sudo apt-get update && sudo apt-get install -y kubeadm='1.36.5-*'   # новая версия kubeadm
+sudo apt-mark hold kubeadm                         # снова закрепить версию пакета
 sudo kubeadm upgrade plan                          # до каких версий можно обновиться
 sudo kubeadm upgrade apply v1.36.5                 # обновить первый узел control plane
 sudo kubeadm upgrade node                          # остальные узлы, после пакета kubeadm
-sudo apt-mark hold kubeadm                         # снова закрепить версию пакета
 kubeadm reset                                      # убрать с узла всё, что создал kubeadm
 ```
 
@@ -259,7 +262,7 @@ kubectl diff -k overlays/prod                      # разница с клас�
 kubectl get -k overlays/prod                       # состояние объектов сборки
 kubectl delete -k overlays/prod                    # удалить все объекты сборки
 kubectl kustomize --enable-helm DIR                # разрешить helmCharts (нужен helm в PATH)
-kubectl kustomize --enable-helm DIR | kubectl apply -f -   # применить сборку с Helm
+kubectl kustomize --enable-helm DIR | kubectl apply -n NS -f -   # сборка с Helm, namespace явно
 kustomize edit set image localhost:5001/orders-api:2.1     # сменить тег в images
 kustomize edit fix                                 # перевести устаревшие поля на новые
 kubectl version --client                           # строка Kustomize Version встроенной сборки
@@ -279,6 +282,7 @@ kubectl version --client                           # строка Kustomize Vers
 CLI не читает Git и кластер сам: он вызывает API сервера Argo CD. Версия CLI должна совпадать с версией сервера (3.5.5).
 
 ```bash
+kubectl -n argocd port-forward svc/argocd-server 8443:443 &   # доступ к серверу с хоста
 argocd login 127.0.0.1:8443 --insecure --username admin   # войти, токен сохранится
 argocd version --client                            # версия CLI
 argocd app list                                    # все Application: sync, health, источник
@@ -311,8 +315,8 @@ cosign подписывает дайджест образа и кладёт по
 
 ```bash
 cosign version                                     # версия (на стенде v2.5.3)
-cosign generate-key-pair                           # создать cosign.key и cosign.pub
-D=sha256:HEX          # дайджест из заголовка Docker-Content-Digest реестра (06-4, шаг 2)
+COSIGN_PASSWORD='' cosign generate-key-pair        # учебная пара cosign.key и cosign.pub
+D=sha256:HEX     # свой дайджест: строка digest: из docker push или 06-4, работа 3, шаг 2
 COSIGN_PASSWORD='' cosign sign --key cosign.key --yes --tlog-upload=false \
   localhost:5001/lab-06-4/orders-api@$D              # подписать дайджест, без записи в Rekor
 cosign verify --key cosign.pub --insecure-ignore-tlog=true \
@@ -335,13 +339,14 @@ curl -s http://localhost:5001/v2/lab-06-4/orders-api/tags/list     # теги и
 Velero копирует объекты namespace и файлы томов в бакет S3 и возвращает их на живой кластер. Снимок etcd он не заменяет. Флаг `--namespace` указывает namespace установки.
 
 ```bash
-velero backup-location get --namespace lab-04-3   # доступен ли бакет: Available или Unavailable
-velero backup create demo --include-namespaces lab-04-3-demo --wait --namespace lab-04-3
-velero backup get --namespace lab-04-3             # список бэкапов и их фаз
-velero backup describe demo --details --namespace lab-04-3     # состав и скопированные тома
-velero restore create --from-backup demo --namespace lab-04-3  # восстановить из бэкапа
+VEL=~/lab/k8s/04-3/bin/velero                      # бинарник из шага 1 работы 3
+$VEL backup-location get --namespace lab-04-3      # доступен ли бакет: Available или Unavailable
+$VEL backup create demo --include-namespaces lab-04-3-demo --wait --namespace lab-04-3
+$VEL backup get --namespace lab-04-3               # список бэкапов и их фаз
+$VEL backup describe demo --details --namespace lab-04-3   # состав и скопированные тома
+$VEL restore create --from-backup demo --namespace lab-04-3   # восстановить из бэкапа
 kubectl -n lab-04-3 logs deploy/velero             # лог сервера при Unavailable
-velero uninstall --namespace lab-04-3              # удалить Velero вместе с CRD и namespace
+$VEL uninstall --namespace lab-04-3 --force        # удалить Velero, CRD и namespace без вопроса
 ```
 
 Частые ошибки:
@@ -359,13 +364,14 @@ velero uninstall --namespace lab-04-3              # удалить Velero вм�
 
 ```bash
 docker pull nicolaka/netshoot:v0.13                # образ с tcpdump (около 540 МБ на диске)
-IPB=$(kubectl get pod p-lab-worker2 -o jsonpath='{.status.podIP}')   # адрес пода
+IPB=$(kubectl -n lab-03-1 get pod p-lab-worker2 -o jsonpath='{.status.podIP}')   # адрес пода
 docker run --rm --net=container:lab-worker2 nicolaka/netshoot:v0.13 \
   timeout 10 tcpdump -n -t -p -i eth0 -c 4 "icmp and host $IPB"   # захват на eth0 узла
 tcpdump -n -i eth0 host 10.244.3.69                # без DNS-запросов, один интерфейс, адрес
 tcpdump -n -t -i any -c 5 tcp port 80              # без времени, все интерфейсы, 5 пакетов
 tcpdump -n -e -i eth0 arp                          # печатать MAC-адреса
 tcpdump -n -i eth0 -w /tmp/a.pcap                  # записать в файл для Wireshark
+docker image rm nicolaka/netshoot:v0.13            # уборка: удалить образ
 ```
 
 Частые ошибки:
@@ -382,6 +388,7 @@ tcpdump -n -i eth0 -w /tmp/a.pcap                  # записать в фай�
 ingress2gateway читает Ingress и печатает Gateway и HTTPRoute. Манифесты идут в stdout, предупреждения в stderr. Результат проверяет человек.
 
 ```bash
+go install github.com/kubernetes-sigs/ingress2gateway@v1.0.0   # бинарник в ~/go/bin
 ingress2gateway print --input-file ingress.yaml --providers=ingress-nginx \
   --emitter envoy-gateway > gateway.yaml           # из файла, кластер не нужен
 ingress2gateway print --providers=ingress-nginx --namespace lab-03-5      # из одного namespace
