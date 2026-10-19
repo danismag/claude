@@ -94,14 +94,14 @@ spec:
 - **names** — `kind` для манифестов, `plural` для адреса, `shortNames` для коротких команд.
 - **versions** — список версий, у каждой своя схема (подраздел о версиях ниже).
 
-Схема в `openAPIV3Schema` — это **OpenAPI v3 schema**, описание полей объекта: типы, допустимые значения, обязательные поля. Для CRD версии v1 схема должна быть **структурной** (structural schema): у корня и у каждого узла задан непустой `type`, а свойства перечислены в `properties`, а не спрятаны в `anyOf` или `oneOf`.
+Схема в `openAPIV3Schema` — это **OpenAPI v3 schema**, описание полей объекта: типы, допустимые значения, обязательные поля. Для CRD версии v1 схема должна быть **структурной** (structural schema). Это значит, что у корня и у каждого узла задан непустой `type`, а свойства перечислены в `properties`, а не спрятаны в `anyOf` или `oneOf`.
 
 Структурность нужна для трёх вещей. Первая — **pruning** (отсечение): API-сервер удаляет при записи поля, которых нет в схеме, поэтому опечатка в имени поля не сохранится молча. Вторая — **default**: значение по умолчанию подставляется при записи и при чтении из etcd. Третья — проверка CEL, о которой ниже. Исключения из pruning делают явно: `x-kubernetes-preserve-unknown-fields: true` оставляет неизвестные поля на этом узле, и тогда ошибки всплывают уже в контроллере, а не при `kubectl apply`.
 
 ```
-запрос с CR ──► разбор ──► pruning ──► default ──► … admission (09-2) … ──► схема ──► CEL ──► etcd
-                          убрать        подставить                           типы,    правила
-                          чужие поля    значения                             enum     x-k8s-validations
+запрос с CR ─► разбор ─► pruning ─► default ─► … admission (09-2) … ─► схема ─► CEL ─► etcd
+                         убрать      подставить                         типы,     правила
+                         чужие поля  значения                           enum      x-k8s-validations
 ```
 
 Схема 3. Путь CR внутри API-сервера. Любой этап может отклонить запрос, и тогда в etcd ничего не попадает.
@@ -181,7 +181,7 @@ API-сервер ─ watch ─► informer + кэш ─ ключ объекта 
 
 ### Установка CRD и оператора
 
-Оператор приходит манифестом, Helm-чартом (07-1) или через OLM (Operator Lifecycle Manager, менеджер операторов проекта Operator Framework). Манифест оператора применяют с `kubectl apply --server-side`: CRD с большими схемами не помещаются в аннотацию `last-applied-configuration` с лимитом 256 КиБ (01-3 §6), и client-side apply на них падает.
+Оператор приходит манифестом, Helm-чартом (07-1) или через OLM (Operator Lifecycle Manager, менеджер операторов проекта Operator Framework). Манифест оператора применяют командой `kubectl apply --server-side`. Большие схемы CRD не помещаются в аннотацию `last-applied-configuration` с лимитом 256 КиБ (01-3 §6), и client-side apply на них падает.
 
 Helm ставит CRD из каталога `crds/` только при первой установке и не обновляет их при `upgrade` (07-1). Поэтому у чартов операторов обновление CRD — отдельный шаг, который выполняют вручную. CRD всегда ставят раньше контроллера и CR, иначе первый `apply` CR вернёт ошибку «no matches for kind».
 
@@ -327,7 +327,7 @@ kubectl -n lab-09-1 get pods -L cnpg.io/instanceRole -o wide
 
 ### Клиент не переживает failover
 
-Оператор может переключить primary за секунды, а приложение всё равно остаётся без БД. На стенде автора запись пропадала на 2,5 с, а клиент без таймаутов при первом прогоне повис навсегда: `psql` открыл соединение к адресу, которого уже не было, и ждал без `connect_timeout`. От приложения нужны четыре вещи.
+Оператор может переключить primary за секунды, а приложение всё равно остаётся без БД. На стенде автора запись пропадала на 2,5 с. Клиент без таймаутов при первом прогоне повис навсегда: `psql` открыл соединение к адресу, которого уже не было, и ждал без `connect_timeout`. От приложения нужны четыре вещи.
 
 - Таймаут подключения и запросов: `connect_timeout`, `statement_timeout`, TCP keepalive.
 - Переподключение в пуле соединений.
@@ -650,7 +650,8 @@ k get rp
 ```
 CRs before CRD delete: 2
 customresourcedefinition.apiextensions.k8s.io "retentionpolicies.ops.lab.local" deleted
-Error from server (NotFound): Unable to list "ops.lab.local/v1, Resource=retentionpolicies": … could not find the requested resource
+Error from server (NotFound): Unable to list "ops.lab.local/v1, Resource=retentionpolicies":
+  … could not find the requested resource
 ```
 
 Строка `deleted` ожидаемая, остальные получены на стенде.
@@ -735,7 +736,8 @@ cd ~/lab/k8s/09-1
 curl -fL --retry 3 -o cnpg.yaml \
   https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v1.30.1/cnpg-1.30.1.yaml
 wc -c cnpg.yaml
-for img in ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1 ghcr.io/cloudnative-pg/postgresql:17.6; do
+for img in ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1 \
+           ghcr.io/cloudnative-pg/postgresql:17.6; do
   docker pull $img && kind load docker-image $img --name lab
 done
 ```
@@ -882,8 +884,9 @@ PRIM=$(k get cluster orders-db -o jsonpath='{.status.currentPrimary}')
 echo "primary=$PRIM deleted at $(date +%T)"
 k delete pod $PRIM --wait=false
 SECONDS=0
-until [ "$(k get cluster orders-db -o jsonpath='{.status.currentPrimary}')" != "$PRIM" ]; do sleep 1; done
-echo "new primary=$(k get cluster orders-db -o jsonpath='{.status.currentPrimary}') after ${SECONDS}s"
+cur() { k get cluster orders-db -o jsonpath='{.status.currentPrimary}'; }
+until [ "$(cur)" != "$PRIM" ]; do sleep 1; done
+echo "new primary=$(cur) after ${SECONDS}s"
 ```
 
 | Часть команды | Значение |
@@ -893,7 +896,7 @@ echo "new primary=$(k get cluster orders-db -o jsonpath='{.status.currentPrimary
 | `timeout 3 psql …` | оборвать зависший запрос через 3 с |
 | `inet_server_addr()` | адрес сервера, который принял запись |
 | `k delete pod $PRIM --wait=false` | удалить под primary и не ждать завершения |
-| `.status.currentPrimary` | поле status, где оператор записывает primary |
+| `cur()` | функция: прочитать `status.currentPrimary`, где оператор записывает primary |
 
 Результат:
 
@@ -974,12 +977,13 @@ for n in $(kind get nodes --name lab); do
   docker exec $n crictl rmi ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1 \
     ghcr.io/cloudnative-pg/postgresql:17.6
 done
-docker rmi ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1 ghcr.io/cloudnative-pg/postgresql:17.6
+docker rmi ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1 \
+  ghcr.io/cloudnative-pg/postgresql:17.6
 rm -rf ~/lab/k8s/09-1
-unset -f k
+unset -f k cur
 ```
 
-Первая и вторая команды удаляют писателя и Cluster; оператор сам удаляет его поды и тома. Третья должна показать, что подов и PVC в namespace больше нет. Далее удаляются namespace работ, оператор вместе с CRD и вебхуками (манифест создал и namespace `cnpg-system`), образы на узлах kind и на хосте, файлы и функция `k`. Строку с `docker rmi` пропустите, если образы были на хосте до работы.
+Первая и вторая команды удаляют писателя и Cluster; оператор сам удаляет его поды и тома. Третья должна показать, что подов и PVC в namespace больше нет. Далее удаляются namespace работ и оператор вместе с CRD и вебхуками: манифест создал и namespace `cnpg-system`. Потом удаляются образы на узлах kind и на хосте, файлы и функция `k`. Строку с `docker rmi` пропустите, если образы были на хосте до работы.
 
 **Вопросы для самопроверки.**
 
@@ -1002,4 +1006,4 @@ unset -f k
 
 ## → Дальше
 
-Вы увидели, что тип из CRD и оператор живут в том же API, что и встроенные объекты, и что оператор — точка отказа управления: пока он работает, кластер БД лечится сам, а без него нет failover. Поэтому следующая часть, 09-2, разбирает механизмы, на которых оператор подключается к запросам: admission-вебхуки, которые проверяют и изменяют объекты до записи, и finalizers, которые не дают удалить объект, пока контроллер не закончил работу. Это же самые частые причины блокировок: вебхук с `failurePolicy: Fail` останавливает создание подов, а забытый finalizer оставляет namespace в Terminating.
+Тип из CRD и оператор живут в том же API, что и встроенные объекты. Оператор при этом остаётся точкой отказа управления: пока он работает, кластер БД лечится сам, а без него failover не будет. Следующая часть, 09-2, разбирает два механизма, на которых оператор встраивается в запросы. Admission-вебхуки проверяют и меняют объекты до записи, а finalizers не дают удалить объект, пока контроллер не закончил работу. Эти же механизмы чаще всего блокируют кластер: вебхук с `failurePolicy: Fail` останавливает создание подов, а забытый finalizer оставляет namespace в Terminating.
