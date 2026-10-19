@@ -108,7 +108,7 @@
 
 **seccomp** (secure computing mode) — механизм ядра, который проверяет каждый системный вызов процесса по списку правил и разрешает его или возвращает ошибку. Ядро Linux содержит сотни системных вызовов, а типичному серверу нужна небольшая часть. Фильтр отсекает остальные, поэтому эксплойт, который рассчитывает на редкий вызов, не срабатывает.
 
-Есть три режима профиля. Профиль **RuntimeDefault** — встроенный профиль containerd: он разрешает список вызовов, нужных обычным программам, а на остальные возвращает ошибку. Вызовы `mount` и `bpf` он пропускает только при `CAP_SYS_ADMIN`, `reboot` — только при `CAP_SYS_BOOT`, а `kexec_load` не пропускает никогда. Профиль **Localhost** — ваш JSON-файл на узле. Профиль **Unconfined** отключает фильтр; privileged-контейнеры всегда работают так.
+Есть три режима профиля. Профиль **RuntimeDefault** — встроенный профиль containerd: он разрешает список вызовов, нужных обычным программам, а на остальные возвращает ошибку. Вызов `mount` он пропускает только при `CAP_SYS_ADMIN`, `bpf` — при `CAP_SYS_ADMIN` или `CAP_BPF`, `reboot` — при `CAP_SYS_BOOT`, а `kexec_load` не пропускает никогда. Профиль **Localhost** — ваш JSON-файл на узле. Профиль **Unconfined** отключает фильтр; privileged-контейнеры всегда работают так.
 
 ```
  процесс ──► syscall (например mkdir) ──► фильтр seccomp ──┬─► разрешён ──► ядро
@@ -125,7 +125,7 @@
 
 AppArmor и SELinux защищают, когда процесс уже скомпрометирован: профиль не даст прочитать `/etc/shadow` даже от root. Контейнеру подходит профиль рантайма (в containerd он называется `cri-containerd.apparmor.d`) или ваш собственный. Метки SELinux (`seLinuxOptions` в `securityContext`) нужны в основном на RHEL-подобных узлах. Влияние SELinux на тома разобрано в 04-2, а в этой части мы к нему не вернёмся.
 
-Ubuntu включает AppArmor по умолчанию. Manjaro по умолчанию не включает ни AppArmor, ни SELinux. Узлы kind используют ядро хоста, но containerd внутри узла AppArmor не применяет: в образе узла нет программы `apparmor_parser`, и containerd считает модуль недоступным.
+Ubuntu включает AppArmor по умолчанию. Manjaro по умолчанию не включает ни AppArmor, ни SELinux. Узлы kind используют ядро хоста, но containerd внутри узла AppArmor не применяет. В образе узла нет программы `apparmor_parser`, и containerd внутри контейнера считает модуль недоступным. Поэтому под без поля `appArmorProfile` идёт без профиля, а под с явным профилем на стенде не запускается (работа 2).
 
 ---
 
@@ -204,7 +204,7 @@ Capabilities в таком поде действуют только внутри
 - **Рантайм** — containerd 2.0 или новее либо CRI-O 1.25+, и runc 1.2+ либо crun 1.9+.
 - **Ограничения пода** — нельзя вместе с `hostNetwork`, `hostIPC` и `hostPID`; нельзя `volumeDevices`.
 
-Размер диапазона на под задаёт поле kubelet `userNamespaces.idsPerPod` (с 1.33, кратно 65 536, по умолчанию 65 536). Свой диапазон узла описывают в `/etc/subuid` и `/etc/subgid` для пользователя `kubelet`. Старт и размер кратны 65 536, а размер не меньше 65 536 × maxPods. Меняют диапазон только на опустошённом узле.
+Размер диапазона на под задаёт поле kubelet `userNamespaces.idsPerPod` (с 1.33, кратно 65 536, по умолчанию 65 536). Свой диапазон узла описывают в `/etc/subuid` и `/etc/subgid` для пользователя `kubelet`; kubelet читает его утилитой `getsubids`. Старт и размер кратны 65 536, а размер не меньше 65 536 × maxPods. Меняют диапазон только на опустошённом узле.
 
 ### RuntimeClass и песочницы
 
@@ -236,7 +236,7 @@ overhead:
 - **hostNetwork** — под использует сеть узла: видит службы на `localhost` узла и выходит из-под NetworkPolicy (03-6).
 - **hostPID** и **hostIPC** — под видит процессы узла и других подов, а значит их переменные окружения и память.
 
-Отдельно стоит поле `procMount`. Значение `Default` оставляет маскировку чувствительных путей в `/proc` и `/sys`, а `Unmasked` снимает её. Начиная с 1.36 поле стабильно и допустимо только вместе с `hostUsers: false`: userns ограничивает последствия. В остальных случаях оставляйте значение по умолчанию.
+Отдельно стоит поле `procMount`. Значение `Default` оставляет маскировку чувствительных путей в `/proc` и `/sys`, а `Unmasked` снимает её. Начиная с 1.36 поле стабильно. Значение `Unmasked` допустимо только вместе с `hostUsers: false`, потому что userns ограничивает последствия; иначе API отвечает ``hostUsers` must be false to use `Unmasked``. В остальных случаях оставляйте значение по умолчанию.
 
 ---
 
@@ -260,7 +260,7 @@ overhead:
 
 Что запрошено у рантайма, видно на узле. Команда `crictl inspect <контейнер>` (00-2) выводит `info.runtimeSpec` с полями `linux.seccomp`, `linux.uidMappings`, `process.capabilities` и `process.noNewPrivileges`. В `/proc/<pid>/uid_map` узла видно отображение пользователей, а `ps -eo uid,pid,args` показывает uid процесса на узле, не внутри пода.
 
-Состояние самого процесса в поде видно и через API: `status.containerStatuses[].user.linux` содержит uid, gid и дополнительные группы первого процесса. Поле заполняется, когда kubelet и рантайм поддерживают политику групп (1.35).
+Состояние самого процесса в поде видно и через API: `status.containerStatuses[].user.linux` содержит uid, gid и дополнительные группы первого процесса. Поле заполняется, когда рантайм поддерживает политику групп: containerd 2.0+ или CRI-O 1.31+.
 
 ### События, метрики и AppArmor
 
@@ -280,7 +280,8 @@ AppArmor проверяют отдельно. Файл `/sys/module/apparmor/par
 
 - **CreateContainerConfigError** с текстом `container has runAsNonRoot and image will run as root` — образ работает от root, а `runAsUser` не задан. Задайте числовой `runAsUser`: kubelet не может проверить имя пользователя из `USER app`.
 - **CreateContainerError** с упоминанием seccomp — профиль `Localhost` не найден на этом узле. Файл лежит не на каждом узле или путь указан неверно; под назначается на узел раньше, чем проверяется профиль.
-- **Pod заблокирован kubelet** с сообщением про AppArmor — профиль не загружен или модуль выключен на узле.
+- **Под в статусе Failed с причиной AppArmor** и текстом `Cannot enforce AppArmor: AppArmor is not enabled on the host` — модуль выключен на узле, и kubelet не принял под.
+- **CreateContainerError** с текстом `apparmor profile not found` — профиль `Localhost` не загружен в ядро этого узла.
 - **Под не запускается с hostUsers: false** — ядро, рантайм или файловая система тома не поддерживают userns. Проверьте требования из §3.
 
 ### Приложение падает после ужесточения
@@ -310,6 +311,7 @@ AppArmor проверяют отдельно. Файл `/sys/module/apparmor/par
 - Пользователь — из образа; без `USER` процесс идёт от root, uid 0.
 - Capabilities — 14 штук (список в §2); `NoNewPrivs` равен 0, `allowPrivilegeEscalation` равен `true`.
 - seccomp — без фильтра (`Unconfined`), пока на узле не включён `seccompDefault`.
+- AppArmor — профиль рантайма, если модуль включён на узле и рантайм его поддерживает; иначе без профиля.
 - Корневая файловая система — доступна для записи.
 - `fsGroupChangePolicy` — `Always`; `supplementalGroupsPolicy` — `Merge`.
 - `hostUsers` — `true`: user namespace узла.
@@ -663,7 +665,7 @@ k delete pod plain hardened caps-root caps-user nonroot fixed --ignore-not-found
 1. Поле только проверяет. Образ busybox работает от root, а kubelet видит uid 0 и не создаёт контейнер.
 2. Процесс не имеет привилегированных операций. Обычная работа — чтение файлов приложения, сетевые запросы на порты выше 1023 — привилегий не требует.
 3. Приложению нужно писать временные файлы. Каталог для записи монтируют отдельно, а корень остаётся неизменяемым.
-4. Для не-root процесса effective-набор обнуляется при запуске программы, а Kubernetes не выдаёт ambient capabilities. Практичный выход — порт выше 1023.
+4. Для не-root процесса effective-набор обнуляется при запуске программы, а Kubernetes не выдаёт ambient capabilities. Containerd 2.x снимает проблему через `ip_unprivileged_port_start=0`; на других рантаймах практичный выход — порт выше 1023.
 
 </details>
 
@@ -677,7 +679,7 @@ k delete pod plain hardened caps-root caps-user nonroot fixed --ignore-not-found
 - **Влияние на систему:** другие поды и узлы не затрагиваются; `docker exec` на узле только читает и копирует файл.
 - **Откат:** блок «Уборка» в конце работы.
 
-Эту работу вы выполняете сами, результаты в ней — ожидаемые. Только `Seccomp: 2` для профиля RuntimeDefault взято из реального вывода стенда (работа 1, шаг 2). Шаги с AppArmor зависят от ядра вашего хоста: узлы kind используют ядро машины, и на многих системах AppArmor выключен (по умолчанию он выключен в Manjaro).
+Эту работу вы выполняете сами, результаты в ней — ожидаемые. Только `Seccomp: 2` для профиля RuntimeDefault взято из реального вывода стенда (работа 1, шаг 2). Шаг с AppArmor зависит от ядра вашего хоста, но под с профилем на узлах kind не запустится в любом случае: containerd внутри узла AppArmor не применяет (§2).
 
 **Цель.** Сравнить режимы seccomp по значению `Seccomp` в `/proc/self/status`, запретить один вызов своим профилем и проверить, поддерживает ли узел AppArmor.
 
@@ -694,7 +696,7 @@ k delete pod plain hardened caps-root caps-user nonroot fixed --ignore-not-found
 Шаг 1  три пода: без профиля, Unconfined, RuntimeDefault ─► Seccomp: 0 / 0 / 2
 Шаг 2  профиль Localhost deny-mkdir на lab-worker         ─► mkdir: Operation not permitted
        тот же профиль на lab-worker2 без файла            ─► контейнер не создаётся
-Шаг 3  AppArmor: /sys/module/apparmor на узле             ─► Y: профиль; иначе: отказ kubelet
+Шаг 3  AppArmor: /sys/module/apparmor на узле             ─► Y или N; под с профилем не стартует
 ```
 
 Схема 8. Три сравнения: режимы seccomp, свой профиль и поддержка AppArmor на узле.
@@ -821,7 +823,7 @@ k describe pod sc-missing | grep -iE 'seccomp|Error' | head -3
 Ожидаемый результат (текст события зависит от версии containerd, здесь сокращён):
 
 ```
-NAME         READY   STATUS               RESTARTS   AGE
+NAME         READY   STATUS                 RESTARTS   AGE
 sc-missing   0/1     CreateContainerError   0          10s
 … seccomp profile … lab-06-2/deny-mkdir.json … no such file or directory
 ```
@@ -850,12 +852,12 @@ Y
 или
 
 ```
-cat: /sys/module/apparmor/parameters/enabled: No such file or directory
+N
 ```
 
-Разбор: `Y` значит, что ядро хоста поддерживает AppArmor (типично для Ubuntu). Ошибка значит, что модуля нет (типично для Manjaro), и поды с AppArmor на узлах kind не запустятся.
+Разбор: `Y` значит, что AppArmor включён в ядре хоста (типично для Ubuntu). `N` значит, что модуль собран в ядро, но не включён при загрузке (типично для Manjaro). Если ядро собрано без AppArmor, файла нет, и `cat` сообщает `No such file or directory`.
 
-Если получили `Y`, запустите под с профилем рантайма и прочитайте профиль.
+Теперь запустите под с профилем рантайма и посмотрите, что с ним станет.
 
 ```bash
 k apply -f - <<'EOF'
@@ -878,21 +880,26 @@ k exec aa-default -- cat /proc/1/attr/current
 | `appArmorProfile: {type: RuntimeDefault}` | применить профиль рантайма |
 | `/proc/1/attr/current` | профиль главного процесса контейнера |
 
-Ожидаемый результат при рабочем AppArmor, где профиль загружен:
+Ожидаемый результат на стенде kind — под не запускается, причина зависит от хоста (текст сокращён):
 
 ```
-NAME         READY   STATUS    RESTARTS   AGE
-aa-default   1/1     Running   0          10s
+NAME         READY   STATUS                 RESTARTS   AGE
+aa-default   0/1     CreateContainerError   0          10s
+```
+
+В `k describe pod aa-default` при этом видно `failed to generate apparmor spec opts: apparmor is not supported`. Если kubelet узла сам считает AppArmor выключенным (типично при `N`), под получает статус `Failed` с причиной `AppArmor` и текстом `Cannot enforce AppArmor: AppArmor is not enabled on the host`. Команда `k exec` в обоих случаях ответит ошибкой, потому что контейнера нет.
+
+На обычном узле Ubuntu с containerd тот же под работает, и `cat /proc/1/attr/current` печатает такую строку:
+
+```
 cri-containerd.apparmor.d (enforce)
 ```
 
-Если под не стартует, в событиях будет отказ kubelet с упоминанием AppArmor; если профиль на узле kind не загружен, вы увидите `unconfined`. Это ожидаемое поведение стенда в контейнерах, а не ошибка манифеста.
-
 Разбор:
 
-1. `Running` и имя профиля с `(enforce)` — AppArmor применён.
-2. Отказ с текстом про AppArmor — узел не поддерживает модуль: при поле `appArmorProfile` kubelet не запускает под молча без защиты.
-3. Для профиля `Localhost` файл нужно загрузить в ядро узла командой `apparmor_parser`; на стенде kind мы этого не делаем, потому что узел — контейнер без прав на ядро хоста.
+1. Отказ на стенде — ожидаемое поведение: при явном поле `appArmorProfile` ни kubelet, ни containerd не запускают под молча без защиты.
+2. `cri-containerd.apparmor.d (enforce)` на настоящем узле — профиль рантайма применён в режиме enforce.
+3. Для профиля `Localhost` файл нужно загрузить в ядро узла командой `apparmor_parser`; в узле kind этой программы нет, поэтому на стенде мы этого не делаем.
 
 **Итог.**
 
@@ -901,7 +908,7 @@ cri-containerd.apparmor.d (enforce)
 | Без профиля и с Unconfined фильтра нет, с RuntimeDefault значение 2 | шаг 1 |
 | Профиль Localhost запрещает выбранный вызов | шаг 2, `mkdir` |
 | Без файла профиля контейнер не создаётся | шаг 2, `sc-missing` |
-| AppArmor зависит от ядра хоста | шаг 3 |
+| AppArmor нужен и в ядре, и в рантайме узла; в kind его нет | шаг 3 |
 
 **Уборка.**
 
@@ -931,7 +938,7 @@ rm ~/lab/k8s/06-2/deny-mkdir.json
 
 ### Лабораторная работа 3. User namespaces
 
-Эту работу вы выполняете сами, результаты в ней — ожидаемые. Они выведены по документации Kubernetes 1.36: на стенде автора (kind 0.32 с containerd 2.3 и ядро хоста 6.x) работа не проходила. Числа uid на вашем узле будут другими.
+Эту работу вы выполняете сами, результаты в ней — ожидаемые. Они выведены по документации Kubernetes 1.36: на стенде автора (kind 0.32 с containerd 2.3 и ядро хоста 6.x) работа не выполнялась. Числа uid на вашем узле будут другими.
 
 **Цель.** Включить user namespace в поде, прочитать `uid_map` и убедиться, что root контейнера на узле — обычный пользователь с большим номером.
 
@@ -973,7 +980,7 @@ docker exec lab-worker runc --version
 
 ```
 6.8.0-… (ядро 6.3 или новее)
-containerd containerd.io … v2.3.1 …   (2.0 или новее)
+containerd github.com/containerd/containerd/v2 v2.3.1 …   (2.0 или новее)
 runc version 1.3.… (1.2 или новее)
 ```
 
@@ -1081,9 +1088,13 @@ EOF
 |---|---|
 | `hostUsers: false` вместе с `hostNetwork: true` | сочетание, которое API не допускает |
 
-Ожидаемый результат: ответ вида `The Pod "userns-hostnet" is invalid` с причиной про `hostUsers` и `hostNetwork` (точный текст зависит от версии).
+Ожидаемый результат:
 
-Разбор: API-сервер проверяет сочетание при создании, поэтому пода нет. User namespace и общие пространства имён узла несовместимы: либо под изолирован, либо делит ресурсы узла.
+```
+The Pod "userns-hostnet" is invalid: spec.hostNetwork: Forbidden: when `hostUsers` is false
+```
+
+Разбор: API-сервер проверяет сочетание при создании, поэтому пода нет. С `hostPID` и `hostIPC` ответ такой же. В 1.36 сочетание с `hostNetwork` открывает только альфа-флаг `UserNamespacesHostNetworkSupport`, выключенный по умолчанию. User namespace и общие пространства имён узла несовместимы: либо под изолирован, либо делит ресурсы узла.
 
 **Итог.**
 
