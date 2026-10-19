@@ -1,6 +1,6 @@
 # Задание ревьюеру части курса Kubernetes
 
-Репозиторий /home/user/claude. Прочитай /home/user/claude/AGENTS.md (§3, §3.1, §3.2, §3.3, §4, §6), /home/user/claude/00-readability-rules.md и задание писателя /home/user/claude/kubernetes/00-production/brief-writer.md. Эталоны формата: /home/user/claude/kubernetes/02-workloads/02-1-pod.md и /home/user/claude/kubernetes/03-networking/03-2-sample-lab.md.
+Репозиторий /home/user/claude. Прочитай /home/user/claude/AGENTS.md (§3, §3.1, §3.2, §3.3, §4, §6), /home/user/claude/00-readability-rules.md и задание писателя /home/user/claude/kubernetes/00-production/brief-writer.md. Эталоны формата: /home/user/claude/kubernetes/02-workloads/02-1-pod.md и /home/user/claude/kubernetes/03-networking/03-2-service-kube-proxy.md (лабораторная работа 1).
 
 Проверь часть (путь в задании). Источник реального вывода — старая версия: `git -C /home/user/claude show e755ced:<путь>`.
 0. Сверь часть с исследованиями (пути и соответствие старой и новой нумерации — в brief-writer.md, п. 6): всё значимое для части из research-k8s-changes.md учтено и верно по версиям и стадиям.

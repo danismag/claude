@@ -1201,6 +1201,8 @@ curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders
 
 </details>
 
+---
+
 ## → Дальше
 
 Эта часть настроила вход по HTTP: listener на порту 80 принимает запросы и разводит их по Service. Следующая часть, 03-5, добавляет к тому же listener'у шифрование: HTTPS-listener, сертификаты от cert-manager и TLS до самого бэкенда через BackendTLSPolicy. Она идёт сразу за этой, потому что TLS настраивается на Gateway, который вы уже освоили. Секрет с сертификатом может лежать в другом namespace, и тогда снова нужен ReferenceGrant. Там же разобран переход с Ingress: инвентаризация аннотаций ingress-nginx, перенос правил и инструмент ingress2gateway.

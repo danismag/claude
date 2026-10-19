@@ -6,7 +6,7 @@
 
 Эта часть открывает модуль 05 и объясняет, во что превращаются числа в поле `resources`. Часть опирается на 01-2, где kubelet создаёт cgroup для каждого пода, и на 02-1, где разобраны код выхода 137 и пауза между перезапусками. Мы проследим путь каждого числа: от манифеста через scheduler и kubelet до файлов ядра.
 
-Следующие части строятся на этом. Ресурсы работающего пода, квоты namespace и значения по умолчанию (05-2) меняют те же числа, планировщик (05-3) выбирает по ним узел, автомасштабирование (05-4) считает от requests, а вытеснение kubelet (05-5) использует QoS-класс.
+Следующие части строятся на этом. Часть 05-2 меняет те же числа у работающего пода и ограничивает их квотами namespace. Планировщик (05-3) выбирает по ним узел, автомасштабирование (05-4) считает от requests, а вытеснение kubelet (05-5) использует QoS-класс.
 
 ```
 manifest: resources
@@ -156,7 +156,7 @@ Request памяти в cgroup не попадает: файл `memory.min` ос
 
 ### Что входит в лимит памяти
 
-В потолок `memory.max` входит не только куча приложения. Контейнеру засчитывают всё, что ядро выделило ради него: анонимную память процессов, **page cache** (кэш страниц, то есть файлы, которые контейнер читал и писал), память ядра (стеки потоков, буферы сокетов) и tmpfs, включая `emptyDir` с `medium: Memory`.
+В потолок `memory.max` входит не только куча приложения. Контейнеру засчитывают всё, что ядро выделило ради него. Это анонимная память процессов и **page cache** (кэш страниц, то есть файлы, которые контейнер читал и писал). Сюда же входит память ядра (стеки потоков, буферы сокетов) и tmpfs, включая `emptyDir` с `medium: Memory`.
 
 Page cache ядро вытесняет перед OOM, поэтому использование «почти на лимите» у сервиса с активным диском ещё не беда. Метрика, по которой kubelet и `kubectl top` судят о памяти, — **working set** (рабочий набор): использование минус неактивный файловый кэш. Именно её сравнивают с лимитом, когда ищут риск OOM.
 
@@ -189,7 +189,7 @@ Page cache ядро вытесняет перед OOM, поэтому испол
     └── kubepods-besteffort-pod<uid>.slice   BestEffort
 ```
 
-Схема 4. Ветка cgroup зависит от класса; внутри каждого пода лежат cgroup его контейнеров (на стенде с префиксом `kubelet-`, 01-2 §2).
+Схема 4. Ветка cgroup зависит от класса; внутри каждого пода лежат cgroup его контейнеров (на стенде с префиксом `kubelet-`, 01-2 §4).
 
 Класс не равен защите от OOM своего контейнера. Лимит памяти срабатывает по cgroup независимо от класса и от свободной памяти узла, а класс работает только при нехватке памяти всего узла (§5).
 
@@ -221,7 +221,7 @@ Page cache ядро вытесняет перед OOM, поэтому испол
 
 ### Что настраивают на уровне пода и namespace
 
-Часть управления вынесена в 05-2: изменение ресурсов работающего пода без перезапуска (in-place resize), ресурсы уровня пода, подкачка (swap), значения по умолчанию LimitRange, квоты ResourceQuota и ephemeral storage. Здесь важно одно ограничение: при изменении ресурсов QoS-класс пода измениться не может.
+Остальное управление вынесено в 05-2. Там разобраны изменение ресурсов работающего пода без перезапуска (in-place resize), ресурсы уровня пода и подкачка (swap). Там же значения по умолчанию LimitRange, квоты ResourceQuota и ephemeral storage. Здесь важно одно ограничение: при изменении ресурсов QoS-класс пода измениться не может.
 
 ---
 
@@ -249,7 +249,7 @@ Page cache ядро вытесняет перед OOM, поэтому испол
 - `memory.events` — счётчики событий памяти, среди них `oom_kill`.
 - `memory.oom.group` — режим убийства всей группы.
 
-Узлы kind и обычные узлы различаются только префиксом пути к cgroup пода: на обычном узле это `/sys/fs/cgroup/kubepods.slice/…` (схема 4), а на узле kind путь начинается ещё с `docker-…scope` и именами `kubelet-…`.
+Узлы kind и обычные узлы различаются только префиксом пути к cgroup пода. На обычном узле это `/sys/fs/cgroup/kubepods.slice/…` (схема 4), а на узле kind перед ним стоят `docker-…scope` и имена с префиксом `kubelet-`.
 
 ### Троттлинг
 
@@ -271,7 +271,7 @@ cgroup пода        cpu.max 20000 100000   nr_periods 27   nr_throttled 19   
 
 Строка в файле имеет вид `some avg10=<доля> avg60=<доля> avg300=<доля> total=<мкс>`. Слово `some` значит, что ждала хотя бы одна задача, а в `memory.pressure` и `io.pressure` есть ещё строка `full` — ждали все. Числа `avg` — средняя доля времени ожидания за 10, 60 и 300 секунд в процентах.
 
-С Kubernetes 1.36 (GA) kubelet отдаёт эти данные метриками `container_pressure_*`, а сами файлы доступны всегда. Рост `memory.pressure` показывает нехватку памяти раньше, чем OOM убьёт процесс, а `cpu.pressure` — ожидание ядер при споре. Это отдельный сигнал от квоты: для троттлинга основным остаётся `cpu.stat`. Использование PSI в мониторинге разобрано в 11-3.
+С Kubernetes 1.36 (GA) kubelet отдаёт эти данные метриками `container_pressure_*`, а сами файлы доступны всегда. Рост `memory.pressure` показывает нехватку памяти раньше, чем OOM убьёт процесс, а `cpu.pressure` — ожидание ядер при споре. Это отдельный сигнал от квоты: для троттлинга основным остаётся `cpu.stat`. Использование PSI в мониторинге разобрано в 11-4.
 
 ---
 
@@ -296,11 +296,11 @@ cgroup пода        cpu.max 20000 100000   nr_periods 27   nr_throttled 19   
 
 OOM внутри контейнера и OOM узла — разные события. Первый срабатывает по cgroup, когда контейнер вышел за свой `memory.max`, даже если на узле свободны гигабайты. Класс пода и `oom_score_adj` на него не влияют.
 
-Второй случается, когда память кончилась у всего узла. Сначала kubelet пытается выселить поды по давлению на память (05-5), а если не успел, глобальный OOM killer ядра убивает процессы по `oom_score_adj`: сначала BestEffort, затем Burstable с малым request, Guaranteed последними. Журнал ядра различает эти случаи: для контейнера строка начинается с `Memory cgroup out of memory`, а для узла — с `Out of memory`.
+Второй случается, когда память кончилась у всего узла. Сначала kubelet пытается выселить поды по давлению на память (05-5). Если он не успел, глобальный OOM killer ядра убивает процессы по `oom_score_adj`: сначала BestEffort, затем Burstable с малым request, Guaranteed последними. Журнал ядра различает эти случаи: для контейнера строка начинается с `Memory cgroup out of memory`, а для узла — с `Out of memory`.
 
 ### Задержки растут, а загрузка CPU низкая
 
-Это троттлинг: квота кончилась в середине 100-миллисекундного периода, и контейнер стоит до следующего. Квота общая на все потоки, поэтому они исчерпывают её быстро. Лимит в 1 CPU и четыре потока, которые проснулись одновременно, тратят 100 мс квоты за 25 мс, а следующие 75 мс стоят — даже если на узле простаивают десять ядер.
+Это троттлинг: квота кончилась в середине 100-миллисекундного периода, и контейнер стоит до следующего. Квота общая на все потоки, поэтому они исчерпывают её быстро. Возьмём лимит в 1 CPU и четыре потока, которые проснулись одновременно. Они тратят 100 мс квоты за 25 мс, а следующие 75 мс стоят, даже если на узле простаивают десять ядер.
 
 ```
 период 100 мс:   0          25                       100
@@ -319,7 +319,7 @@ OOM внутри контейнера и OOM узла — разные собы�
 
 Порядок цифр совпадает с расчётом: 100 мс CPU при квоте 20 мс на период занимают пять периодов, то есть около 420 мс. Четыре запроса по 100 мс при квоте 50 мс занимают восемь периодов, то есть около 750 мс. Метрики контейнера могут при этом молчать (§4), поэтому смотрят `cpu.stat` пода.
 
-Решение зависит от условий. Обычно снимают CPU-лимит, оставляют request и задают число воркеров явно; если лимит нужен, поднимают его выше пиков и считают воркеры по лимиту, а не по ядрам узла. Один и тот же сервис с лимитом ведёт себя по-разному на узле с 4 и с 32 ядрами, если число потоков определяет рантайм.
+Решение зависит от условий. Обычно снимают CPU-лимит и оставляют request. Если лимит нужен, его поднимают выше пиков, а число воркеров считают по лимиту, а не по ядрам узла. Один и тот же сервис с лимитом ведёт себя по-разному на узле с 4 и с 32 ядрами, если число потоков определяет рантайм.
 
 ### Pending при низкой загрузке узлов
 
@@ -343,7 +343,7 @@ OOM внутри контейнера и OOM узла — разные собы�
 
 ### Memory QoS
 
-**Memory QoS** — функция kubelet, которая записывает request и limit памяти в файлы cgroup v2: `memory.min` (память, которую ядро не отбирает) из request и `memory.high` (порог, после которого ядро притормаживает выделение вместо убийства) чуть ниже limit. Множитель порога `memoryThrottlingFactor` по умолчанию равен 0,9.
+**Memory QoS** — функция kubelet, которая записывает память пода в файлы cgroup v2. Из request получается `memory.min` — память, которую ядро не отбирает. Чуть ниже limit встаёт `memory.high` — порог, после которого ядро притормаживает выделение вместо убийства. Множитель порога `memoryThrottlingFactor` по умолчанию равен 0,9.
 
 В 1.36 она остаётся alpha и выключена по умолчанию, поэтому на стенде `memory.min` равен нулю. Включённой по умолчанию (beta) она станет в 1.37, и там же появится политика `memoryReservationPolicy: TieredReservation`. Для функции нужно ядро 5.9 или новее (01-2 §6). Её цель — сделать поведение при нехватке памяти менее резким: ядро сначала замедляет контейнер у порога, а убивает только если замедление не помогло.
 
@@ -351,7 +351,9 @@ OOM внутри контейнера и OOM узла — разные собы�
 
 По умолчанию поды делят все ядра узла, и вес только распределяет время. Политика **CPU Manager** `static` закрепляет за подами Guaranteed с целым числом ядер (request = limit, например `2`) выделенные ядра. Остальные поды делят оставшиеся. Это нужно для задач, чувствительных к переключению контекста и кэшу процессора.
 
-Опции политики, ставшие стабильными к 1.36: `full-pcpus-only` (1.33) выдаёт только целые физические ядра, `strict-cpu-reservation` (1.35) не пускает обычные поды на резервные ядра, а `prefer-align-cpus-by-uncorecache` (1.36) размещает под в пределах одного блока кэша L3. **Memory Manager** (GA в 1.32) с политикой `Static` привязывает память Guaranteed-подов к тем же NUMA-узлам. Обе политики настраиваются в KubeletConfiguration узла и несовместимы с изменением ресурсов на месте (05-2).
+К 1.36 стабильными стали три опции политики. Опция `full-pcpus-only` (с 1.33) выдаёт только целые физические ядра. Опция `strict-cpu-reservation` (с 1.35) не пускает обычные поды на резервные ядра. Опция `prefer-align-cpus-by-uncorecache` (с 1.36) размещает под в пределах одного блока кэша L3.
+
+**Memory Manager** (GA в 1.32) с политикой `Static` привязывает память Guaranteed-подов к тем же NUMA-узлам. Обе политики настраиваются в KubeletConfiguration узла и несовместимы с изменением ресурсов на месте (05-2).
 
 ---
 
@@ -463,14 +465,14 @@ pod/besteffort condition met
 
 #### Шаг 2. Прочитать класс и файлы cgroup
 
-Цикл печатает для каждого пода QoS-класс из статуса и значения из его cgroup: квоту, вес, потолок и request памяти, режим OOM, поправку `oom_score_adj` и число ядер.
+Цикл печатает для каждого пода QoS-класс из статуса и значения его cgroup: квоту, вес, потолок и request памяти. Затем он выводит режим OOM, поправку `oom_score_adj` и число ядер.
 
 ```bash
 R='echo cpu.max=$(cat /sys/fs/cgroup/cpu.max)'
 R+=' cpu.weight=$(cat /sys/fs/cgroup/cpu.weight)'
 R+=' memory.max=$(cat /sys/fs/cgroup/memory.max)'
 R+=' memory.min=$(cat /sys/fs/cgroup/memory.min)'
-R+=' oom.group=$(cat /sys/fs/cgroup/memory.oom.group)'
+R+='; echo oom.group=$(cat /sys/fs/cgroup/memory.oom.group)'
 R+=' oom_score_adj=$(cat /proc/1/oom_score_adj) nproc=$(nproc)'
 for p in guaranteed burstable besteffort; do
   echo "== $p qos=$(kubectl get pod $p -o jsonpath='{.status.qosClass}')"
@@ -490,11 +492,14 @@ done
 
 ```
 == guaranteed qos=Guaranteed
-cpu.max=50000 100000 cpu.weight=59 memory.max=268435456 memory.min=0 oom.group=1 oom_score_adj=-997 nproc=12
+cpu.max=50000 100000 cpu.weight=59 memory.max=268435456 memory.min=0
+oom.group=1 oom_score_adj=-997 nproc=12
 == burstable qos=Burstable
-cpu.max=max 100000 cpu.weight=35 memory.max=268435456 memory.min=0 oom.group=1 oom_score_adj=992 nproc=12
+cpu.max=max 100000 cpu.weight=35 memory.max=268435456 memory.min=0
+oom.group=1 oom_score_adj=992 nproc=12
 == besteffort qos=BestEffort
-cpu.max=max 100000 cpu.weight=1 memory.max=max memory.min=0 oom.group=1 oom_score_adj=1000 nproc=12
+cpu.max=max 100000 cpu.weight=1 memory.max=max memory.min=0
+oom.group=1 oom_score_adj=1000 nproc=12
 ```
 
 Разбор:
@@ -535,7 +540,7 @@ kubectl describe node $(kubectl get pod burstable -o jsonpath='{.spec.nodeName}'
 Разбор:
 
 1. Requests CPU 350m — сумма requests подов узла, среди них 250m у burstable.
-2. Limits CPU 100m заметно меньше requests: у большинства подов лимита CPU нет, он учитывается только там, где задан.
+2. Limits CPU 100m меньше requests: в сумму limits входят только поды, у которых лимит CPU задан.
 3. Проценты считаются от allocatable. На kind он равен capacity (12 ядер и 16315248Ki), в реальном кластере allocatable меньше.
 
 #### Шаг 4. Планирование идёт по requests
@@ -543,11 +548,30 @@ kubectl describe node $(kubectl get pod burstable -o jsonpath='{.spec.nodeName}'
 Команда создаёт два пода. Первому нужно 20Gi памяти по request, больше, чем есть на любом узле. Второй просит 64Mi, а лимит у него 40Gi.
 
 ```bash
-kubectl run big --image=python:3.12-slim --overrides='{"spec":{"containers":[{"name":"big",
-"image":"python:3.12-slim","command":["sleep","infinity"],"resources":{"requests":{"memory":"20Gi"}}}]}}'
-kubectl run greedy --image=python:3.12-slim --overrides='{"spec":{"containers":[{"name":"greedy",
-"image":"python:3.12-slim","command":["sleep","infinity"],"resources":{"requests":{"memory":"64Mi"},
-"limits":{"memory":"40Gi"}}}]}}'
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata: {name: big}
+spec:
+  containers:
+  - name: app
+    image: python:3.12-slim
+    command: ["sleep", "infinity"]
+    resources:
+      requests: {memory: 20Gi}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: greedy}
+spec:
+  containers:
+  - name: app
+    image: python:3.12-slim
+    command: ["sleep", "infinity"]
+    resources:
+      requests: {memory: 64Mi}
+      limits:   {memory: 40Gi}
+EOF
 sleep 5
 kubectl get pod big greedy
 kubectl get events --field-selector involvedObject.name=big,reason=FailedScheduling \
@@ -556,7 +580,7 @@ kubectl get events --field-selector involvedObject.name=big,reason=FailedSchedul
 
 | Часть команды | Значение |
 |---|---|
-| `kubectl run … --overrides='{…}'` | создать под с заданным JSON-фрагментом spec |
+| `apply -f -` | создать оба пода из манифеста на стандартном вводе |
 | `requests.memory: 20Gi` | запрос больше памяти любого узла |
 | `limits.memory: 40Gi` | лимит больше памяти любого узла |
 | `--field-selector reason=FailedScheduling` | события, где scheduler не нашёл узел |
@@ -568,7 +592,8 @@ kubectl get events --field-selector involvedObject.name=big,reason=FailedSchedul
 NAME     READY   STATUS    RESTARTS   AGE
 big      0/1     Pending   0          5s
 greedy   1/1     Running   0          5s
-0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 Insufficient memory. no new claims to deallocate, preemption: 0/4 nodes are available: 4 Preemption is not helpful for scheduling.
+0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 Insufficient memory.
+no new claims to deallocate, preemption: 0/4 nodes are available: 4 Preemption is not …
 ```
 
 Разбор:
@@ -669,7 +694,8 @@ kubectl get pod oom -o jsonpath='{.status.containerStatuses[0].lastState}{"\n"}'
 ```
 NAME   READY   STATUS      RESTARTS      AGE
 oom    0/1     OOMKilled   3 (30s ago)   45s
-{"terminated":{"containerID":"containerd://e58d…","exitCode":137,"finishedAt":"2026-10-14T07:53:47Z","reason":"OOMKilled","startedAt":"2026-10-14T07:53:47Z"}}
+{"terminated":{"containerID":"containerd://e58d…","exitCode":137,
+ "finishedAt":"2026-10-14T07:53:47Z","reason":"OOMKilled","startedAt":"2026-10-14T07:53:47Z"}}
 ```
 
 Разбор:
@@ -725,8 +751,10 @@ docker exec $(kubectl get pod oom -o jsonpath='{.spec.nodeName}') dmesg \
 Результат:
 
 ```
-Memory cgroup out of memory: Killed process 874590 (python) total-vm:218992kB, anon-rss:129904kB, file-rss:5540kB, shmem-rss:0kB, UID:0 pgtables:320kB oom_score_adj:996
-Tasks in /system.slice/docker-…scope/kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-burstable.slice/kubelet-kubepods-burstable-pode5e9….slice/cri-containerd-fa1a….scope are going to be killed due to memory.oom.group set
+Memory cgroup out of memory: Killed process 874590 (python) total-vm:218992kB,
+  anon-rss:129904kB, file-rss:5540kB, shmem-rss:0kB, UID:0 pgtables:320kB oom_score_adj:996
+Tasks in /system.slice/docker-…scope/…/kubelet-kubepods-burstable.slice/…/cri-containerd-fa1a….scope
+  are going to be killed due to memory.oom.group set
 ```
 
 Разбор:
@@ -1010,7 +1038,7 @@ one request: 1100 ms
 1. `restarts=0` и `status=500m` — kubelet изменил лимит на лету, `cpu.max` стал `50000 100000`.
 2. cpu-free: четыре запроса ушли на четыре свободных ядра, по 97–102 мс. Лимита нет, ядер на узле достаточно.
 3. cpu-limited: 798–1100 мс. Четыре запроса по 100 мс CPU требуют 400 мс, а квота даёт 50 мс на период, то есть около восьми периодов (расчёт: около 750 мс).
-4. Лимит 500m при средней загрузке меньше полядра всё равно замедлил запросы в восемь–десять раз: всплеск упёрся в квоту.
+4. Лимит 500m замедлил запросы в восемь–одиннадцать раз: короткий всплеск из четырёх потоков упёрся в квоту.
 
 **Итог.**
 
@@ -1050,4 +1078,4 @@ rmdir ~/lab/k8s/05-1
 
 ## → Дальше
 
-Эта часть показала, во что превращаются requests и limits и как найти причину OOM и троттлинга. Следующая часть, 05-2, меняет те же числа и ограничивает их сверху: изменение ресурсов работающего пода, ресурсы уровня пода, подкачка, значения по умолчанию в namespace и квоты. Она идёт сразу после этой, потому что QoS-класс определяет, что допустимо при изменении, а квота отказывает подам без requests, и обе механики нельзя понять без файлов cgroup, которые мы только что читали.
+Эта часть показала, во что превращаются requests и limits и как найти причину OOM и троттлинга. Следующая часть, 05-2, меняет те же числа и ограничивает их сверху. Она идёт сразу после этой, потому что QoS-класс определяет, что допустимо при изменении ресурсов на месте, а квота отказывает подам без requests. Обе механики опираются на файлы cgroup, которые мы только что читали.

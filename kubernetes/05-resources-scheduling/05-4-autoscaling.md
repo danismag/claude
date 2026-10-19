@@ -69,7 +69,7 @@ VPA                   меняет размер пода (requests)         §2
 
 ## 2. Как устроено автомасштабирование
 
-Устройство делится на четыре части: как HPA считает реплики, откуда он берёт метрики, как KEDA и VPA дополняют его и как работают автоскейлеры узлов.
+Сначала разберём, как HPA считает реплики и ограничивает скорость. Затем посмотрим, чем его дополняют KEDA и VPA, и как работают автоскейлеры узлов.
 
 ### HPA: формула и метрики
 
@@ -355,7 +355,7 @@ kubectl get apiservice v1beta1.metrics.k8s.io         # колонка Available
 
 ### Узлы не добавляются и не убираются
 
-В облаке причины для CA и Karpenter другие, чем у HPA. Узлы не добавляются в трёх случаях: под не помещается ни на один тип узла (requests больше узла), `nodeSelector` не подходит ни к одной группе, либо достигнут лимит группы или квота облака.
+В облаке причины для CA и Karpenter другие, чем у HPA. Узлы не добавляются в трёх случаях. Под не помещается ни на один тип узла, потому что requests больше узла. Либо `nodeSelector` не подходит ни к одной группе. Либо достигнут лимит группы или квота облака.
 
 Узлы не убираются, если в узле есть под, которого нельзя выселить:
 
@@ -501,10 +501,12 @@ kubectl get hpa noreq -o jsonpath="$CJ"
 | `{.type}={.status}` | имя и статус условия |
 | `{.reason}: {.message}` | причина и текст ошибки |
 
-Результат (сокращён до значимой строки):
+Результат (сокращён до значимой строки; kubectl печатает её одной строкой, здесь она перенесена):
 
 ```
-ScalingActive=False FailedGetResourceMetric: the HPA was unable to compute the replica count: failed to get cpu utilization: missing request for cpu in container orders-api of Pod noreq-95cdd95d4-rz85h
+ScalingActive=False FailedGetResourceMetric: the HPA was unable to compute the replica count:
+  failed to get cpu utilization: missing request for cpu in container orders-api
+  of Pod noreq-95cdd95d4-rz85h
 ```
 
 Разбор:

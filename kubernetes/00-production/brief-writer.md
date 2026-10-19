@@ -6,7 +6,7 @@
 1. /home/user/claude/AGENTS.md — стандарт (особенно §3, §3.1, §3.2, §3.3, §4, §6) и /home/user/claude/00-readability-rules.md — правила читаемости с антипаттернами.
 2. Утверждённые заказчиком ЭТАЛОНЫ формата (повторяй их подачу, порядок блоков, оформление шагов):
    - /home/user/claude/kubernetes/02-workloads/02-1-pod.md — эталон части;
-   - /home/user/claude/kubernetes/03-networking/03-2-sample-lab.md — эталон лабораторной работы.
+   - /home/user/claude/kubernetes/03-networking/03-2-service-kube-proxy.md, «Лабораторная работа 1» — эталон лабораторной работы.
 3. /home/user/claude/kubernetes/00-plan.md — план (§3 стенд и правило имён, §4 части и список лабораторных).
 4. Старую версию своей части (путь дан в задании) — источник механики, опытов и РЕАЛЬНОГО вывода (прогон 2026-10-14 на стенде автора: kind 0.32.0, Kubernetes 1.36.1, containerd 2.3.1, Manjaro).
 5. При необходимости /home/user/claude/kubernetes/00-lab/00-1-stand.md (стенд).

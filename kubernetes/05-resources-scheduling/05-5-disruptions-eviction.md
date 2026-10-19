@@ -4,7 +4,7 @@
 
 ## Где мы на карте
 
-Эта часть закрывает модуль 05: мы разобрали, сколько ресурсов просит под (05-1, 05-2) и куда его ставит scheduler (05-3), а теперь выясняем, как поды покидают узлы и кто это разрешает. Поды уходят с узла по двум причинам. Администратор или автоскейлер выводит узел на обслуживание, и тогда бюджет **PodDisruptionBudget** решает, сколько подов можно выселить одновременно. Либо узлу не хватает памяти или диска, и kubelet выселяет поды сам, не спрашивая бюджет.
+Эта часть закрывает модуль 05. Мы разобрали, сколько ресурсов просит под (05-1, 05-2) и куда его ставит scheduler (05-3), а теперь выясняем, как поды покидают узлы и кто это разрешает. Поды уходят с узла по двум причинам. Администратор или автоскейлер выводит узел на обслуживание, и тогда бюджет **PodDisruptionBudget** решает, сколько подов можно выселить одновременно. Либо узлу не хватает памяти или диска, и kubelet выселяет поды сам, не спрашивая бюджет.
 
 Часть разбирает `drain` целиком: обновление узлов в 10-4 ссылается сюда и не повторяет механику. Приоритеты и вытеснение со стороны scheduler (preemption) остались в 05-3, а завершение отдельного пода (SIGTERM, grace period) — в 02-5.
 
@@ -109,7 +109,7 @@ kubectl drain ──► POST pods/X/eviction ──► API-сервер: ест�
 
 Порядок работы `kubectl drain` такой: пометить узел, отобрать поды, выселить каждый, дождаться удаления. При ответе 429 команда повторяет запрос каждые 5 секунд, пока не истечёт `--timeout`. По умолчанию таймаут равен нулю, то есть команда ждёт бесконечно. При ошибке `drain` не снимает cordon: узел остаётся недоступным для планирования.
 
-При отборе подов `drain` отказывается трогать три группы и требует флагов: поды DaemonSet (их выселение бессмысленно, контроллер вернёт под на тот же узел), поды без контроллера (после выселения они не вернутся) и поды с `emptyDir` (данные тома пропадут). Зеркальные поды static pods (01-2) пропускаются всегда: ими управляет kubelet по файлам.
+При отборе подов `drain` отказывается трогать три группы и требует флагов. Первая группа — поды DaemonSet: контроллер вернёт их на тот же узел. Вторая — поды без контроллера, которые после выселения не вернутся. Третья — поды с `emptyDir`, чьи данные пропадут. Статические поды (static pods, 01-2) `drain` пропускает всегда: ими управляет kubelet по файлам, а в API лежит только их зеркальная копия.
 
 ### Вытеснение kubelet: сигналы и пороги
 
@@ -117,7 +117,7 @@ kubectl drain ──► POST pods/X/eviction ──► API-сервер: ест�
 
 **Порог** (threshold) — значение сигнала, при котором kubelet начинает действовать. Порогов два вида.
 
-- **Жёсткий** (`evictionHard`) — выселять сразу, с нулевым grace period, то есть почти как `kill`.
+- **Жёсткий** (`evictionHard`) — выселять сразу, с нулевым grace period, то есть под получает команду на остановку без ожидания.
 - **Мягкий** (`evictionSoft`) — выселять, если сигнал ниже порога дольше `evictionSoftGracePeriod`. Под получает время на остановку, не больше `evictionMaxPodGracePeriod`.
 
 Жёсткие пороги по умолчанию на Linux такие: `memory.available` — 100Mi, `nodefs.available` — 10%, `nodefs.inodesFree` — 5%, `imagefs.available` — 15%. Мягких порогов по умолчанию нет. Параметр `evictionMinimumReclaim` задаёт, сколько ресурса освободить сверх порога, чтобы узел не «дребезжал» на границе.
@@ -133,7 +133,7 @@ kubectl drain ──► POST pods/X/eviction ──► API-сервер: ест�
 
 Схема 4. Реакция на порог: сначала меняется состояние узла, затем выселяются поды, пока ресурса снова не хватает.
 
-При срабатывании порога kubelet выставляет **условие узла** (node condition): `MemoryPressure`, `DiskPressure` или `PIDPressure`. Одновременно узел получает taint `node.kubernetes.io/memory-pressure:NoSchedule` или аналогичный, поэтому scheduler перестаёт ставить на него новые поды. Условие держится минимум 5 минут после выхода из давления: это значение `evictionPressureTransitionPeriod`, оно защищает от мигания. Admission-плагин добавляет подам, которые не BestEffort, toleration на `memory-pressure`, так что на узел под давлением по-прежнему попадают только поды с запросами.
+При срабатывании порога kubelet выставляет **условие узла** (node condition): `MemoryPressure`, `DiskPressure` или `PIDPressure`. Одновременно узел получает taint `node.kubernetes.io/memory-pressure:NoSchedule` или аналогичный, поэтому scheduler перестаёт ставить на него новые поды. Условие держится минимум 5 минут после выхода из давления: это значение `evictionPressureTransitionPeriod`, оно защищает от мигания. Admission-плагин добавляет подам, которые не BestEffort, toleration на `memory-pressure`, поэтому BestEffort-поды на такой узел не попадают, а остальные попадают.
 
 При нехватке диска kubelet сначала освобождает ресурсы узла без выселения: удаляет мёртвые контейнеры и неиспользуемые образы. Выселение начинается, если этого мало.
 
@@ -145,7 +145,7 @@ kubectl drain ──► POST pods/X/eviction ──► API-сервер: ест�
 2. Приоритет пода (05-3): меньший приоритет выселяется раньше.
 3. Насколько потребление превышает request: больше превышение — раньше.
 
-QoS-класс (05-1) в порядке не участвует напрямую, но результат похож. У BestEffort request равен нулю, поэтому он почти всегда превышает request сильнее всех, а Guaranteed с потреблением в пределах лимита, равного request, не превышает его никогда. Под, который не вышел за свой request, выселяется в последнюю очередь, как и поды с критичным приоритетом.
+QoS-класс (05-1) в порядке не участвует напрямую, но результат похож. У BestEffort request равен нулю, поэтому он почти всегда превышает request сильнее всех. Guaranteed не превышает request никогда, потому что лимит у него равен request. Под, который не вышел за свой request, выселяется в последнюю очередь, как и поды с критичным приоритетом.
 
 **Allocatable** — память и CPU узла, доступные подам. Scheduler считает по allocatable, а значение вычисляется по формуле:
 
@@ -324,7 +324,8 @@ kubectl get --raw /api/v1/nodes/lab-worker3/proxy/stats/summary | jq '.node.memo
 Выселенный kubelet'ом под получает фазу `Failed` и причину `Evicted`; в `kubectl get pods` он выглядит как `Evicted` или `ContainerStatusUnknown`. Причина записана в поле `status.message`.
 
 ```bash
-kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}: {.status.phase}/{.status.reason}{"\n"}{end}'
+kubectl get pods \
+  -o jsonpath='{range .items[*]}{.metadata.name}: {.status.phase}/{.status.reason}{"\n"}{end}'
 kubectl get events --field-selector reason=Evicted
 ```
 
@@ -389,15 +390,21 @@ kubectl get events --field-selector reason=Evicted
 | `kube-reserved`, `system-reserved` | 0 |
 | `shutdownGracePeriod` | 0s |
 
-Сложность растёт линейно: чем строже бюджет и выше пороги, тем сложнее обслуживать узлы. Версии: бюджет `unhealthyPodEvictionPolicy` и taint `out-of-service` стали stable в 1.31 и 1.28. В Kubernetes 1.37 появилась alpha-функция условий узла для обслуживания (node lifecycle conditions), на стенд она не берётся.
+Версии: политика `unhealthyPodEvictionPolicy` стала stable в 1.31, taint `out-of-service` — в 1.28. В Kubernetes 1.37 появилась alpha-функция условий узла для обслуживания (node lifecycle conditions), на стенд она не берётся.
 
 ### Особенности kind
 
-Стенд kind отличается от прода тремя вещами. Конфигурация kubelet задаёт пороги диска `0%`, и тогда kubelet обнуляет остальные пороги, включая память (00-1). Пока порог не задан вручную, kubelet на узле не выселяет никого. Кроме того, kubelet в контейнере-узле считает `memory.available` от лимита своего контейнера, то есть от всей памяти хоста: он видит 15–16 ГБ свободными, даже когда на хосте свободно 8 ГБ. Вложенные узлы не видят давления хоста, а на VM и железе сигнал честный. Наконец, graceful shutdown выключен: оба поля равны `0s`, поэтому остановка контейнера узла убивает поды без SIGTERM, и опыт с ним в лабораторных работах — только теория.
+Стенд kind отличается от прода тремя вещами. Конфигурация kubelet задаёт пороги диска `0%`, и тогда kubelet обнуляет остальные пороги, включая память (00-1). Пока порог не задан вручную, kubelet на узле не выселяет никого. 
+
+Кроме того, kubelet в контейнере-узле считает `memory.available` от лимита своего контейнера, то есть от всей памяти хоста. Он видит 15–16 ГБ свободными, даже когда на хосте свободно 8 ГБ. Узлы kind не видят давления хоста, а на VM и железе сигнал честный. 
+
+Наконец, graceful shutdown выключен: оба поля равны `0s`, поэтому остановка контейнера узла убивает поды без SIGTERM, и опыт с ним в лабораторных работах — только теория.
 
 ### Swap и вытеснение
 
-**Swap** — область диска, куда ядро выгружает страницы памяти (05-2). С Kubernetes 1.34 поддержка swap стабильна, но включается вручную: нужны `failSwapOn: false` и `memorySwap.swapBehavior: LimitedSwap`. Тогда swap получают только поды класса Burstable. Для вытеснения это важно, потому что память, ушедшая в swap, не входит в рабочее множество пода: сигнал `memory.available` падает позже, и kubelet выселяет с запозданием, а узел к тому времени уже тормозит из-за обращений к диску. Поэтому на узлах со swap следите за PSI (§4), а не только за порогами.
+**Swap** — область диска, куда ядро выгружает страницы памяти (05-2). С Kubernetes 1.34 поддержка swap стабильна, но включается вручную: нужны `failSwapOn: false` и `memorySwap.swapBehavior: LimitedSwap`. Тогда swap получают только поды класса Burstable. 
+
+Для вытеснения это важно: память, ушедшая в swap, уходит из рабочего множества пода, поэтому сигнал `memory.available` падает позже. Kubelet выселяет с запозданием, а узел к тому времени уже тормозит из-за обращений к диску. Поэтому на узлах со swap следите за PSI (§4), а не только за порогами.
 
 ---
 
@@ -469,7 +476,7 @@ lab-worker                         lab-worker2
 
 #### Шаг 1. Создать нагрузку и бюджеты
 
-Команда создаёт Deployment `web` с тремя репликами и бюджетом `minAvailable: 2`, Deployment `single` с одной репликой и бюджетом 1 и голый под `bare`, а затем показывает, где что запущено.
+Команда создаёт Deployment `web` из трёх реплик с бюджетом 2, Deployment `single` из одной реплики с бюджетом 1 и голый под `bare`. Затем она показывает, где что запущено.
 
 ```bash
 kubectl apply -f - <<'EOF'
@@ -575,7 +582,7 @@ kubectl get node lab-worker \
 ```
 node/lab-worker cordoned
 error: unable to drain node "lab-worker", aborting command...
-cannot delete DaemonSet-managed Pods (use --ignore-daemonsets to ignore): kube-system/kindnet-v72nj, …
+cannot delete DaemonSet-managed Pods (use --ignore-daemonsets to ignore): …
 cannot delete Pods that declare no controller (use --force to override): lab-05-5/bare
 unschedulable after refused drain: true
 ```
@@ -828,7 +835,8 @@ ev
 Результат:
 
 ```
-Error from server (TooManyRequests): Cannot evict pod as it would violate the pod's disruption budget.
+Error from server (TooManyRequests): Cannot evict pod as it would violate the pod's
+disruption budget.
 ```
 
 Разбор вывода:
@@ -843,7 +851,8 @@ Error from server (TooManyRequests): Cannot evict pod as it would violate the po
 ```bash
 kubectl patch pdb sick -p '{"spec":{"unhealthyPodEvictionPolicy":"AlwaysAllow"}}'
 ev
-kubectl get pdb sick -o jsonpath='currentHealthy={.status.currentHealthy} disruptionsAllowed={.status.disruptionsAllowed}{"\n"}'
+kubectl get pdb sick -o jsonpath=\
+'currentHealthy={.status.currentHealthy} allowed={.status.disruptionsAllowed}{"\n"}'
 ```
 
 | Часть команды | Значение |
@@ -857,7 +866,7 @@ kubectl get pdb sick -o jsonpath='currentHealthy={.status.currentHealthy} disrup
 ```
 poddisruptionbudget.policy/sick patched
 {"kind":"Status","apiVersion":"v1","metadata":{},"status":"Success","code":201}
-currentHealthy=0 disruptionsAllowed=0
+currentHealthy=0 allowed=0
 ```
 
 Разбор вывода:
@@ -937,7 +946,7 @@ rm ~/lab/k8s/05-5/ev.json
 
 - **Что меняется:** файл `/var/lib/kubelet/config.yaml` внутри контейнера `lab-worker3` и его перезапуск; узел получает условие `MemoryPressure` и taint `node.kubernetes.io/memory-pressure`.
 - **Надолго ли:** до уборки; уборка возвращает файл и перезапускает kubelet.
-- **Безопасность:** привилегированных контейнеров нет, меняется только файл в контейнере-узле; docker-сокет используется как обычно (`docker exec`).
+- **Безопасность:** привилегированных контейнеров нет, меняется только файл в контейнере-узле; доступ к узлу идёт через `docker exec`.
 - **Влияние на систему:** контейнеры подов при перезапуске kubelet продолжают работать. Порог действует на все поды узла, поэтому kubelet может выселить и чужой под, превышающий свой request; под контроллера пересоздастся на другом узле, голый под пропадёт. Новые поды на узел не планируются, пока висит taint. Память хоста работа почти не использует: поды занимают около 700 МиБ.
 - **Откат:** уборка работы; при сбое скопируйте `/root/lab-05-5-config.yaml.bak` обратно в `/var/lib/kubelet/config.yaml` и выполните `systemctl restart kubelet` внутри узла.
 
@@ -999,7 +1008,7 @@ kubectl get --raw /api/v1/nodes/$W/proxy/configz | jq -c '.kubeletconfig.evictio
 
 ```
 node/lab-worker3 condition met
-{"imagefs.available":"0%","memory.available":"14900Mi","nodefs.available":"0%","nodefs.inodesFree":"0%"}
+{"imagefs.available":"0%","memory.available":"14900Mi","nodefs.available":"0%",…}
 ```
 
 Разбор вывода:
@@ -1041,8 +1050,7 @@ capacity=16315248Ki allocatable=1057648Ki
 Команда запускает три пода, которые занимают память: Guaranteed (200 МиБ при request 300Mi), BestEffort (200 МиБ) и Burstable (300 МиБ при request 1Mi). Затем она следит за узлом каждые 2 секунды.
 
 ```bash
-cat > ~/lab/k8s/05-5/mem.sh <<'EOF'
-mkp() {  # имя, МиБ, resources в формате YAML-потока
+mkp() {  # имя пода, МиБ памяти, resources в виде YAML
   kubectl apply -f - <<YAML
 apiVersion: v1
 kind: Pod
@@ -1054,13 +1062,11 @@ spec:
   - name: $1
     image: python:3.12-slim
     command: ["python", "-c", "import time; b=b'x'*($2*2**20); time.sleep(1e6)"]
-    resources: ${3:-{\}}
+    resources: $3
 YAML
 }
-EOF
-. ~/lab/k8s/05-5/mem.sh
 mkp guaranteed 200 '{requests: {cpu: 50m, memory: 300Mi}, limits: {cpu: 50m, memory: 300Mi}}'
-mkp besteffort 200
+mkp besteffort 200 '{}'
 kubectl wait --for=condition=Ready pod/guaranteed pod/besteffort; sleep 12
 t0=$(date +%s)
 mkp burstable 300 '{requests: {memory: 1Mi}, limits: {memory: 1Gi}}'
@@ -1086,15 +1092,15 @@ done
 |---|---|
 | `b'x' * N` | заполнить память реально: `bytearray(N)` дал бы нулевые страницы, которые не считаются |
 | `requests` и `limits` Guaranteed | равны, поэтому QoS-класс Guaranteed |
-| пода без `resources` | QoS-класс BestEffort, request 0 |
+| `resources: {}` | QoS-класс BestEffort, request 0 |
 | `requests: {memory: 1Mi}` | Burstable, почти всё потребление сверх request |
 | `availableBytes` в цикле | сигнал kubelet, который сравнивается с порогом |
 
 Результат на стенде автора:
 
 ```
-t=+1s  avail=15045Mi MemoryPressure=False | besteffort:Running burstable:Running guaranteed:Running
-t=+12s avail=14949Mi MemoryPressure=True  | besteffort:ContainerStatusUnknown burstable:Running guaranteed:Running
+t=+1s  avail=15045Mi MemoryPressure=False | besteffort:Running burstable:Running …
+t=+12s avail=14949Mi MemoryPressure=True  | besteffort:ContainerStatusUnknown burstable:Running …
 ```
 
 Разбор вывода:
@@ -1108,7 +1114,8 @@ t=+12s avail=14949Mi MemoryPressure=True  | besteffort:ContainerStatusUnknown bu
 Команда выводит фазу и сообщение каждого пода, taint узла и события узла.
 
 ```bash
-kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}: {.status.phase}/{.status.reason} {.status.message}{"\n"}{end}'
+kubectl get pods -o jsonpath=\
+'{range .items[*]}{.metadata.name}: {.status.phase}/{.status.reason} {.status.message}{"\n"}{end}'
 kubectl get node $W -o jsonpath='{.spec.taints}{"\n"}'
 kubectl get events --field-selector involvedObject.name=$W \
   -o custom-columns=REASON:.reason,MSG:.message | grep -iE 'memory|evict'
@@ -1124,7 +1131,8 @@ kubectl get events --field-selector involvedObject.name=$W \
 Результат на стенде автора:
 
 ```
-besteffort: Failed/Evicted The node was low on resource: memory. Threshold quantity: 14900Mi, available: 15089952Ki. Container besteffort was using 209476Ki, request is 0, has larger consumption of me…
+besteffort: Failed/Evicted The node was low on resource: memory. Threshold quantity: 14900Mi,
+  available: 15089952Ki. Container besteffort was using 209476Ki, request is 0, has larger …
 taints=[{"effect":"NoSchedule","key":"node.kubernetes.io/memory-pressure",…}]
 EvictionThresholdMet        Attempting to reclaim memory
 NodeHasInsufficientMemory   Node lab-worker3 status is now: NodeHasInsufficientMemory
@@ -1157,7 +1165,8 @@ docker exec $W rm /root/lab-05-5-config.yaml.bak
 docker exec $W systemctl restart kubelet
 sleep 15; kubectl wait --for=condition=Ready node/$W
 kubectl get --raw /api/v1/nodes/$W/proxy/configz | jq -c '.kubeletconfig.evictionHard'
-kubectl get node $W -o jsonpath='allocatable={.status.allocatable.memory} taints={.spec.taints}{"\n"}'
+kubectl get node $W \
+  -o jsonpath='allocatable={.status.allocatable.memory} taints={.spec.taints}{"\n"}'
 curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders
 rm -rf ~/lab/k8s/05-5
 ```
@@ -1214,4 +1223,4 @@ Allocatable равен ёмкости минус резервы и жёстки�
 
 ## → Дальше
 
-Мы закончили модуль 05: поды получили ресурсы, место на узле и правила ухода с него. Уходят они тогда, когда кто-то имеет на это право, ведь `drain` и Eviction API требуют прав на узлы и на подресурс `pods/eviction`, а ошибка `forbidden` выглядит иначе, чем отказ бюджета. Поэтому следующая часть, 06-1, начинает модуль «Доступ и безопасность» с аутентификации и RBAC: кто и чем подтверждает себя API-серверу и какие права ему выдают. Обслуживание узлов целиком (сертификаты и порядок drain) разобрано в 10-4, и она ссылается на эту часть.
+Мы закончили модуль 05: поды получили ресурсы, место на узле и правила ухода с него. Но выселять может не каждый: `drain` и Eviction API требуют прав на узлы и на подресурс `pods/eviction`, а ошибка `forbidden` выглядит иначе, чем отказ бюджета. Поэтому следующая часть, 06-1, начинает модуль «Доступ и безопасность» с аутентификации и RBAC: кто и чем подтверждает себя API-серверу и какие права ему выдают. Обслуживание узлов целиком (сертификаты и порядок drain) разобрано в 10-4, и она ссылается на эту часть.
