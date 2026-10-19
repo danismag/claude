@@ -370,9 +370,11 @@ anti-affinity rules. no new claims to deallocate, preemption: 0/4 nodes are avai
 
 ### Spread вешает rollout
 
-Rollout Deployment с жёстким spread по узлам зависает, хотя места хватает. При `maxSurge` 25 % Deployment создаёт сначала лишний под новой ревизии, а старые ещё работают. Старые и новый поды подходят под один `labelSelector`, поэтому scheduler считает их вместе.
+Rollout Deployment с жёстким spread по узлам может зависнуть, хотя места хватает. При `maxSurge` 25 % Deployment создаёт сначала лишний под новой ревизии, а старые ещё работают. Старые и новый поды подходят под один `labelSelector`, поэтому scheduler считает их вместе.
 
-На стенде с тремя репликами, `maxSkew: 1` по hostname и тремя worker'ами случилось так. Каждый worker держит по одному старому поду, а control-plane остаётся доменом без подов, потому что при `nodeTaintsPolicy: Ignore` его taint в расчёте не участвует. Новый под, куда бы он ни встал, даёт на worker'е 2 пода при минимуме 0 на control-plane, и перекос равен 2. Узла для него нет, и rollout стоит.
+Плагин PodTopologySpread считает перекос для узла-кандидата так: подов в его домене плюс сам новый под минус наименьшее число подов среди всех доменов. Домены собираются со всех узлов, у которых есть метка `topologyKey` и которые прошли политики `nodeAffinityPolicy` и `nodeTaintsPolicy`, даже если подов там нет. Поэтому один пустой домен держит минимум на нуле.
+
+На стенде с тремя репликами, `maxSkew: 1` по hostname и тремя worker'ами случилось так. Каждый worker держит по одному старому поду, а control-plane остаётся доменом без подов, потому что при `nodeTaintsPolicy: Ignore` его taint в расчёте не участвует. Новый под, куда бы он ни встал, даёт на worker'е 2 пода при минимуме 0 на control-plane, и перекос равен 2. Узла для него нет, и rollout стоит. Без пустого домена минимум был бы 1, и surge-под встал бы с перекосом 1.
 
 ```
  домен          lab-worker  lab-worker2  lab-worker3  control-plane
@@ -435,14 +437,14 @@ Scheduler не перепланирует работающие поды, не и
 
 ## Лабораторные работы
 
-Работы идут на стенде 00-1 в namespace `lab-05-3`. **Namespace** — область имён, и его удаление удаляет всё внутри. Метки и taint'ы узлов в этой части называются с префиксом `lab-05-3/`, а манифесты лежат в `~/lab/k8s/05-3/`. Работы 1, 3 и 5 меняют узлы стенда, поэтому блоки «Риски» стоит прочитать до начала. Хост они не меняют, кроме текущего namespace в `~/.kube/config`.
+Работы идут на стенде 00-1 в namespace `lab-05-3`. **Namespace** — область имён, и его удаление удаляет всё внутри. Метки и taint'ы узлов в этой части называются с префиксом `lab-05-3/`, а манифесты лежат в `~/lab/k8s/05-3/`. Работы 1 и 3 меняют узлы стенда, а работа 4 создаёт объекты уровня кластера, поэтому блоки «Риски» в них стоит прочитать до начала. Хост работы не меняют, контекст kubectl тоже остаётся прежним.
 
-Подготовка делается один раз: выбрать контекст, создать namespace и каталог и определить две функции оболочки. Функции живут только в вашем терминале, поэтому в новом окне определите их заново.
+Подготовка делается один раз: выбрать контекст, создать namespace и каталог и определить три функции оболочки. Функции живут только в вашем терминале, поэтому в новом окне определите их заново.
 
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-05-3
-kubectl config set-context --current --namespace=lab-05-3
+k() { kubectl -n lab-05-3 "$@"; }
 mkdir -p ~/lab/k8s/05-3
 ```
 
@@ -452,7 +454,7 @@ mkdir -p ~/lab/k8s/05-3
 |---|---|
 | `use-context kind-lab` | работать с кластером стенда |
 | `create ns lab-05-3` | создать namespace части |
-| `set-context --current --namespace=…` | подставлять его, если флаг `-n` не указан |
+| `k() { kubectl -n lab-05-3 "$@"; }` | короткая команда для namespace части |
 | `mkdir -p ~/lab/k8s/05-3` | каталог для манифестов части |
 
 Результат:
@@ -460,16 +462,15 @@ mkdir -p ~/lab/k8s/05-3
 ```
 Switched to context "kind-lab".
 namespace/lab-05-3 created
-Context "kind-lab" modified.
 ```
 
-Разбор вывода: контекст переключён, namespace создан и пуст, а команды без `-n` попадают в `lab-05-3`.
+Разбор вывода: контекст переключён, namespace создан и пуст. Команды через `k` попадают в `lab-05-3`, а команды для узлов и классов приоритета идут через `kubectl`, потому что эти объекты не принадлежат namespace.
 
 Функция `where` показывает, на каких узлах стоят поды приложения, а `mkd` создаёт Deployment из пода `pause` с нагрузкой 10m CPU. Дополнительные поля шаблона пода `mkd` читает со стандартного ввода.
 
 ```bash
 where() {
-  kubectl get pods -l app=$1 -o custom-columns=N:.spec.nodeName,S:.status.phase \
+  k get pods -l app=$1 -o custom-columns=N:.spec.nodeName,S:.status.phase \
     --no-headers | sort | uniq -c | awk '{printf "%s:%s×%s ", $2, $3, $1}'
   echo
 }
@@ -492,7 +493,7 @@ $(cat)
         image: registry.k8s.io/pause:3.10
         resources: {requests: {cpu: 10m}}
 EOF
-  kubectl apply -f $f
+  k apply -f $f
 }
 ```
 
@@ -561,14 +562,14 @@ kubectl get nodes -L lab-05-3/zone
 node/lab-worker labeled
 node/lab-worker2 labeled
 node/lab-worker3 labeled
-NAME                 STATUS   ROLES           …   LAB-05-3/ZONE
+NAME                 STATUS   ROLES           …   ZONE
 lab-control-plane    Ready    control-plane   …
 lab-worker           Ready    <none>          …   zone-a
 ```
 
 Разбор вывода:
 
-1. Три узла помечены; колонка называется по ключу метки.
+1. Три узла помечены; колонку kubectl называет по части ключа после `/`, заглавными буквами.
 2. У control-plane значение пусто, поэтому домена зоны для него нет.
 
 #### Шаг 2. Шесть реплик без правил
@@ -624,8 +625,8 @@ lab-worker2:Running×1 lab-worker3:Running×1 lab-worker:Running×1 <none>:Pendi
 Разбор вывода: три реплики стоят по одной на узле, а четвёртая без узла (`<none>`) в фазе Pending. Теперь прочитаем причину.
 
 ```bash
-P=$(kubectl get pods -l app=anti --field-selector=status.phase=Pending -o name | head -1)
-kubectl get events \
+P=$(k get pods -l app=anti --field-selector=status.phase=Pending -o name | head -1)
+k get events \
   --field-selector involvedObject.name=${P#pod/},reason=FailedScheduling \
   -o jsonpath='{.items[-1:].message}{"\n"}'
 ```
@@ -692,7 +693,7 @@ lab-worker2:Running×2 lab-worker3:Running×1 lab-worker:Running×3
 **Уборка.**
 
 ```bash
-kubectl delete deploy plain anti zspread
+k delete deploy plain anti zspread
 kubectl label node lab-worker lab-worker2 lab-worker3 lab-05-3/zone-
 kubectl get nodes -L lab-05-3/zone
 ```
@@ -738,7 +739,7 @@ mkd hs-plain 3 <<'EOF'
         whenUnsatisfiable: DoNotSchedule
         labelSelector: {matchLabels: {app: hs-plain}}
 EOF
-kubectl rollout status deploy/hs-plain
+k rollout status deploy/hs-plain
 where hs-plain
 ```
 
@@ -765,12 +766,21 @@ lab-worker2:Running×1 lab-worker3:Running×1 lab-worker:Running×1
 Запускаем rollout и ждём 40 секунд. Новый под не должен найти узел, поэтому `rollout status` завершится по таймауту с ошибкой.
 
 ```bash
-kubectl rollout restart deploy/hs-plain
-kubectl rollout status deploy/hs-plain --timeout=40s
-kubectl get pods -l app=hs-plain -o custom-columns=POD:.metadata.name,S:.status.phase
+k rollout restart deploy/hs-plain
+k rollout status deploy/hs-plain --timeout=40s
+k get pods -l app=hs-plain --no-headers \
+  -o custom-columns=POD:.metadata.name,S:.status.phase
 ```
 
-Результат:
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `rollout restart` | создать новую ревизию с тем же шаблоном |
+| `--timeout=40s` | ждать не дольше 40 секунд |
+| `--no-headers -o custom-columns=…` | имя и фаза пода без заголовка |
+
+Результат (сообщение `rollout status` о таймауте опущено):
 
 ```
 hs-plain-c47c4cd5b-cbkn8 Pending
@@ -788,7 +798,7 @@ hs-plain-df77c4f58-ngj2v Running
 Причина записана в событии. Читаем его.
 
 ```bash
-kubectl get events --field-selector reason=FailedScheduling \
+k get events --field-selector reason=FailedScheduling \
   -o jsonpath='{.items[-1:].message}{"\n"}'
 ```
 
@@ -798,7 +808,7 @@ kubectl get events --field-selector reason=FailedScheduling \
 0/4 nodes are available: … 3 node(s) didn't match pod topology spread constraints. …
 ```
 
-Разбор вывода: три worker'а отброшены правилом spread. Старые и новый поды считаются вместе. На worker'е вышло бы 2 пода при минимуме 0 на control-plane, то есть перекос 2 против допустимого 1 (§5).
+Разбор вывода: три worker'а отброшены правилом spread, потому что старые и новый поды считаются вместе. На worker'е вышло бы 2 пода при минимуме 0 на control-plane, то есть перекос 2 против допустимого 1 (§5). Сам control-plane отброшен своим taint'ом, эта группа узлов скрыта за первым `…`.
 
 #### Шаг 3. Вылечить через matchLabelKeys
 
@@ -813,9 +823,9 @@ mkd hs-mlk 3 <<'EOF'
         labelSelector: {matchLabels: {app: hs-mlk}}
         matchLabelKeys: [pod-template-hash]
 EOF
-kubectl rollout status deploy/hs-mlk
-kubectl rollout restart deploy/hs-mlk
-kubectl rollout status deploy/hs-mlk --timeout=40s
+k rollout status deploy/hs-mlk
+k rollout restart deploy/hs-mlk
+k rollout status deploy/hs-mlk --timeout=40s
 ```
 
 Разбор команд:
@@ -845,12 +855,12 @@ deployment "hs-mlk" successfully rolled out
 **Уборка.**
 
 ```bash
-kubectl delete deploy hs-plain hs-mlk
+k delete deploy hs-plain hs-mlk
 ```
 
 **Вопросы для самопроверки.**
 
-1. Почему первое развёртывание прошло, а перезапуск завис? <details><summary>Ответ</summary>Первый раз старых подов нет. При перезапуске surge-под считается вместе со старыми, и перекос превышает `maxSkew`.</details>
+1. Почему первое развёртывание прошло, а перезапуск завис? <details><summary>Ответ</summary>Первый раз старых подов нет. При перезапуске surge-под считается вместе со старыми, а пустой домен control-plane держит минимум на нуле, поэтому перекос превышает `maxSkew`.</details>
 2. Что делает `matchLabelKeys: [pod-template-hash]`? <details><summary>Ответ</summary>Добавляет в селектор значение метки `pod-template-hash` самого пода, и поды разных ревизий считаются отдельно.</details>
 3. Какие ещё способы обхода есть? <details><summary>Ответ</summary>`maxSurge: 0` с `maxUnavailable: 1`, `whenUnsatisfiable: ScheduleAnyway` или `nodeTaintsPolicy: Honor` (работа 5).</details>
 
@@ -917,8 +927,8 @@ items:
        tolerationSeconds: 20}
     containers: [{name: c, image: "registry.k8s.io/pause:3.10"}]
 EOF
-kubectl apply -f ~/lab/k8s/05-3/taint-pods.yaml
-kubectl wait --for=condition=Ready pod/t-plain pod/t-tol pod/t-tol20
+k apply -f ~/lab/k8s/05-3/taint-pods.yaml
+k wait --for=condition=Ready pod/t-plain pod/t-tol pod/t-tol20
 ```
 
 Разбор команд:
@@ -928,7 +938,7 @@ kubectl wait --for=condition=Ready pod/t-plain pod/t-tol pod/t-tol20
 | `nodeSelector: {kubernetes.io/hostname: …}` | закрепить под за узлом |
 | `tolerations … effect: NoExecute` | терпеть taint с этим эффектом |
 | `tolerationSeconds: 20` | терпеть 20 секунд после появления taint |
-| `kubectl wait --for=condition=Ready` | ждать готовности трёх подов |
+| `k wait --for=condition=Ready` | ждать готовности трёх подов |
 
 Результат:
 
@@ -949,10 +959,10 @@ pod/t-tol20 condition met
 
 ```bash
 kubectl taint node lab-worker3 lab-05-3/dedicated=db:NoSchedule
-kubectl run t-new --image=registry.k8s.io/pause:3.10 \
+k run t-new --image=registry.k8s.io/pause:3.10 \
   --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"lab-worker3"}}}'
-sleep 4; kubectl get pods
-kubectl delete pod t-new --now
+sleep 4; k get pods
+k delete pod t-new --now
 ```
 
 Разбор команд:
@@ -960,7 +970,7 @@ kubectl delete pod t-new --now
 | Часть команды | Значение |
 |---|---|
 | `taint node … key=value:NoSchedule` | запретить новые поды без toleration |
-| `kubectl run t-new` | новый под, закреплённый за тем же узлом |
+| `k run t-new` | новый под, закреплённый за тем же узлом |
 | `delete pod t-new --now` | убрать Pending-под сразу |
 
 Результат (сокращён):
@@ -985,7 +995,7 @@ t-tol20 Running
 t0=$(date +%s)
 kubectl taint node lab-worker3 lab-05-3/dedicated=db:NoExecute
 for i in $(seq 1 30); do
-  s=$(kubectl get pods --no-headers | awk '{printf "%s:%s ", $1, $3}')
+  s=$(k get pods --no-headers | awk '{printf "%s:%s ", $1, $3}')
   [ "$s" != "$prev" ] && echo "t=+$(( $(date +%s)-t0 ))s $s" && prev=$s
   sleep 1
 done
@@ -1045,7 +1055,7 @@ lab-worker3         <none>
 **Уборка.**
 
 ```bash
-kubectl delete pod --all --now
+k delete pod --all --now
 kubectl taint node lab-worker3 lab-05-3/dedicated- 2>/dev/null
 kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
 ```
@@ -1091,7 +1101,7 @@ Taint'ы должны остаться только у control-plane.
 Создаём два класса и Deployment `batch` на три реплики, по 10 CPU в requests.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: scheduling.k8s.io/v1
 kind: PriorityClass
 metadata: {name: lab-05-3-low}
@@ -1118,8 +1128,8 @@ spec:
         image: registry.k8s.io/pause:3.10
         resources: {requests: {cpu: "10"}}
 EOF
-kubectl rollout status deploy/batch
-kubectl get pods -l app=batch \
+k rollout status deploy/batch
+k get pods -l app=batch \
   -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName,PRIO:.spec.priority
 ```
 
@@ -1147,13 +1157,13 @@ batch-55c5fc9bfc-drfgg   lab-worker3   100
 Запускаем под с высоким приоритетом, просящий 10 CPU. Свободного места нет нигде, поэтому scheduler включает вытеснение.
 
 ```bash
-kubectl run critical --image=registry.k8s.io/pause:3.10 --overrides='{"spec":{
+k run critical --image=registry.k8s.io/pause:3.10 --overrides='{"spec":{
   "priorityClassName":"lab-05-3-high","containers":[{"name":"critical",
   "image":"registry.k8s.io/pause:3.10","resources":{"requests":{"cpu":"10"}}}]}}'
-kubectl wait --for=condition=Ready pod/critical
-kubectl get events --field-selector reason=Preempted \
+k wait --for=condition=Ready pod/critical
+k get events --field-selector reason=Preempted \
   -o custom-columns=OBJ:.involvedObject.name,MSG:.message
-kubectl get pods -l app=batch
+k get pods -l app=batch
 ```
 
 Разбор команд:
@@ -1161,7 +1171,7 @@ kubectl get pods -l app=batch
 | Часть команды | Значение |
 |---|---|
 | `priorityClassName: lab-05-3-high` | под принадлежит высокому классу |
-| `kubectl wait --for=condition=Ready` | ждать запуска под |
+| `k wait --for=condition=Ready` | ждать запуска под |
 | `reason=Preempted` | события вытеснения |
 | `get pods -l app=batch` | что стало с низкоприоритетными подами |
 
@@ -1191,8 +1201,8 @@ batch-55c5fc9bfc-9x8g8   Pending — 3 Insufficient cpu … No preemption victim
 **Уборка.**
 
 ```bash
-kubectl delete deploy batch
-kubectl delete pod critical --now
+k delete deploy batch
+k delete pod critical --now
 kubectl delete priorityclass lab-05-3-low lab-05-3-high
 ```
 
@@ -1232,7 +1242,7 @@ kubectl delete priorityclass lab-05-3-low lab-05-3-high
 Создаём под с одним шлюзом. Шлюз можно задать только при создании.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: gated}
@@ -1243,8 +1253,8 @@ spec:
   containers:
   - {name: c, image: "registry.k8s.io/pause:3.10"}
 EOF
-kubectl get pod gated
-kubectl get events --field-selector involvedObject.name=gated
+k get pod gated
+k get events --field-selector involvedObject.name=gated
 ```
 
 Разбор команд:
@@ -1270,10 +1280,10 @@ No resources found in lab-05-3 namespace.
 Убираем поле `schedulingGates`. Это роль внешнего контроллера, здесь её играете вы.
 
 ```bash
-kubectl patch pod gated --type=json \
+k patch pod gated --type=json \
   -p '[{"op":"remove","path":"/spec/schedulingGates"}]'
-kubectl wait --for=condition=Ready pod/gated --timeout=60s
-kubectl get pod gated -o wide
+k wait --for=condition=Ready pod/gated --timeout=60s
+k get pod gated -o wide
 ```
 
 Ожидаемый результат (сокращён):
@@ -1361,16 +1371,17 @@ No resources found
 **Уборка.**
 
 ```bash
-kubectl delete deploy sp-ignore sp-honor
-kubectl delete pod gated --now
-kubectl config set-context --current --namespace=default
+k delete deploy sp-ignore sp-honor
+k delete pod gated --now
 kubectl delete ns lab-05-3
+kubectl get priorityclass | grep lab-05-3
 kubectl get nodes -o custom-columns=NAME:.metadata.name,TAINTS:.spec.taints
 kubectl get nodes -L lab-05-3/zone
 rm -rf ~/lab/k8s/05-3
+unset -f k where mkd
 ```
 
-Namespace и каталог удалены, текущий namespace контекста вернулся в `default`, на узлах остался только штатный taint control-plane и нет меток зоны.
+Namespace, каталог и функции удалены, классов `lab-05-3-` нет (grep ничего не печатает), на узлах остался только штатный taint control-plane и нет меток зоны.
 
 **Вопросы для самопроверки.**
 

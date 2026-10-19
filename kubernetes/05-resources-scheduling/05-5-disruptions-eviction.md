@@ -101,7 +101,7 @@ kubectl drain ──► POST pods/X/eviction ──► API-сервер: ест�
 
 Схема 3. Eviction API стоит между клиентом и удалением; именно код 429 выглядит как «зависший» drain.
 
-Поды в фазах Pending, Succeeded и Failed API выселяет без проверки бюджета: их выселение не снижает доступность.
+Поды в фазах Pending, Succeeded и Failed, а также поды, которые уже удаляются, API выселяет без проверки бюджета: их выселение не снижает доступность.
 
 ### Drain: cordon и выселение
 
@@ -113,14 +113,14 @@ kubectl drain ──► POST pods/X/eviction ──► API-сервер: ест�
 
 ### Вытеснение kubelet: сигналы и пороги
 
-**Node-pressure eviction** (вытеснение по давлению) — выселение подов kubelet'ом, когда ресурсов узла остаётся меньше порога. Kubelet проверяет **сигналы** (eviction signals) — измеряемые значения ресурсов узла — каждые 10 секунд. Сигналов шесть: `memory.available`, `nodefs.available`, `nodefs.inodesFree`, `imagefs.available`, `imagefs.inodesFree` и `pid.available`. **nodefs** — файловая система с каталогами kubelet и логами, **imagefs** — файловая система образов и слоёв контейнеров.
+**Node-pressure eviction** (вытеснение по давлению) — выселение подов kubelet'ом, когда ресурсов узла остаётся меньше порога. Kubelet сверяет **сигналы** (eviction signals) — измеряемые значения ресурсов узла — с порогами раз в `housekeeping-interval`, по умолчанию каждые 10 секунд. Основных сигналов на Linux шесть: `memory.available`, `nodefs.available`, `nodefs.inodesFree`, `imagefs.available`, `imagefs.inodesFree` и `pid.available`. **nodefs** — файловая система с каталогами kubelet и логами, **imagefs** — файловая система образов и слоёв контейнеров. Ещё два сигнала, `containerfs.available` и `containerfs.inodesFree`, появляются только при разделённой файловой системе образов (feature gate `KubeletSeparateDiskGC`, пока только с CRI-O).
 
 **Порог** (threshold) — значение сигнала, при котором kubelet начинает действовать. Порогов два вида.
 
 - **Жёсткий** (`evictionHard`) — выселять сразу, с нулевым grace period, то есть под получает команду на остановку без ожидания.
-- **Мягкий** (`evictionSoft`) — выселять, если сигнал ниже порога дольше `evictionSoftGracePeriod`. Под получает время на остановку, не больше `evictionMaxPodGracePeriod`.
+- **Мягкий** (`evictionSoft`) — выселять, если сигнал ниже порога дольше `evictionSoftGracePeriod`. Под получает меньшее из двух значений: свой grace period или `evictionMaxPodGracePeriod`; если максимум не задан, kubelet убивает под сразу.
 
-Жёсткие пороги по умолчанию на Linux такие: `memory.available` — 100Mi, `nodefs.available` — 10%, `nodefs.inodesFree` — 5%, `imagefs.available` — 15%. Мягких порогов по умолчанию нет. Параметр `evictionMinimumReclaim` задаёт, сколько ресурса освободить сверх порога, чтобы узел не «дребезжал» на границе.
+Жёсткие пороги по умолчанию на Linux такие: `memory.available` — 100Mi, `nodefs.available` — 10%, `nodefs.inodesFree` — 5%, `imagefs.available` — 15%, `imagefs.inodesFree` — 5%. Мягких порогов по умолчанию нет. Параметр `evictionMinimumReclaim` задаёт, сколько ресурса освободить сверх порога, чтобы узел не «дребезжал» на границе; по умолчанию он равен нулю.
 
 ```
 сигнал memory.available:   ──────── норма ────────┬─── ниже порога ───►
@@ -133,7 +133,7 @@ kubectl drain ──► POST pods/X/eviction ──► API-сервер: ест�
 
 Схема 4. Реакция на порог: сначала меняется состояние узла, затем выселяются поды, пока ресурса снова не хватает.
 
-При срабатывании порога kubelet выставляет **условие узла** (node condition): `MemoryPressure`, `DiskPressure` или `PIDPressure`. Одновременно узел получает taint `node.kubernetes.io/memory-pressure:NoSchedule` или аналогичный, поэтому scheduler перестаёт ставить на него новые поды. Условие держится минимум 5 минут после выхода из давления: это значение `evictionPressureTransitionPeriod`, оно защищает от мигания. Admission-плагин добавляет подам, которые не BestEffort, toleration на `memory-pressure`, поэтому BestEffort-поды на такой узел не попадают, а остальные попадают.
+При срабатывании порога kubelet выставляет **условие узла** (node condition): `MemoryPressure`, `DiskPressure` или `PIDPressure`. Одновременно узел получает taint `node.kubernetes.io/memory-pressure:NoSchedule` или аналогичный, поэтому scheduler перестаёт ставить на него новые поды. Условие держится минимум 5 минут после выхода из давления: это значение `evictionPressureTransitionPeriod`, оно защищает от мигания. Control plane сам добавляет подам, которые не BestEffort, toleration на `memory-pressure`, поэтому новые BestEffort-поды на такой узел не попадают, а остальные попадают. Подам DaemonSet контроллер добавляет tolerations на все три вида давления.
 
 При нехватке диска kubelet сначала освобождает ресурсы узла без выселения: удаляет мёртвые контейнеры и неиспользуемые образы. Выселение начинается, если этого мало.
 
@@ -261,7 +261,9 @@ shutdownGracePeriod: 30s
 shutdownGracePeriodCriticalPods: 10s
 ```
 
-Первое поле задаёт общее время на выключение, второе — часть этого времени, зарезервированную для критичных подов. Здесь обычные поды получают 20 секунд, а критичные — последние 10. Поле `shutdownGracePeriodByPodPriority` делит время по приоритетам подов точнее. Значения по умолчанию — `0s`, и это означает: поды умирают без SIGTERM при перезагрузке узла.
+Первое поле задаёт общее время на выключение, второе — часть этого времени, зарезервированную для критичных подов. Здесь обычные поды получают 20 секунд, а критичные — последние 10. Поле `shutdownGracePeriodByPodPriority` делит время по приоритетам подов точнее.
+
+Значения по умолчанию — `0s`, и режим выключен: при перезагрузке узла kubelet не участвует в остановке, поэтому preStop и grace period подов не соблюдаются. Задержку ограничивает параметр logind `InhibitDelayMaxSec`. На Ubuntu пакет unattended-upgrades задаёт его равным 30 секундам, и при `shutdownGracePeriod` больше 30 секунд kubelet не получает блокировку.
 
 Если узел выключился без предупреждения и kubelet ничего не успел сообщить, поды висят в состоянии Terminating, а тома не отсоединяются. Оператор, убедившись, что узел выключен, ставит taint `node.kubernetes.io/out-of-service=nodeshutdown:NoExecute` (stable с 1.28): поды удаляются принудительно, тома отсоединяются. Ставить taint на живой узел нельзя, иначе два экземпляра приложения запишут в один том.
 
@@ -375,30 +377,34 @@ kubectl get events --field-selector reason=Evicted
 
 Таблица собирает числа, которые определяют поведение drain и вытеснения.
 
-| Параметр | Значение по умолчанию |
-|---|---|
-| `kubectl drain --timeout` | 0s (ждать бесконечно) |
-| повтор eviction при 429 | каждые 5 с |
-| `unhealthyPodEvictionPolicy` | `IfHealthyBudget` |
-| `memory.available` (жёсткий) | 100Mi |
-| `nodefs.available` | 10% |
-| `nodefs.inodesFree` | 5% |
-| `imagefs.available` | 15% |
-| мягкие пороги | не заданы |
-| проверка порогов | каждые 10 с |
-| `evictionPressureTransitionPeriod` | 5 минут |
-| `kube-reserved`, `system-reserved` | 0 |
-| `shutdownGracePeriod` | 0s |
+| Параметр | По умолчанию | Где задаётся |
+|---|---|---|
+| `drain --timeout` | 0s (ждать бесконечно) | kubectl |
+| повтор eviction при 429 | каждые 5 с | kubectl |
+| `unhealthyPodEvictionPolicy` | IfHealthyBudget | PDB |
+| `memory.available` | 100Mi | kubelet, жёсткий порог |
+| `nodefs.available` | 10% | kubelet, жёсткий порог |
+| `nodefs.inodesFree` | 5% | kubelet, жёсткий порог |
+| `imagefs.available` | 15% | kubelet, жёсткий порог |
+| `imagefs.inodesFree` | 5% | kubelet, жёсткий порог |
+| мягкие пороги | не заданы | kubelet, evictionSoft |
+| `evictionMinimumReclaim` | 0 | kubelet |
+| `evictionMaxPodGracePeriod` | 0 (убить сразу) | kubelet |
+| проверка порогов | каждые 10 с | kubelet, интервал проверки |
+| `evictionPressureTransitionPeriod` | 5 минут | kubelet |
+| `kube-reserved`, `system-reserved` | 0 | kubelet |
+| `shutdownGracePeriod` | 0s | kubelet |
+| порог GC завершённых подов | 12 500 | controller-manager |
 
 Версии: политика `unhealthyPodEvictionPolicy` стала stable в 1.31, taint `out-of-service` — в 1.28. В Kubernetes 1.37 появилась alpha-функция условий узла для обслуживания (node lifecycle conditions), на стенд она не берётся.
 
 ### Особенности kind
 
-Стенд kind отличается от прода тремя вещами. Конфигурация kubelet задаёт пороги диска `0%`, и тогда kubelet обнуляет остальные пороги, включая память (00-1). Пока порог не задан вручную, kubelet на узле не выселяет никого. 
+Стенд kind отличается от прода тремя вещами. Конфигурация kubelet задаёт пороги диска `0%`, и тогда kubelet обнуляет остальные пороги, включая память (00-1). Сохранить значения по умолчанию для незаданных порогов позволяет поле `mergeDefaultEvictionSettings: true`, но kind его не задаёт. Пока порог не задан вручную, kubelet на узле не выселяет никого. 
 
 Кроме того, kubelet в контейнере-узле считает `memory.available` от лимита своего контейнера, то есть от всей памяти хоста. Он видит 15–16 ГБ свободными, даже когда на хосте свободно 8 ГБ. Узлы kind не видят давления хоста, а на VM и железе сигнал честный. 
 
-Наконец, graceful shutdown выключен: оба поля равны `0s`, поэтому остановка контейнера узла убивает поды без SIGTERM, и опыт с ним в лабораторных работах — только теория.
+Наконец, graceful shutdown выключен: оба поля равны `0s`. При остановке контейнера узла kubelet не останавливает поды по порядку, поэтому в лабораторных работах этот режим только описан.
 
 ### Swap и вытеснение
 
@@ -577,12 +583,12 @@ kubectl get node lab-worker \
 | `--timeout=20s` | сдаться через 20 секунд |
 | `jsonpath='…{.spec.unschedulable}'` | прочитать признак cordon |
 
-Результат:
+Результат (служебные строки между первой и третьей опущены):
 
 ```
 node/lab-worker cordoned
-error: unable to drain node "lab-worker", aborting command...
-cannot delete DaemonSet-managed Pods (use --ignore-daemonsets to ignore): …
+…
+cannot delete DaemonSet-managed Pods (use --ignore-daemonsets to ignore): kube-system/kindnet-…, …
 cannot delete Pods that declare no controller (use --force to override): lab-05-5/bare
 unschedulable after refused drain: true
 ```
@@ -611,7 +617,7 @@ kubectl get pods -o wide
 | `--force` | удалить поды без контроллера |
 | `2>&1 \| grep -vE … \| sort \| uniq -c` | убрать однотипные строки и посчитать повторы |
 
-Результат (вывод `kubectl get pods` сокращён до сути, ниже):
+Результат (оставлены две значимые строки, вывод `kubectl get pods` описан в разборе):
 
 ```
       9 error when evicting pods/"single-674944c7bd-zkjjs" -n "lab-05-5" (will retry after 5s): …
@@ -643,7 +649,7 @@ kubectl -n orders get events \
 | `reason=FailedScheduling` | события, где scheduler не нашёл узел |
 | `{.items[-1:].message}` | текст последнего такого события |
 
-Результат:
+Результат (строки сокращены до значимых):
 
 ```
 orders/postgres-0   Pending
@@ -946,9 +952,9 @@ rm ~/lab/k8s/05-5/ev.json
 
 - **Что меняется:** файл `/var/lib/kubelet/config.yaml` внутри контейнера `lab-worker3` и его перезапуск; узел получает условие `MemoryPressure` и taint `node.kubernetes.io/memory-pressure`.
 - **Надолго ли:** до уборки; уборка возвращает файл и перезапускает kubelet.
-- **Безопасность:** привилегированных контейнеров нет, меняется только файл в контейнере-узле; доступ к узлу идёт через `docker exec`.
+- **Безопасность:** новых контейнеров с привилегиями работа не создаёт. Команды `docker exec` выполняются от root внутри контейнера-узла kind, а он сам работает привилегированным, поэтому вводите их точно и только для `lab-worker3`.
 - **Влияние на систему:** контейнеры подов при перезапуске kubelet продолжают работать. Порог действует на все поды узла, поэтому kubelet может выселить и чужой под, превышающий свой request; под контроллера пересоздастся на другом узле, голый под пропадёт. Новые поды на узел не планируются, пока висит taint. Память хоста работа почти не использует: поды занимают около 700 МиБ.
-- **Откат:** уборка работы; при сбое скопируйте `/root/lab-05-5-config.yaml.bak` обратно в `/var/lib/kubelet/config.yaml` и выполните `systemctl restart kubelet` внутри узла.
+- **Откат:** уборка работы. Если kubelet не поднялся после правки, верните копию командами `docker exec lab-worker3 cp /root/lab-05-5-config.yaml.bak /var/lib/kubelet/config.yaml` и `docker exec lab-worker3 systemctl restart kubelet`. Копия лежит внутри контейнера-узла; если стенд пересоздан, она не нужна, потому что kind пишет исходную конфигурацию заново.
 
 #### Шаг 1. Выбрать порог
 
@@ -1004,7 +1010,7 @@ kubectl get --raw /api/v1/nodes/$W/proxy/configz | jq -c '.kubeletconfig.evictio
 | `systemctl restart kubelet` | перечитать конфигурацию |
 | `proxy/configz` | действующая конфигурация kubelet |
 
-Ожидаемый результат (по документации, точный вывод зависит от конфигурации kind):
+Ожидаемый результат (ключи выведены по алфавиту; три нулевых порога — из конфигурации kind, видны в выводе уборки):
 
 ```
 node/lab-worker3 condition met
@@ -1058,6 +1064,7 @@ metadata: {name: $1}
 spec:
   nodeSelector: {kubernetes.io/hostname: $W}
   terminationGracePeriodSeconds: 1
+  restartPolicy: Never
   containers:
   - name: $1
     image: python:3.12-slim
@@ -1092,6 +1099,7 @@ done
 |---|---|
 | `b'x' * N` | заполнить память реально: `bytearray(N)` дал бы нулевые страницы, которые не считаются |
 | `requests` и `limits` Guaranteed | равны, поэтому QoS-класс Guaranteed |
+| `restartPolicy: Never` | выселенный или упавший под не перезапускается |
 | `resources: {}` | QoS-класс BestEffort, request 0 |
 | `requests: {memory: 1Mi}` | Burstable, почти всё потребление сверх request |
 | `availableBytes` в цикле | сигнал kubelet, который сравнивается с порогом |

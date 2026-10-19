@@ -1,169 +1,392 @@
-# 06-2. Pod Security и admission
+# 06-3. Pod Security и admission-политики
 
-> Модуль 6 «Доступ и безопасность» · часть 2 из 2 · 🟡🔴 · ~1 ч чтения + ~40 мин лабы · Нужно: стенд 00-1. Глубже — курс `security` (hardening узлов, supply chain, политики образов).
+> Модуль 06 «Доступ и безопасность» · часть 3 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд 00-1 (контекст `kind-lab`), образы `localhost:5001/orders-api:2.0` и `busybox:1.37` · Опирается на: 01-1 (путь запроса), 01-3 (API-объекты), 06-1 (RBAC), 06-2 (securityContext)
 
-> Отличие от плана: часть 06-1 «Аутентификация и RBAC» в этой версии курса не опубликована (см. `00-plan.md`); основы RBAC, ServiceAccount и токенов — в курсе `security`. Здесь — как кластер проверяет, **что** можно запускать.
+## Где мы на карте
+
+Эта часть разбирает, как кластер проверяет и правит объект после того, как RBAC его пропустил. Часть опирается на путь запроса (01-1): admission стоит между авторизацией и записью в etcd. Поля `securityContext`, capabilities, seccomp и user namespaces объяснены в 06-2, а здесь мы проверяем, что поды их действительно задают. Вебхуки как отдельный сервис разобраны в 09-2, а проверка подписей и реестров образов — в 06-4.
+
+```
+запрос ─► аутентификация ─► авторизация (RBAC, 06-1)
+                                  │
+                                  ▼
+             ┌─── admission ──────────────────────────────────┐
+             │ 1. mutating: правят объект                     │  ← 06-3 §2 (MAP)
+             │ 2. проверка схемы                              │
+             │ 3. validating: принимают или отклоняют         │  ← 06-3 §2 (PSA, VAP)
+             └────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+                                etcd
+```
+
+Схема 1. Место admission в пути запроса: сначала объект можно изменить, потом проверить; после проверки он попадает в etcd.
 
 ---
 
-## Зачем это DevOps-у
+## 1. Какую задачу решают admission-политики
 
-Кластер по умолчанию запускает любой под, который прошёл RBAC: от root, с привилегиями, с сетью узла, с образом `:latest`. Pod Security Admission и политики admission — способ сказать «в этом namespace так нельзя» до того, как под попадёт на узел. В работе это выглядит так: деплой падает с `violates PodSecurity "restricted"`, и нужно быстро понять, какие поля добавить. На собеседовании: «что такое Pod Security Standards», «как запретить latest», «чем ValidatingAdmissionPolicy отличается от вебхука».
+RBAC отвечает на вопрос «кто может создать объект», а admission отвечает на вопрос «какой объект можно создать». Без admission любой пользователь с правом создавать поды запустит под от root, с сетью узла и с образом `latest`.
 
-Сквозной сценарий: проверим, готов ли namespace `orders` к уровню `restricted`, и соберём для orders-api `securityContext`, который его проходит.
+### Что RBAC не проверяет
+
+RBAC смотрит на глагол, ресурс и namespace, но не заглядывает в содержимое объекта. Право `create pods` одинаково для пода с `securityContext` и для привилегированного пода. Поэтому ограничения на поля объекта живут отдельно — в admission.
+
+**Admission** (допуск) — этап обработки запроса, на котором API-сервер проверяет объект и при необходимости меняет его. Этап идёт после аутентификации и авторизации и касается только запросов на запись: создание, обновление, удаление.
+
+### Цепочка admission
+
+Admission состоит из двух фаз, и порядок фаз важен. Сначала работают **mutating-плагины** (mutating admission) — они меняют объект: подставляют значения по умолчанию, добавляют контейнер, метку или поле. Затем API-сервер проверяет схему изменённого объекта. После этого работают **validating-плагины** (validating admission) — они только принимают или отклоняют объект.
+
+Такой порядок защищает проверки: validating видит объект уже в окончательном виде, после всех мутаций. Обратная сторона в том, что мутация может сделать валидный манифест невалидным (§5).
+
+Внутри фазы плагины делятся на встроенные и расширяемые:
+
+- **Встроенные** — часть API-сервера: `PodSecurity`, `ResourceQuota` (05-1), `LimitRanger` (05-1), `ServiceAccount`.
+- **Политики на CEL** — ValidatingAdmissionPolicy и MutatingAdmissionPolicy; выражения выполняются внутри API-сервера.
+- **Вебхуки** — внешний сервис, который API-сервер вызывает по HTTPS (09-2).
+
+**CEL** (Common Expression Language) — небольшой язык выражений без побочных эффектов: выражение читает объект и возвращает значение, например `true` или `false`.
+
+### Три способа задать правило
+
+Для каждой задачи есть свой инструмент, и они дополняют друг друга.
+
+- **Pod Security Admission** — готовый набор правил для полей пода, включается меткой namespace. Правило выбрать можно, написать своё нельзя.
+- **Политики на CEL** — своё правило для любого объекта: теги образов, обязательные метки, лимиты. Работают без отдельного сервиса.
+- **Вебхуки и их оболочки (Kyverno, OPA Gatekeeper)** — всё остальное: генерация объектов, обращение к внешним данным, проверка подписей образов.
+
+Дальше мы идём в этом же порядке — от готового к самописному.
 
 ---
 
-## 1. securityContext: из чего состоит «безопасный под» 🟡
+## 2. Как устроены PSS, PSA, VAP и MAP
 
-| Поле | Уровень | Что даёт |
+В этом разделе четыре механизма: стандарты безопасности подов, их контроллер, политики проверки и политики мутации. Затем мы сравним их с Kyverno и Gatekeeper.
+
+### Pod Security Standards: три уровня
+
+**Pod Security Standards** (PSS, стандарты безопасности подов) — три фиксированных набора требований к полям пода, от свободного до строгого. Набор называют **уровнем** (level).
+
+- **privileged** — без ограничений. Нужен системным компонентам: CNI, CSI, агентам узлов.
+- **baseline** — запрещает очевидно опасное. Минимально ограничивающий уровень, который не ломает большинство приложений.
+- **restricted** — следует практикам усиления защиты (hardening). Он включает всё из baseline и требует безопасный под.
+
+Таблица показывает, что запрещает каждый уровень и что требует restricted сверх baseline.
+
+| Уровень | Что запрещено или требуется | Для кого |
 |---|---|---|
-| `runAsNonRoot: true`, `runAsUser` | под/контейнер | процесс не root (у orders-api в образе `USER 10001`) |
-| `allowPrivilegeEscalation: false` | контейнер | `no_new_privs`: процесс не получит больше прав через setuid-бинарники |
-| `capabilities: {drop: [ALL]}` | контейнер | без Linux capabilities |
-| `seccompProfile: {type: RuntimeDefault}` | под/контейнер | фильтр системных вызовов рантайма |
-| `readOnlyRootFilesystem: true` | контейнер | корневая ФС только для чтения; запись — в смонтированные тома |
-| `privileged`, `hostNetwork`, `hostPID`, `hostPath` | под/контейнер | **не использовать** в прикладных подах |
+| privileged | ничего | системные компоненты |
+| baseline | privileged-контейнеры, host-пространства имён, hostPath, лишние capabilities | обычные приложения |
+| restricted | non-root, seccomp, drop ALL, запрет повышения привилегий | чувствительные нагрузки |
 
-Проверено — orders-api с полным набором (лаба, шаг 1):
+Список в baseline включает ещё порты хоста, профили AppArmor и SELinux вне разрешённых, смонтированный `/proc` и ограниченный набор sysctl. Начиная с Kubernetes 1.34 baseline запрещает и поле `host` в `httpGet` и `tcpSocket` проб и хуков жизненного цикла: через него проба била в произвольный адрес, а не в под. Restricted требует `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` и `seccompProfile` типа `RuntimeDefault` или `Localhost`. Смысл этих полей объяснён в 06-2.
 
-```
-uid 10001 {"version": "2.0", "pod": "hardened"}
-write to /srv: OSError                 ← корень только для чтения
-write to /tmp: ok                      ← emptyDir для временных файлов
-CapEff:	0000000000000000               ← ни одной capability
-NoNewPrivs:	1
-Seccomp:	2                              ← фильтр seccomp включён
-```
+### Pod Security Admission: метки namespace
 
-Приложение работает без изменений кода; потребовался только `emptyDir` для `/tmp`. Большинство сервисов переводятся так же: найти, куда они пишут (кэш, `/tmp`, pid-файлы), и дать туда тома.
+**Pod Security Admission** (PSA) — встроенный validating-плагин `PodSecurity`, который применяет уровни PSS к подам по меткам namespace. Плагин включён в API-сервер по умолчанию, ставить ничего не нужно. У каждого режима своя метка вида `pod-security.kubernetes.io/<режим>`.
 
-## 2. Pod Security Standards и Admission 🟡
+- **enforce** — отклонять под, который нарушает уровень.
+- **warn** — пропускать под, но показывать клиенту предупреждение.
+- **audit** — пропускать под и записывать нарушение в аннотацию события аудита.
 
-Три стандарта (уровня):
-
-| Уровень | Смысл |
-|---|---|
-| `privileged` | без ограничений (системные компоненты: CNI, CSI, агенты узлов) |
-| `baseline` | запрещено очевидно опасное: host-namespaces, привилегированные контейнеры, hostPath, лишние capabilities |
-| `restricted` | плюс обязательный «безопасный под» из §1 |
-
-Встроенный контроллер Pod Security Admission включается **метками namespace**, в трёх режимах:
-
-| Метка | Что делает |
-|---|---|
-| `pod-security.kubernetes.io/enforce=<уровень>` | отклоняет под |
-| `…/warn=<уровень>` | пропускает, но пишет предупреждение клиенту (видно в kubectl и в CI) |
-| `…/audit=<уровень>` | пропускает, пишет аннотацию в аудит-лог |
-| `…/<режим>-version=v1.36` или `latest` | версия стандарта |
-
-Проверено: под без `securityContext` в namespace с `enforce=restricted`:
+Три режима задают независимо, и у каждого может быть свой уровень. К метке уровня добавляют метку версии: `pod-security.kubernetes.io/enforce-version` принимает значение `latest` или версию вида `v1.36`. Версия фиксирует набор правил на тот момент, поэтому после обновления кластера новые требования не появятся неожиданно.
 
 ```
-Error from server (Forbidden): pods "plain" is forbidden: violates PodSecurity "restricted:latest": allowPrivilegeEscalation != false (container "plain" must set securityContext.allowPrivilegeEscalation=false), unrestricted capabilities (container "plain" must set securityContext.capabilities.drop=["ALL"]), runAsNonRoot != true (pod or container "plain" must set securityContext.runAsNonRoot=true), seccompProfile (pod or container "plain" must set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+namespace lab-06-3b
+  labels:  enforce=baseline    warn=restricted    audit=restricted
+                │                    │                   │
+под нарушает restricted:             │                   │
+  отклонить? ───┘ нет, это baseline  │                   │
+  предупредить клиента ──────────────┘                   │
+  записать в аудит ──────────────────────────────────────┘
 ```
 
-Сообщение — готовый список того, что добавить. Под с `hostNetwork: true` в namespace с `enforce=baseline` (проверено): `violates PodSecurity "baseline:latest": host namespaces (hostNetwork=true)`.
+Схема 2. Один под проверяется по трём меткам: отказывает только enforce, остальные режимы лишь сообщают.
 
-Режимы вместе — путь внедрения без аварий (проверено, namespace с `enforce=baseline, warn=restricted, audit=restricted`): обычный под создаётся с предупреждением `Warning: would violate PodSecurity "restricted:latest": …` — команды видят, что надо поправить, ничего не ломается.
+Режимы по-разному относятся к контроллерам. Enforce проверяет только объект Pod, а Deployment или Job он пропускает. Warn и audit проверяют и шаблоны подов в Deployment, Job и других контроллерах, поэтому предупреждение приходит уже при `kubectl apply` манифеста Deployment.
 
-Перед ужесточением существующего namespace — **dry-run** (проверено на `orders`):
+### ValidatingAdmissionPolicy: политика и привязка
+
+**ValidatingAdmissionPolicy** (VAP) — объект API, который описывает правило проверки на CEL; он выполняется внутри API-сервера, и отдельный сервис не нужен. Функция стала GA в 1.30, группа API — `admissionregistration.k8s.io/v1`. Правило состоит из двух объектов.
+
+- **Политика** (ValidatingAdmissionPolicy) — что проверять: на какие ресурсы и операции она смотрит и какие выражения вычисляет.
+- **Привязка** (ValidatingAdmissionPolicyBinding) — где и как применять: в каких namespace, с какими параметрами и что делать при нарушении.
+
+Разделение позволяет написать правило один раз и привязать его к разным областям с разными действиями.
 
 ```
-$ kubectl label --dry-run=server --overwrite ns orders pod-security.kubernetes.io/enforce=restricted
-Warning: existing pods in namespace "orders" violate the new PodSecurity enforce level "restricted:latest"
-Warning: orders-api-7f45b67f95-c47t8 (and 2 other pods): allowPrivilegeEscalation != false, unrestricted capabilities, runAsNonRoot != true, seccompProfile
-namespace/orders labeled (server dry run)
+ValidatingAdmissionPolicy        ValidatingAdmissionPolicyBinding
+  matchConstraints  (что) ◄───────  policyName
+  validations: CEL                  matchResources (где: namespaceSelector)
+  paramKind (тип параметров)        paramRef       (какие параметры)
+  failurePolicy                     validationActions: Deny | Warn | Audit
 ```
 
-Работающие поды enforce не убивает, но после следующего rollout'а новые поды не создадутся — Deployment будет «зелёным», а ReplicaSet — с `FailedCreate`, как при квоте (05-1 §6).
+Схема 3. Политика хранит логику, привязка выбирает область и действие; без привязки политика ничего не проверяет.
 
-Что PSA не умеет: исключения по образам и пользователям тоньше, чем на весь namespace (есть только глобальные exemptions в конфиге apiserver), проверки чего-то кроме полей пода (теги образов, реестры, метки, ресурсы). Для этого — политики.
+В выражении доступны переменные: `object` — новый объект, `oldObject` — прежний (при создании пуст), `request` — атрибуты запроса, `params` — объект параметров. Если выражение возвращает `false`, правило нарушено.
 
-## 3. ValidatingAdmissionPolicy: свои правила на CEL 🟡🔴
+Три поля определяют поведение при нарушении и при сбое:
 
-Встроенный механизм (stable с 1.30): правила на языке CEL выполняются **внутри apiserver**, без отдельного сервиса-вебхука. Два объекта — политика (что проверять) и привязка (где и как применять).
+- **validationActions** в привязке — список действий: `Deny` отклоняет запрос, `Warn` возвращает предупреждение клиенту, `Audit` записывает нарушение в аннотацию аудита. Deny и Warn вместе не используют.
+- **failurePolicy** в политике — что делать, если выражение само не вычислилось (ошибка CEL): `Fail` (по умолчанию) отклоняет запрос, `Ignore` пропускает.
+- **messageExpression** — выражение, которое собирает текст отказа, и в нём видны данные объекта.
 
-```yaml
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicy
-metadata: {name: no-latest-tag}
-spec:
-  failurePolicy: Fail
-  matchConstraints:
-    resourceRules:
-    - {apiGroups: [""], apiVersions: [v1], operations: [CREATE, UPDATE], resources: [pods]}
-  validations:
-  - expression: >-
-      object.spec.containers.all(c, c.image.contains('@sha256:') ||
-        (c.image.split('/')[size(c.image.split('/'))-1].contains(':') && !c.image.endsWith(':latest')))
-    messageExpression: "'образ без тега или с :latest запрещён: ' + object.spec.containers.map(c, c.image).join(', ')"
+Параметры нужны, когда одно правило должно работать с разными значениями. В политике задают `paramKind`, например ConfigMap, а привязка через `paramRef` называет конкретный объект или выбирает их по меткам. В выражении параметры читают из `params`, и первой строкой проверяют `params != null`. Обязательное поле `parameterNotFoundAction` решает, что делать, если параметра нет: `Allow` пропускает запрос, `Deny` применяет `failurePolicy`.
+
+### MutatingAdmissionPolicy: мутация без вебхука
+
+**MutatingAdmissionPolicy** (MAP) — аналог VAP для изменений: CEL-выражение возвращает патч, и API-сервер применяет его к объекту. Функция прошла путь alpha 1.32, beta 1.34 и стала GA в 1.36, так что на стенде она включена по умолчанию. Объекты те же две: политика и привязка (`MutatingAdmissionPolicyBinding`), с теми же `matchConstraints`, `paramKind` и `matchConditions`.
+
+Патч задаёт список `mutations`, и у каждой мутации один из двух типов (`patchType`).
+
+- **ApplyConfiguration** — выражение возвращает объект, построенный через `Object{...}`; он сливается с исходным по правилам server-side apply (01-3). Подходит для «добавить поле» и «задать значение по умолчанию».
+- **JSONPatch** — выражение возвращает список операций `JSONPatch{op, path, value}` по RFC 6902. Подходит для точечных правок и операции `test`.
+
+Ключи с символами `/` и `~` в пути экранирует функция `jsonpatch.escapeKey()`; без неё метка `example.com/team` сломает путь.
+
+Условия `matchConditions` отбирают запросы, которым патч нужен: например, мутация применяется, только если поле ещё не задано. Это защищает от перезаписи значений, которые указал автор манифеста.
+
+### Kyverno и OPA Gatekeeper
+
+**Kyverno** и **OPA Gatekeeper** — внешние контроллеры, которые работают как admission-вебхуки и дают политики в виде объектов Kubernetes. Курс `security` разбирает их полнее, а здесь мы сравниваем механизмы по ключевым свойствам.
+
+| | VAP / MAP | Kyverno | Gatekeeper |
+|---|---|---|---|
+| Где работает | в API-сервере | вебхук | вебхук |
+| Язык правил | CEL | YAML, CEL | Rego, CEL |
+| Мутация | MAP | да | да |
+| Генерация объектов | нет | да | нет |
+| Внешние данные | нет | да | ограниченно |
+
+Таблица строится по документации проектов; версии и режимы зависят от установки, поэтому детали проверяйте в курсе `security`. Практический вывод простой: простые правила по полям объекта пишут на CEL внутри API-сервера, а за генерацией объектов, проверкой подписей образов и обращением к внешним данным идут в Kyverno или Gatekeeper.
+
 ---
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicyBinding
-metadata: {name: no-latest-tag}
-spec:
-  policyName: no-latest-tag
-  validationActions: [Warn]          # затем [Deny]; есть ещё Audit
-  matchResources:
-    namespaceSelector: {matchLabels: {policy.lab/images: pinned}}
+
+## 3. Как управлять политиками
+
+Управление сводится к меткам namespace для PSA и к объектам политик и привязок для VAP и MAP. Главное правило — вводить ограничения постепенно, от сообщения к отказу.
+
+### Включить PSA на namespace
+
+Уровень задают меткой, и достаточно одной команды `kubectl label`. Namespace без меток живёт на уровне privileged, поэтому защита появляется только после явной метки.
+
+```bash
+kubectl label ns lab-06-3 \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/enforce-version=latest
 ```
 
-Тег ищется в **последнем** сегменте пути — иначе двоеточие порта реестра (`localhost:5001/…`) сойдёт за тег. Проверено:
+Команда ставит две метки: уровень `restricted` для режима enforce и версию правил `latest`. Для долгоживущих namespace версию фиксируют конкретной (`v1.36`), чтобы обновление кластера не изменило требования.
 
+### Мягкое внедрение
+
+Уровень повышают по шагам, и каждый шаг проверяют, прежде чем включать отказ. Так внедрение не ломает работающие сервисы.
+
+1. Поставить `warn` и `audit` на целевой уровень, а `enforce` оставить на текущем. Тогда команды видят предупреждения при `kubectl apply`.
+2. Исправить манифесты по списку нарушений и дождаться нуля предупреждений.
+3. Проверить существующий namespace пробной меткой: `kubectl label --dry-run=server --overwrite`.
+4. Включить `enforce`.
+
+Сухой прогон на сервере (`--dry-run=server`) выполняет запрос на сервере, но не сохраняет результат; для метки он перечисляет работающие поды, которые нарушат новый уровень.
+
+### Исключения PSA
+
+**Исключение** (exemption) — запрос, который PSA не проверяет вообще: ни enforce, ни warn, ни audit. Исключения задают статически в конфигурации admission-контроллера API-сервера (`AdmissionConfiguration`, плагин `PodSecurity`) по трём признакам: имя пользователя, класс рантайма (RuntimeClass) или namespace.
+
+Меняется эта конфигурация перезапуском API-сервера, поэтому в кластере kind её правят на уровне kubeadm-конфигурации при создании кластера; эту работу мы не делаем. Исключение пользователя действует только на прямое создание пода, но не на создание Deployment. Сервисные учётные записи контроллеров (например, ReplicaSet) исключать нельзя: тогда любой, кто может создать Deployment, обойдёт проверку.
+
+### Включить VAP: от Warn к Deny
+
+Привязка с действием `Warn` показывает нарушения без отказов, и её меняют на `Deny`, когда нарушений нет. Область ограничивают через `namespaceSelector` привязки: правило включается по namespace, а не на весь кластер.
+
+Порядок тот же, что у PSA: `Warn` (а при необходимости `Audit`), потом `Deny`. Переключение делают патчем привязки, политику не трогают:
+
+```bash
+kubectl patch validatingadmissionpolicybinding no-latest-tag --type=merge \
+  -p '{"spec":{"validationActions":["Deny"]}}'
 ```
---- Warn
-Warning: Validation failed for ValidatingAdmissionPolicy 'no-latest-tag' with binding 'no-latest-tag': образ без тега или с :latest запрещён: busybox
---- Deny
-busybox                       -> … ValidatingAdmissionPolicy 'no-latest-tag' with binding 'no-latest-tag' denied request
-busybox:latest                -> … denied request
-busybox:1.37                  -> pod/… created
-localhost:5001/orders-api:2.0 -> pod/… created
-localhost:5001/orders-api     -> … denied                   ← порт реестра не принят за тег
-localhost:5001/orders-api@sha256:ad4f8fd… -> pod/… created
-```
 
-Порядок внедрения тот же, что у PSA: `Warn` → смотрим, кого задевает → `Deny`. Привязка через `namespaceSelector` позволяет включать правило по namespace'ам.
+Команда заменяет список действий в привязке `no-latest-tag`. Политика остаётся прежней, меняется только реакция на нарушение. Вступает в силу изменение не мгновенно: после патча даём API-серверу около 3 секунд.
 
-| | ValidatingAdmissionPolicy | Admission webhook (Kyverno, OPA Gatekeeper, свой) |
+### Включить MAP
+
+Привязка MAP не имеет действий `Deny` и `Warn`: мутация всегда применяется. Поэтому безопасно вводить её через узкий `namespaceSelector` и условие `matchConditions`. Как и у VAP, область задаёт привязка, а политика без привязки не работает.
+
+---
+
+## 4. Как увидеть состояние
+
+Результат admission видно в трёх местах: в ответе на запрос, в событиях контроллера и в аудите. Какое место смотреть, зависит от того, кто создал под — человек или контроллер.
+
+### Ответ на запрос
+
+Отказ и предупреждение приходят в ответе на запрос, и `kubectl` печатает их сразу. Отказ PSA выглядит как `Forbidden: violates PodSecurity "restricted:latest": …` и перечисляет все нарушенные требования с подсказкой, какое поле добавить. Предупреждение начинается словами `Warning: would violate PodSecurity`. У VAP в тексте названы политика и привязка: `ValidatingAdmissionPolicy 'имя' with binding 'имя' denied request`.
+
+### События контроллера
+
+Поды создаёт контроллер, а не человек, и его отказы видны в событиях. Под из Deployment создаёт ReplicaSet, поэтому событие `FailedCreate` с текстом отказа лежит у ReplicaSet, а не у Deployment. Сам Deployment при этом выглядит нормально, а `READY` показывает, например, `2/6`. Команда `kubectl describe rs` и `kubectl get events` показывают причину.
+
+### Сухой прогон и проверка политики
+
+`kubectl label --dry-run=server` покажет, какие поды нарушат новый уровень PSA. Для манифеста подходит `kubectl apply --dry-run=server`: он проходит admission, и CI ловит отказ до выкатки (00-2). Для VAP на сервере проверяется и сама политика: при создании API-сервер проверяет типы выражений и пишет предупреждения в `status.typeChecking.expressionWarnings`. Пустой статус значит, что ошибок не найдено.
+
+### Аудит
+
+Режимы `audit` пишут нарушения в аннотации событий аудита API-сервера. У PSA это аннотация `pod-security.kubernetes.io/audit-violations`, у VAP с действием `Audit` — `validation.policy.admission.k8s.io/validation_failure`. Включить аудит и читать его — тема 06-4. На стенде аудит выключен, поэтому записи режима `audit` здесь не видны.
+
+---
+
+## 5. Что ломается и как найти причину
+
+Поломки admission делятся на три группы: отказ после включения enforce, отказ из-за мутации и сбой самой политики. Для каждой группы свой первый шаг диагностики.
+
+### Релиз прошёл, а подов нет
+
+Enforce не трогает уже работающие поды, поэтому проблема всплывает на следующем rollout или при масштабировании. Deployment остаётся «зелёным», новые реплики не создаются, а ReplicaSet пишет `FailedCreate`. Так же ведёт себя исчерпанная квота (05-1).
+
+Диагностика идёт по цепочке: `kubectl get deploy` показывает нехватку реплик, `kubectl describe rs` показывает отказ с текстом, и в тексте уже написано, какие поля добавить. Чтобы не попасть в эту ловушку, перед enforce делают сухой прогон метки, а в CI проверяют `rollout status`, а не только `kubectl apply` (02-2).
+
+### Мутация сломала валидный манифест
+
+Если манифест корректен, а PodSecurity отказывает, виновата мутация. Она идёт раньше проверки: вебхук-инжектор (sidecar сервисной сетки, агент) добавляет контейнер без нужного `securityContext`, и под перестаёт проходить restricted. Автор манифеста тут ни при чём.
+
+Признак: в тексте отказа названо имя контейнера, которого нет в манифесте. Чинят инжектор, чтобы он добавлял безопасный контейнер, или исключают его по признаку (§3), но не ослабляют уровень namespace.
+
+### Политика не срабатывает или срабатывает не там
+
+Тихая политика чаще всего ошибается в области. Типичные причины такие:
+
+- Привязка не совпала с namespace: `namespaceSelector` не находит метку, и правило ничего не проверяет.
+- Политика создана, а привязки нет.
+- Выражение неверно разбирает значение: двоеточие порта реестра принято за тег.
+- Действие в привязке `Warn`, а не `Deny`, поэтому поды создаются.
+
+Диагностика: проверить метки namespace, прочитать `status.typeChecking` у политики и создать тестовый объект с ожидаемым отказом. Ошибки в самом выражении при `failurePolicy: Fail` превращаются в отказы всех запросов, которые попали под правило, поэтому политику сначала запускают в режиме `Warn`.
+
+### Недоступный вебхук
+
+Вебхук падает как отдельный сервис, и при `failurePolicy: Fail` кластер перестаёт принимать изменения, которые под него попадают. Для CEL-политик такой сценарий невозможен, потому что они работают внутри API-сервера. Диагностика вебхука и выход из зависших namespace — 09-2.
+
+---
+
+## 6. Пределы и значения по умолчанию
+
+Ниже собраны стадии функций, значения по умолчанию и то, чего эти механизмы не умеют. Значения приведены для Kubernetes 1.36.
+
+### Стадии функций
+
+Таблица показывает, с какой версии что доступно без включения флагов.
+
+| Функция | Стадия | Версия |
 |---|---|---|
-| Где выполняется | в apiserver | отдельный сервис, вызов по HTTPS |
-| Отказ сервиса | не бывает | `failurePolicy: Fail` → кластер не принимает изменения (09-2) |
-| Задержка | микросекунды | сетевой вызов |
-| Возможности | проверки объекта и параметров (CEL) | плюс мутация, генерация объектов, обращение к внешним данным, проверка подписей образов |
+| Pod Security Admission | stable | 1.25 |
+| ValidatingAdmissionPolicy | GA | 1.30 |
+| MutatingAdmissionPolicy | GA | 1.36 |
+| Контроль `host` в пробах и хуках (baseline) | в PSS | 1.34 |
 
-Мутация на CEL — MutatingAdmissionPolicy (⚠️ на стенде не проверялась; уровень зрелости сверяйте с версией кластера). Проверка подписи образов (cosign) — Kyverno `verifyImages` или Sigstore policy-controller — курс `cicd` 04-2 и курс `security`.
+MAP в 1.32 была alpha, в 1.34 — beta. Если кластер старше 1.36, проверьте, включена ли функция и какая версия API у политики.
 
-## 4. Порядок admission 🔴
+### Значения по умолчанию
 
-```
-запрос → аутентификация → авторизация (RBAC)
-       → mutating admission (встроенные дефолты, MutatingAdmissionPolicy, mutating webhooks)
-       → валидация схемы
-       → validating admission (PodSecurity, ResourceQuota, LimitRanger, ValidatingAdmissionPolicy, validating webhooks)
-       → etcd
-```
+- Namespace без меток PSA — уровень privileged, проверок нет.
+- Версия правил без метки версии — `latest`.
+- `failurePolicy` у VAP — `Fail`.
+- Режимы PSA независимы: каждый настраивается отдельной меткой.
+- Исключений PSA по умолчанию нет.
+- Ответ на нарушение VAP без `reason` — код `Invalid` (422); значение `reason` можно задать: `Unauthorized`, `Forbidden`, `Invalid`, `RequestEntityTooLarge`.
 
-Мутация до валидации: вебхук, добавляющий sidecar без `securityContext`, сделает под несовместимым с `restricted` — ошибка будет от PodSecurity, хотя автор манифеста ни при чём. Решается настройкой инжектора или исключением.
+### Что механизмы не умеют
+
+PSA проверяет поля пода и больше ничего: не теги образов, не реестры, не метки и не ресурсы. Исключения у PSA грубые: на пользователя, RuntimeClass или namespace целиком, а не на образ. Исключить под по отдельному полю нельзя.
+
+VAP и MAP видят один объект и параметры. Они не обращаются к внешним сервисам, не создают другие объекты и не проверяют подпись образа. PSA не заменяет seccomp-профиль: она проверяет, что поле задано, а применяет его рантайм. Подробности про профили — в 06-2.
 
 ---
 
-## 🔧 Лаба
+## Лабораторные работы
 
-### Шаг 0. Подготовка
+Работы идут на стенде 00-1 в namespace `lab-06-3` и `lab-06-3b`; последний нужен для мягкого внедрения, а MAP использует отдельный `lab-06-3c`. Команды везде с явным `-n`: контекст kubectl и текущий namespace не меняются. Хост работы не меняют; политики и привязки — объекты кластера, их удаляет уборка. Образ `busybox:1.37` узлы тянут из Docker Hub, а при недоступности используйте копию в реестре стенда (02-1).
+
+Подготовку делают один раз: выбирают контекст стенда и создают два namespace.
 
 ```bash
 kubectl config use-context kind-lab
-kubectl create ns lab-06-2
-kubectl label ns lab-06-2 pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/enforce-version=latest
-kubectl config set-context --current --namespace=lab-06-2
+kubectl create ns lab-06-3
+kubectl label ns lab-06-3 \
+  pod-security.kubernetes.io/enforce=restricted \
+  pod-security.kubernetes.io/enforce-version=latest
+kubectl create ns lab-06-3b
 ```
 
-### Шаг 1. restricted: отказ и исправление
+| Часть команды | Значение |
+|---|---|
+| `use-context kind-lab` | выбрать кластер стенда |
+| `create ns` | создать namespace |
+| `label ns … enforce=restricted` | отклонять поды, нарушающие уровень restricted |
+| `enforce-version=latest` | брать правила текущей версии кластера |
+
+Первая команда переключает контекст на стенд, поэтому дальнейшие команды не попадут в рабочий кластер.
+
+### Лабораторная работа 1. Уровень restricted: отказ и исправление
+
+**Цель.** Увидеть отказ PSA для пода без `securityContext`, прочитать в сообщении список недостающих полей и собрать под, который проходит restricted.
+
+**Что понадобится.**
+
+- Стенд из 00-1 и namespace `lab-06-3` с меткой enforce.
+- Образ `localhost:5001/orders-api:2.0`.
+- Около 20 минут.
+
+**Схема опыта.**
+
+```
+kubectl run plain ──► PodSecurity (restricted) ──► отказ + список полей
+kubectl apply hardened ──► PodSecurity (restricted) ──► принят ──► проверка внутри пода
+```
+
+Схема 4. Один namespace, два пода: первый нарушает уровень, второй проходит.
+
+#### Шаг 1. Создать под без securityContext
+
+Команда пытается запустить orders-api без единого поля безопасности.
 
 ```bash
-kubectl run plain --image=localhost:5001/orders-api:2.0
-kubectl apply -f - <<'EOF'
+kubectl -n lab-06-3 run plain --image=localhost:5001/orders-api:2.0
+```
+
+| Часть команды | Значение |
+|---|---|
+| `-n lab-06-3` | namespace с меткой `enforce=restricted` |
+| `run plain` | создать под с именем `plain` |
+| `--image=…` | образ orders-api стенда |
+
+Результат (одна строка, здесь перенесена):
+
+```
+Error from server (Forbidden): pods "plain" is forbidden: violates PodSecurity
+"restricted:latest": allowPrivilegeEscalation != false (container "plain" must set
+securityContext.allowPrivilegeEscalation=false), unrestricted capabilities
+(container "plain" must set securityContext.capabilities.drop=["ALL"]),
+runAsNonRoot != true (pod or container "plain" must set
+securityContext.runAsNonRoot=true), seccompProfile (pod or container "plain" must
+set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
+```
+
+Разбор:
+
+1. `Forbidden` — запрос отклонён на admission, под не создан.
+2. `restricted:latest` — применён уровень restricted с версией правил `latest`.
+3. Четыре нарушения — по одному на каждое требование restricted (§2).
+4. В скобках названо поле, которое нужно добавить: сообщение — готовый список правок.
+
+#### Шаг 2. Создать под, который проходит restricted
+
+Команда создаёт под с полным набором полей и ждёт готовности.
+
+```bash
+kubectl -n lab-06-3 apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: hardened}
@@ -182,34 +405,266 @@ spec:
     volumeMounts: [{name: tmp, mountPath: /tmp}]
   volumes: [{name: tmp, emptyDir: {}}]
 EOF
-kubectl wait --for=condition=Ready pod/hardened
-kubectl exec hardened -- python -c "
+kubectl -n lab-06-3 wait --for=condition=Ready pod/hardened
+```
+
+| Часть команды | Значение |
+|---|---|
+| `runAsNonRoot`, `runAsUser: 10001` | процесс не root, как в образе orders-api |
+| `seccompProfile: RuntimeDefault` | фильтр системных вызовов рантайма |
+| `allowPrivilegeEscalation: false` | процесс не получит больше прав |
+| `capabilities.drop: [ALL]` | без Linux capabilities |
+| `readOnlyRootFilesystem: true` | корневая ФС только для чтения |
+| `emptyDir` на `/tmp` | каталог для временных файлов |
+
+Результат: под создаётся, затем `condition met`; точных строк вывода прогона у этого шага нет, поэтому форма ожидаемая.
+
+```
+pod/hardened created
+pod/hardened condition met
+```
+
+Разбор: PSA пропустил под, потому что все четыре требования из шага 1 выполнены. Поля `readOnlyRootFilesystem` и `emptyDir` restricted не требует, они здесь для защиты и показывают, что приложению нужен только каталог для `/tmp`.
+
+#### Шаг 3. Проверить результат внутри контейнера
+
+Команда запускает Python внутри пода: показывает пользователя, проверяет запись на корень и в `/tmp`, а затем читает статус процесса.
+
+```bash
+kubectl -n lab-06-3 exec hardened -- python -c "
 import os,urllib.request
 print('uid', os.getuid(), urllib.request.urlopen('http://127.0.0.1:8000/version').read().decode())
 try: open('/srv/x','w')
 except Exception as e: print('write to /srv:', type(e).__name__)
 open('/tmp/x','w').write('ok'); print('write to /tmp: ok')"
-kubectl exec hardened -- grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/1/status
+kubectl -n lab-06-3 exec hardened -- grep -E 'CapEff|NoNewPrivs|Seccomp:' /proc/1/status
 ```
 
-Проверено: вывод в §1 и §2.
+| Часть команды | Значение |
+|---|---|
+| `os.getuid()` | идентификатор пользователя процесса |
+| `urlopen('…/version')` | запрос к самому приложению |
+| `open('/srv/x','w')` | запись на корневую ФС: должна упасть |
+| `open('/tmp/x','w')` | запись в `emptyDir`: должна пройти |
+| `grep … /proc/1/status` | поля статуса процесса 1 |
 
-### Шаг 2. Мягкое внедрение: baseline + warn/audit restricted
+Результат:
 
-```bash
-kubectl create ns lab-06-2b
-kubectl label ns lab-06-2b pod-security.kubernetes.io/enforce=baseline pod-security.kubernetes.io/warn=restricted pod-security.kubernetes.io/audit=restricted
-kubectl -n lab-06-2b run plain --image=localhost:5001/orders-api:2.0
-kubectl -n lab-06-2b run hostnet --image=busybox:1.37 --overrides='{"spec":{"hostNetwork":true}}' -- sleep 60
-kubectl label --dry-run=server --overwrite ns orders pod-security.kubernetes.io/enforce=restricted
+```
+uid 10001 {"version": "2.0", "pod": "hardened"}
+write to /srv: OSError
+write to /tmp: ok
+CapEff:	0000000000000000
+NoNewPrivs:	1
+Seccomp:	2
 ```
 
-Проверено: `plain` создан с предупреждением, `hostnet` отклонён baseline'ом, dry-run для `orders` перечисляет нарушения (§2).
+Разбор:
 
-### Шаг 3. Политика «без latest»
+1. `uid 10001` — процесс не root, приложение отвечает без изменений кода.
+2. `write to /srv: OSError` — корень только для чтения.
+3. `write to /tmp: ok` — `emptyDir` принимает запись.
+4. `CapEff` из нулей — ни одной capability.
+5. `NoNewPrivs: 1` — повышение привилегий запрещено.
+6. `Seccomp: 2` — включён фильтр seccomp.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Сообщение PSA перечисляет все недостающие поля | шаг 1 |
+| Под с полным набором полей проходит restricted | шаг 2 |
+| Поля применяются в процессе | шаг 3, `CapEff`, `NoNewPrivs`, `Seccomp` |
+
+**Уборка.**
 
 ```bash
-kubectl label ns lab-06-2b policy.lab/images=pinned
+kubectl -n lab-06-3 delete pod hardened
+```
+
+Namespace остаётся для следующих работ.
+
+**Вопросы для самопроверки.**
+
+1. Почему `kubectl run plain` отклонён, хотя у пользователя есть право создавать поды?
+2. Какое поле не требует restricted, но понадобилось приложению?
+3. Что показывает `Seccomp: 2` в статусе процесса?
+
+<details>
+<summary>Ответ</summary>
+
+1. RBAC проверяет право на действие, а PSA — содержимое пода. Они работают на разных шагах цепочки admission, и отказ PSA не связан с правами.
+2. `emptyDir` для `/tmp`. Restricted требует non-root, seccomp, drop ALL и запрет повышения привилегий. Каталог для записи нужен приложению, потому что корневая ФС только для чтения.
+3. Значение 2 значит, что процесс работает в режиме фильтра seccomp, то есть профиль `RuntimeDefault` применён (06-2).
+
+</details>
+
+### Лабораторная работа 2. Мягкое внедрение: baseline и предупреждения restricted
+
+**Цель.** Увидеть, как режимы enforce, warn и audit работают вместе, и проверить существующий namespace пробной меткой до включения enforce.
+
+**Что понадобится.**
+
+- Namespace `lab-06-3b` из подготовки.
+- Образы `localhost:5001/orders-api:2.0` и `busybox:1.37`.
+- Namespace `orders` со стенда, который работа только читает.
+
+**Схема опыта.**
+
+```
+lab-06-3b: enforce=baseline  warn=restricted  audit=restricted
+  plain   ──► создан + Warning (нарушает restricted)
+  hostnet ──► отклонён (нарушает baseline)
+orders:  label --dry-run=server enforce=restricted ──► список нарушений, метка не ставится
+```
+
+Схема 5. Baseline защищает, restricted только сообщает, а пробная метка показывает цену ужесточения.
+
+#### Шаг 1. Поставить режимы
+
+Команда ставит одну метку enforce и две метки для предупреждений и аудита.
+
+```bash
+kubectl label ns lab-06-3b \
+  pod-security.kubernetes.io/enforce=baseline \
+  pod-security.kubernetes.io/warn=restricted \
+  pod-security.kubernetes.io/audit=restricted
+```
+
+| Часть команды | Значение |
+|---|---|
+| `enforce=baseline` | отклонять только очевидно опасное |
+| `warn=restricted` | предупреждать о нарушениях restricted |
+| `audit=restricted` | писать нарушения restricted в аудит |
+
+Результат: `namespace/lab-06-3b labeled`; строка ожидаемая.
+
+#### Шаг 2. Создать обычный под и под с сетью узла
+
+Первая команда создаёт обычный под без полей безопасности, вторая просит сеть узла.
+
+```bash
+kubectl -n lab-06-3b run plain --image=localhost:5001/orders-api:2.0
+kubectl -n lab-06-3b run hostnet --image=busybox:1.37 \
+  --overrides='{"spec":{"hostNetwork":true}}' -- sleep 60
+```
+
+| Часть команды | Значение |
+|---|---|
+| `run plain` | под без `securityContext` |
+| `--overrides='{"spec":{"hostNetwork":true}}'` | добавить в спецификацию сеть узла |
+| `-- sleep 60` | команда контейнера: спать 60 секунд |
+
+Результат (строки сокращены `…`):
+
+```
+Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false …
+pod/plain created
+Error from server (Forbidden): … violates PodSecurity "baseline:latest": host namespaces (hostNetwork=true)
+```
+
+Разбор:
+
+1. `Warning: would violate … restricted` — режим warn сообщает о нарушении, но под создан.
+2. `pod/plain created` — enforce на уровне baseline его пропустил.
+3. `Forbidden … baseline` — сеть узла запрещена уже на baseline, поэтому `hostnet` отклонён.
+
+Команды видят, что нужно исправить, и ничего не ломается: так выглядит внедрение без аварий.
+
+#### Шаг 3. Проверить namespace orders пробной меткой
+
+Команда выполняет метку на сервере, но не сохраняет её: так видно цену ужесточения для работающего namespace.
+
+```bash
+kubectl label --dry-run=server --overwrite ns orders \
+  pod-security.kubernetes.io/enforce=restricted
+```
+
+| Часть команды | Значение |
+|---|---|
+| `--dry-run=server` | выполнить на сервере без сохранения |
+| `--overwrite` | разрешить замену метки, если она есть |
+| `ns orders` | namespace демо-приложения |
+
+Результат:
+
+```
+Warning: existing pods in namespace "orders" violate the new PodSecurity enforce level "restricted:latest"
+Warning: orders-api-7f45b67f95-c47t8 (and 2 other pods): allowPrivilegeEscalation != false, unrestricted capabilities, runAsNonRoot != true, seccompProfile
+namespace/orders labeled (server dry run)
+```
+
+Разбор:
+
+1. Первая строка — работающие поды нарушат новый уровень.
+2. Вторая строка — один под и ещё два, а после двоеточия список нарушений.
+3. `(server dry run)` — метка не поставлена: namespace `orders` не изменился.
+
+Работающие поды enforce не убивает, но следующий rollout не создаст новых подов. Поэтому ужесточение начинают с warn и пробной метки.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Три режима работают независимо | шаг 2 |
+| Enforce отклоняет, warn только предупреждает | шаг 2 |
+| Пробная метка показывает нарушения без изменений | шаг 3 |
+
+**Уборка.** Пробная метка ничего не сохранила. Под `plain` удаляется вместе с namespace в общей уборке последней работы.
+
+```bash
+kubectl -n lab-06-3b delete pod plain
+```
+
+**Вопросы для самопроверки.**
+
+1. Почему `plain` создан, хотя нарушает restricted?
+2. Что случится с работающими подами `orders`, если поставить enforce=restricted?
+3. Почему пробную метку нужно ставить до enforce?
+
+<details>
+<summary>Ответ</summary>
+
+1. Enforce стоит на baseline, а restricted задан только для warn и audit. Эти режимы лишь сообщают о нарушениях.
+2. Ничего: enforce проверяет создаваемые поды и не трогает работающие. Но следующий rollout или масштабирование упрётся в отказ, и ReplicaSet напишет `FailedCreate`.
+3. Она перечисляет нарушения заранее и ничего не сохраняет, так что команды успевают исправить манифесты.
+
+</details>
+
+### Лабораторная работа 3. ValidatingAdmissionPolicy: запретить образы без тега и с latest
+
+**Риски.** Работа создаёт объекты уровня кластера, поэтому прочтите их влияние до запуска.
+
+- **Что меняется:** политика и привязка `no-latest-tag` (объекты кластера), метка на namespace `lab-06-3b`.
+- **Надолго ли:** до уборки; привязка действует только на namespace с меткой `lab-06-3/images=pinned`.
+- **Безопасность:** привилегий не нужно; политика только запрещает поды.
+- **Влияние на систему:** другие namespace не затронуты, пока у них нет метки.
+- **Откат:** блок «Уборка».
+
+**Цель.** Написать политику на CEL, проверить её в режимах Warn и Deny и убедиться, что порт реестра не принят за тег.
+
+**Что понадобится.**
+
+- Namespace `lab-06-3b` и образы `busybox` и `localhost:5001/orders-api:2.0`.
+- Дайджест образа `orders-api:2.0` из вывода `docker push` в 00-1: вместо него в примере стоит сокращение.
+
+**Схема опыта.**
+
+```
+под ──► VAP no-latest-tag (CEL по spec.containers[].image)
+          │ привязка: namespaceSelector lab-06-3/images=pinned
+          ├─ validationActions [Warn] ──► создан + предупреждение
+          └─ validationActions [Deny] ──► отклонён
+```
+
+Схема 6. Правило одно, а реакция на нарушение меняется в привязке.
+
+#### Шаг 1. Создать политику и привязку в режиме Warn
+
+Команда помечает namespace и создаёт политику с привязкой.
+
+```bash
+kubectl label ns lab-06-3b lab-06-3/images=pinned
 kubectl apply -f - <<'EOF'
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -222,8 +677,10 @@ spec:
   validations:
   - expression: >-
       object.spec.containers.all(c, c.image.contains('@sha256:') ||
-        (c.image.split('/')[size(c.image.split('/'))-1].contains(':') && !c.image.endsWith(':latest')))
-    messageExpression: "'образ без тега или с :latest запрещён: ' + object.spec.containers.map(c, c.image).join(', ')"
+        (c.image.split('/')[size(c.image.split('/'))-1].contains(':') &&
+         !c.image.endsWith(':latest')))
+    messageExpression: "'образ без тега или с :latest запрещён: ' +
+      object.spec.containers.map(c, c.image).join(', ')"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -232,122 +689,305 @@ spec:
   policyName: no-latest-tag
   validationActions: [Warn]
   matchResources:
-    namespaceSelector: {matchLabels: {policy.lab/images: pinned}}
+    namespaceSelector: {matchLabels: {lab-06-3/images: pinned}}
 EOF
-sleep 3; kubectl -n lab-06-2b run w1 --image=busybox -- sleep 60
-kubectl patch validatingadmissionpolicybinding no-latest-tag --type=merge -p '{"spec":{"validationActions":["Deny"]}}'; sleep 3
-for img in busybox busybox:latest busybox:1.37 localhost:5001/orders-api:2.0 localhost:5001/orders-api \
-           localhost:5001/orders-api@sha256:ad4f8fd2cabaef73e735d9a623a3499270fd5f3a5d7f640719bfd0982e772465; do
-  printf "%-40s -> " "${img:0:40}"; kubectl -n lab-06-2b run t-$RANDOM --image=$img -- sleep 60 2>&1 | tail -1 | cut -c1-110
+```
+
+| Часть команды | Значение |
+|---|---|
+| `label ns … lab-06-3/images=pinned` | метка, по которой привязка выбирает namespace |
+| `failurePolicy: Fail` | при ошибке выражения отклонять запрос |
+| `operations: [CREATE, UPDATE]` | проверять создание и обновление подов |
+| `c.image.contains('@sha256:')` | образ с дайджестом всегда принят |
+| `split('/')[size(…)-1]` | взять последний сегмент пути образа |
+| `.contains(':')` | в последнем сегменте должен быть тег |
+| `!c.image.endsWith(':latest')` | тег не `latest` |
+| `validationActions: [Warn]` | сначала только предупреждать |
+
+Тег ищется в последнем сегменте пути: иначе двоеточие порта реестра (`localhost:5001/…`) сошло бы за тег. Результат: `validatingadmissionpolicy … created`, `validatingadmissionpolicybinding … created`; строки ожидаемые.
+
+#### Шаг 2. Проверить режим Warn
+
+Команда запускает под с образом без тега в помеченном namespace.
+
+```bash
+sleep 3
+kubectl -n lab-06-3b run w1 --image=busybox -- sleep 60
+```
+
+Результат:
+
+```
+Warning: Validation failed for ValidatingAdmissionPolicy 'no-latest-tag' with binding 'no-latest-tag': образ без тега или с :latest запрещён: busybox
+```
+
+Разбор:
+
+1. `sleep 3` — пауза на загрузку политики в API-сервер.
+2. Предупреждение называет политику и привязку, а текст собран `messageExpression`.
+3. Под при этом создан, потому что действие — `Warn`.
+
+#### Шаг 3. Переключить на Deny и проверить шесть образов
+
+Команда меняет действие в привязке и по очереди создаёт поды с шестью образами. Для последнего вместо дайджеста стоит сокращение: подставьте свой.
+
+```bash
+kubectl patch validatingadmissionpolicybinding no-latest-tag --type=merge \
+  -p '{"spec":{"validationActions":["Deny"]}}'
+sleep 3
+DIGEST=sha256:ad4f8fd…   # свой дайджест из docker push
+for img in busybox busybox:latest busybox:1.37 localhost:5001/orders-api:2.0 \
+           localhost:5001/orders-api localhost:5001/orders-api@$DIGEST; do
+  printf "%-40s -> " "${img:0:40}"
+  kubectl -n lab-06-3b run t-$RANDOM --image=$img -- sleep 60 2>&1 | tail -1 | cut -c1-110
 done
 ```
 
-Дайджест `orders-api:2.0` у вас другой — возьмите из вывода `docker push` в 00-1 §4.1. Проверено: вывод в §3.
+| Часть команды | Значение |
+|---|---|
+| `patch … validationActions:["Deny"]` | теперь нарушения отклоняются |
+| `t-$RANDOM` | случайное имя пода |
+| `printf "%-40s -> "` | вывести образ в колонку шириной 40 |
+| `2>&1 \| tail -1 \| cut -c1-110` | взять последнюю строку и обрезать до 110 знаков |
 
-### Шаг 4. Сквозной сценарий: orders-api под restricted
+Результат:
 
-Добавьте в `~/lab/k8s/orders-api/k8s/orders-api.yaml` в шаблон пода `securityContext` из шага 1 (под и контейнер) и том `emptyDir` на `/tmp`, примените и проверьте dry-run ещё раз:
-
-```bash
-kubectl apply -f ~/lab/k8s/orders-api/k8s/orders-api.yaml && kubectl -n orders rollout status deploy/orders-api
-kubectl label --dry-run=server --overwrite ns orders pod-security.kubernetes.io/enforce=restricted
+```
+busybox                       -> … ValidatingAdmissionPolicy 'no-latest-tag' with binding 'no-latest-tag' denied request
+busybox:latest                -> … denied request
+busybox:1.37                  -> pod/… created
+localhost:5001/orders-api:2.0 -> pod/… created
+localhost:5001/orders-api     -> … denied
+localhost:5001/orders-api@sha256:ad4f8fd… -> pod/… created
 ```
 
-PostgreSQL официального образа запускается от root и меняет владельца каталога данных — под `restricted` он не пройдёт без доработки (`runAsUser: 70` для alpine-образа, `fsGroup`, initContainer для прав). ⚠️ Полный перевод `orders` на `restricted` на стенде не выполнялся — это задание со звёздочкой.
+Разбор:
 
-### Уборка
+1. `busybox` и `busybox:latest` отклонены: образа нет тега, либо тег `latest`.
+2. `busybox:1.37` создан: закреплённый тег принят.
+3. `orders-api:2.0` создан: порт `5001` лежит в предпоследнем сегменте, а тег `2.0` в последнем.
+4. `localhost:5001/orders-api` отклонён: двоеточие порта не принято за тег.
+5. Образ с дайджестом создан: он закреплён навсегда.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Привязка выбирает область через `namespaceSelector` | шаг 1 |
+| Warn показывает нарушения без отказов | шаг 2 |
+| Тег ищется в последнем сегменте пути | шаг 3, `localhost:5001/orders-api` |
+
+**Уборка.** Удаляем привязку, политику, метку и поды, созданные работой.
 
 ```bash
-kubectl delete validatingadmissionpolicybinding no-latest-tag; kubectl delete validatingadmissionpolicy no-latest-tag
-kubectl config set-context --current --namespace=default
-kubectl delete ns lab-06-2 lab-06-2b
+kubectl delete validatingadmissionpolicybinding no-latest-tag
+kubectl delete validatingadmissionpolicy no-latest-tag
+kubectl label ns lab-06-3b lab-06-3/images-
+kubectl -n lab-06-3b delete pod --all
 ```
 
+**Вопросы для самопроверки.**
+
+1. Почему политика без привязки ничего не проверяет?
+2. Зачем выражение ищет тег в последнем сегменте пути?
+3. Почему сначала включают `Warn`, а не `Deny`?
+
+<details>
+<summary>Ответ</summary>
+
+1. Политика хранит только логику. Область, параметры и действие задаёт привязка, и без неё API-сервер не знает, к чему применять правило.
+2. Порт реестра (`localhost:5001`) тоже содержит двоеточие. Без выбора последнего сегмента образ без тега прошёл бы проверку.
+3. Warn показывает, кого заденет правило, и ничего не ломает. Когда предупреждений нет, действие меняют на Deny.
+
+</details>
+
+### Лабораторная работа 4. MutatingAdmissionPolicy: значение по умолчанию на CEL
+
+Эту работу вы выполняете сами, результаты в ней — ожидаемые.
+
+**Риски.** Работа создаёт объекты уровня кластера: политику мутации и привязку.
+
+- **Что меняется:** `MutatingAdmissionPolicy` и привязка `lab-06-3-default-seccomp`, namespace `lab-06-3c` с метками.
+- **Надолго ли:** до уборки; мутация действует только на namespace с меткой `lab-06-3/mutate=on`.
+- **Безопасность:** мутация добавляет `seccompProfile` и метку, привилегий не нужно.
+- **Влияние на систему:** другие namespace не затронуты.
+- **Откат:** блок «Уборка». Нужен кластер версии 1.36 или новее: в старых версиях функция выключена, а версия API другая.
+
+**Цель.** Написать политику мутации, которая задаёт seccomp по умолчанию и добавляет метку, и увидеть, что PSA проверяет под уже после мутации.
+
+**Что понадобится.**
+
+- Kubernetes 1.36 (стенд).
+- Образ `busybox:1.37`.
+- Около 20 минут.
+
+**Схема опыта.**
+
+```
+kubectl run ──► MAP (mutating): добавить seccompProfile и метку
+            ──► PSA warn=restricted (validating): видит уже изменённый под
+```
+
+Схема 7. Мутация идёт раньше проверки, поэтому предупреждение PSA не упоминает seccomp.
+
+#### Шаг 1. Создать namespace, политику и привязку
+
+Команда создаёт namespace с PSA в режиме warn и политику с двумя мутациями.
+
+```bash
+kubectl create ns lab-06-3c
+kubectl label ns lab-06-3c lab-06-3/mutate=on \
+  pod-security.kubernetes.io/warn=restricted
+kubectl apply -f - <<'EOF'
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicy
+metadata: {name: lab-06-3-default-seccomp}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - {apiGroups: [""], apiVersions: [v1], operations: [CREATE], resources: [pods]}
+  matchConditions:
+  - name: no-seccomp
+    expression: "!has(object.spec.securityContext) ||
+      !has(object.spec.securityContext.seccompProfile)"
+  mutations:
+  - patchType: ApplyConfiguration
+    applyConfiguration:
+      expression: >-
+        Object{
+          spec: Object.spec{
+            securityContext: Object.spec.securityContext{
+              seccompProfile: Object.spec.securityContext.seccompProfile{
+                type: "RuntimeDefault"
+              }
+            }
+          }
+        }
+  - patchType: JSONPatch
+    jsonPatch:
+      expression: >-
+        [JSONPatch{op: "add",
+          path: "/metadata/labels/" + jsonpatch.escapeKey("lab-06-3/mutated"),
+          value: "true"}]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata: {name: lab-06-3-default-seccomp}
+spec:
+  policyName: lab-06-3-default-seccomp
+  matchResources:
+    namespaceSelector: {matchLabels: {lab-06-3/mutate: "on"}}
+EOF
+```
+
+| Часть команды | Значение |
+|---|---|
+| `warn=restricted` | PSA предупреждает о нарушениях restricted |
+| `matchConditions … no-seccomp` | мутировать, только если seccomp не задан |
+| `patchType: ApplyConfiguration` | слить указанные поля с объектом |
+| `Object.spec.securityContext{…}` | построить вложенный объект по схеме пода |
+| `patchType: JSONPatch` | выполнить операцию `add` |
+| `jsonpatch.escapeKey(…)` | экранировать `/` в имени метки |
+| `namespaceSelector` | область: только namespace с меткой |
+
+Результат: `namespace/lab-06-3c created`, `namespace/lab-06-3c labeled`, затем две строки `created` для политики и привязки; вывод ожидаемый.
+
+#### Шаг 2. Создать под и прочитать результат мутации
+
+Команда запускает под в помеченном namespace и читает поле seccomp и метки.
+
+```bash
+sleep 3
+kubectl -n lab-06-3c run m1 --image=busybox:1.37 -- sleep 60
+kubectl -n lab-06-3c get pod m1 \
+  -o jsonpath='{.spec.securityContext.seccompProfile.type}{"\n"}{.metadata.labels}{"\n"}'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `sleep 3` | пауза, пока API-сервер загрузит политику |
+| `run m1` | под без `securityContext` |
+| `jsonpath … seccompProfile.type` | значение, которое добавила мутация |
+| `.metadata.labels` | все метки пода |
+
+Ожидаемый результат (порядок ключей меток может быть другим):
+
+```
+Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false …
+pod/m1 created
+RuntimeDefault
+{"lab-06-3/mutated":"true","run":"m1"}
+```
+
+Разбор:
+
+1. Предупреждение PSA не упоминает `seccompProfile` — мутация выполнилась раньше проверки и закрыла это нарушение.
+2. В предупреждении остались остальные нарушения: их мутация не трогает.
+3. `RuntimeDefault` — значение из `ApplyConfiguration`.
+4. Метка `lab-06-3/mutated` — результат JSONPatch; ключ с `/` экранирован.
+
+#### Шаг 3. Проверить, что заданный seccomp не перезаписывается
+
+Команда создаёт под, в котором автор уже указал другой профиль.
+
+```bash
+kubectl -n lab-06-3c apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata: {name: m2, labels: {run: m2}}
+spec:
+  securityContext:
+    seccompProfile: {type: Unconfined}
+  containers:
+  - {name: c, image: "busybox:1.37", command: ["sleep", "60"]}
+EOF
+kubectl -n lab-06-3c get pod m2 -o jsonpath='{.spec.securityContext.seccompProfile.type}{"\n"}'
+```
+
+Ожидаемый результат:
+
+```
+Unconfined
+```
+
+Разбор: условие `matchConditions` не пропустило этот под, потому что `seccompProfile` уже задан. Значение автора осталось, и нарушение попало в предупреждение PSA. Без такого условия `ApplyConfiguration` перезаписал бы выбор автора.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| MAP меняет объект до проверки PSA | шаг 2, предупреждение без seccomp |
+| ApplyConfiguration добавляет поля, JSONPatch — точечные операции | шаг 2, значение и метка |
+| `matchConditions` защищают значения автора | шаг 3 |
+
+**Уборка.**
+
+```bash
+kubectl delete mutatingadmissionpolicybinding lab-06-3-default-seccomp
+kubectl delete mutatingadmissionpolicy lab-06-3-default-seccomp
+kubectl delete ns lab-06-3c lab-06-3 lab-06-3b
+```
+
+Удаление namespace удаляет все поды работ вместе с ним.
+
+**Вопросы для самопроверки.**
+
+1. Почему предупреждение PSA не называет seccomp?
+2. Зачем в политике условие `matchConditions`?
+3. Когда JSONPatch удобнее ApplyConfiguration?
+
+<details>
+<summary>Ответ</summary>
+
+1. Mutating admission идёт раньше validating. Когда PSA проверяет под, поле `seccompProfile` уже добавлено мутацией.
+2. Оно ограничивает мутацию подами без заданного поля. Без условия `ApplyConfiguration` перезаписал бы профиль, который указал автор манифеста.
+3. Когда нужна одна точная операция: заменить значение, удалить поле или проверить его через `test`. ApplyConfiguration удобнее для «добавить поле целиком».
+
+</details>
+
 ---
 
-## 🔥 Кейс из прода: «включили restricted — релиз “прошёл”, а подов нет»
+## → Дальше
 
-**Контекст.** Платформенная команда включила `enforce=restricted` на всех namespace команд в пятницу вечером. Работающие поды не пострадали. В понедельник утренний релиз сервиса прошёл в CI зелёным, но через полчаса упал трафик: при rolling update новые поды не создавались, старые постепенно убирались HPA при снижении нагрузки… а утром нагрузка выросла, и масштабироваться было нечем.
-
-**Разбор.**
-1. `kubectl get deploy` — `READY 2/6`, `kubectl describe rs` — `FailedCreate … violates PodSecurity "restricted:latest"` (как отказ квоты — событие у ReplicaSet, не у Deployment).
-2. CI проверял `kubectl apply`, а не `rollout status` (02-2, кейс).
-3. Включение enforce без этапа warn/audit и без dry-run по существующим namespace.
-
-**Фикс.**
-- Откат меток на `enforce=baseline`, `warn=restricted`, `audit=restricted`; список нарушений из `kubectl label --dry-run=server` по каждому namespace — командам.
-- В CI: `kubectl apply --dry-run=server` (PSA и политики проверяются на этом этапе — 00-2 §4) и `rollout status`.
-- Переход на enforce — по namespace, после нуля предупреждений за неделю.
-
-**Что запомнить.**
-- Enforce не трогает работающие поды — проблема всплывает на следующем rollout или масштабировании.
-- Внедрение: warn/audit → исправления → dry-run → enforce.
-- Ошибки admission у подов контроллеров видны в событиях ReplicaSet/Job.
-
----
-
-## 💼 Вопросы с собеседования
-
-### 🟢 Junior
-
-**1. Что делает `securityContext`?**
-Задаёт параметры безопасности процесса: пользователь (`runAsUser`, `runAsNonRoot`), capabilities, запрет повышения привилегий, seccomp, корень только для чтения. Без него контейнер получает дефолты рантайма — часто root.
-
-**2. Что такое Pod Security Standards?**
-Три уровня требований к подам: privileged, baseline, restricted. Pod Security Admission применяет их по меткам namespace в режимах enforce, warn, audit.
-
-### 🟡 Middle
-
-**3. Как безопасно включить restricted в существующем кластере?**
-Сначала `warn` и `audit` (ничего не ломают), сбор и исправление нарушений, `kubectl label --dry-run=server` для проверки существующих подов, затем `enforce` по namespace. В CI — `apply --dry-run=server` и `rollout status`.
-
-**4. Как запретить образы с тегом latest?**
-ValidatingAdmissionPolicy с CEL-выражением по `spec.containers[].image` (тег в последнем сегменте, дайджест разрешён) и привязкой к нужным namespace; сначала `Warn`, потом `Deny`. Альтернатива — Kyverno/Gatekeeper.
-
-### 🔴 Senior
-
-**5. ValidatingAdmissionPolicy или вебхук?**
-VAP — в apiserver, без сетевого вызова и без риска «упал вебхук — кластер не принимает изменения»; только проверка. Вебхук нужен для мутации, генерации объектов, внешних данных, проверки подписей. Часто — VAP для простых правил и Kyverno для остального, с `failurePolicy` и исключениями для системных namespace.
-
-**6. Почему под может нарушить PodSecurity, хотя манифест автора корректен?**
-Mutating admission выполняется раньше validating: вебхук-инжектор (sidecar mesh'а, агент) может добавить контейнер без нужного `securityContext`. Лечится настройкой инжектора или его исправлением, а не ослаблением уровня.
-
-**7. Что сделать, чтобы сервис работал с `readOnlyRootFilesystem: true`?**
-Найти, куда он пишет (временные файлы, кэш, pid, сокеты), и смонтировать туда `emptyDir` (при необходимости `medium: Memory`); логи — в stdout. Код обычно менять не нужно.
-
----
-
-## ⚠️ Подводные камни
-
-- Enforce не проверяет работающие поды — ломается следующий rollout.
-- Ошибки PSA и политик у подов контроллеров — в событиях ReplicaSet, а не Deployment.
-- `enforce-version: latest` меняет требования вместе с обновлением кластера; для предсказуемости фиксируйте версию.
-- `readOnlyRootFilesystem` без `emptyDir` для `/tmp` ломает многие приложения.
-- Официальные образы БД часто требуют root на старте — под restricted нужна доработка.
-- Двоеточие порта реестра — не тег; проверяйте последний сегмент пути образа.
-- Мутирующие вебхуки могут сделать под несовместимым с уровнем PodSecurity.
-
----
-
-## Чеклист
-
-- [ ] Соберу `securityContext`, проходящий restricted, и проверю его внутри контейнера.
-- [ ] Включу PSA по меткам namespace в режимах warn/audit/enforce.
-- [ ] Проверю существующий namespace dry-run'ом перед enforce.
-- [ ] Напишу ValidatingAdmissionPolicy на CEL и внедрю её через Warn → Deny.
-- [ ] Объясню порядок admission и разницу VAP и вебхуков.
-
----
-
-## Задание со звёздочкой
-
-Переведите namespace `orders` на `restricted` полностью:
-
-1. orders-api — `securityContext` из лабы.
-2. PostgreSQL: `runAsUser`/`runAsGroup` 70 (пользователь `postgres` в alpine-образе), `fsGroup: 70`, `PGDATA` в подкаталоге тома, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, seccomp. Проверьте, что старый том читается (владелец файлов!).
-3. `kubectl label ns orders pod-security.kubernetes.io/enforce=restricted` без предупреждений, `rollout restart` обоих, сквозной `curl` — 200.
-4. Задайте ту же проверку в CI (`apply --dry-run=server` на namespace с меткой enforce).
-
----
-
-→ Следующая часть: **07-1. Helm: чарты и релизы** — модуль «Пакетирование»: чарт orders-api, values и шаблоны, `helm template/lint/diff`, где Helm хранит релизы, `--atomic` и откат, «another operation is in progress» и выход из pending-upgrade; Helm 4 стенда.
+Мы научились решать, какой объект кластер примет и как его изменит, но пока не знаем, кто и когда эти решения принимал. Следующая часть, 06-4, добавляет журнал: аудит API-сервера записывает запросы и аннотации нарушений, которые мы здесь упоминали. На него же опираются политики образов: разрешённые реестры, дайджесты и проверка подписи, где те же VAP и вебхуки работают с содержимым, а не с полями пода.
