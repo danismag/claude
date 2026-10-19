@@ -204,7 +204,7 @@ A шпаргалки (kubectl, Helm, Kustomize, argocd, crictl, etcdctl, kubeadm
 | Часть | Источник вывода | Версии | Что не проверено |
 |---|---|---|---|
 | 02-1 | прогон 2026-10-14, машина автора | kind 0.32.0, k8s 1.36.1 | места, перечисленные ревью пробной части |
-| 03-2, работа 1 | прогон 2026-10-14, машина автора | kind 0.32.0, k8s 1.36.1 | места, перечисленные ревью пробной лабораторной |
+| 03-2, работа 1 | прогон 2026-10-14 (шаги 3–7); ревью по kubernetes/website и коду kube-proxy | kind 0.32.0, k8s 1.36.1 | сообщения kubectl в шагах 1–2 и уборке; время второго отказа (шаг 7); вывод шага 8; вид `describe endpointslice` с `Ready: false`; удаление ns ~30 с |
 
 Непроверенное в старой версии (останется таким, пока способ проверки не согласован): установка на Ubuntu; kubectx, kubens, stern, k9s, krew; CronJob «too many missed start times»; LoadBalancer в kind; NodeLocal DNSCache; `ingress2gateway`; AdminNetworkPolicy; KMS v2; снапшоты CSI; Prometheus Adapter, Cluster Autoscaler, Karpenter; graceful node shutdown; MutatingAdmissionPolicy; `helm push` в OCI и `helm diff`; UI Argo CD, генератор `pullRequest`, ESO, SOPS, Sealed Secrets; pluto и kubent; managed-кластеры.
 

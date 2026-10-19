@@ -35,6 +35,14 @@ client (под) ──► DNS: orders ──► ClusterIP:80 ──► прав�
 
 Схема показывает путь пакета. Первая поломка рвёт его на EndpointSlice, вторая — в самом поде.
 
+**Риски.** Работа меняет только кластер стенда и одну настройку на хосте.
+
+- **Что меняется:** в кластере kind — namespace `lab-03-2` с подами и Service; на хосте — namespace по умолчанию у контекста `kind-lab` в `~/.kube/config`.
+- **Надолго ли:** до уборки; уборка удаляет namespace и возвращает `default`.
+- **Безопасность:** привилегий не нужно; `docker exec … iptables-save` только читает правила узла.
+- **Влияние на систему:** другие контексты kubectl и рабочие кластеры не затрагиваются.
+- **Откат:** блок «Уборка» в конце работы.
+
 #### Шаг 1. Создать namespace
 
 Создаём отдельный **namespace** (пространство имён, логическая папка объектов кластера) и делаем его текущим. Так все объекты работы лежат в одном месте и удаляются одной командой.
@@ -117,18 +125,20 @@ kubectl rollout status deploy/orders
 ```
 deployment.apps/orders created
 service/orders created
+Waiting for deployment "orders" rollout to finish: 0 of 2 updated replicas are available...
+…
 deployment "orders" successfully rolled out
 ```
 
 Разбор вывода:
 
-1. Deployment создан, оба пода запущены и прошли проверку готовности (**Ready** — под готов принимать трафик).
+1. Deployment создан. Строки `Waiting for…` идут, пока узлы скачивают образ и поды проходят проверку; при повторном запуске их может не быть. Последняя строка — оба пода запущены и прошли проверку готовности (**Ready** — под готов принимать трафик).
 2. Service создан без ошибок: Kubernetes не проверяет, что селектор что-то выбирает.
 3. Приложение здорово. Проблема только в связи Service с подами.
 
 #### Шаг 3. Найти пустой EndpointSlice
 
-Первым делом при жалобе «Service не отвечает» проверяют **эндпоинты** (endpoints) — адреса подов, на которые Service отправляет трафик. Контроллер хранит их в объектах **EndpointSlice** (срез эндпоинтов): один объект вмещает до 100 адресов. Смотрим Service, его EndpointSlice и описание.
+Первым делом при жалобе «Service не отвечает» проверяют **эндпоинты** (endpoints) — адреса подов, на которые Service отправляет трафик. Контроллер хранит их в объектах **EndpointSlice** (срез эндпоинтов): по умолчанию один объект вмещает до 100 адресов. Смотрим Service, его EndpointSlice и описание.
 
 ```bash
 kubectl get svc,endpointslice
@@ -191,6 +201,7 @@ probe orders 80
 | `--command -- sleep infinity` | держать под живым, ничего не делая |
 | `wait --for=condition=Ready` | ждать готовности пода |
 | `probe orders 80` | подключиться к имени `orders`, порт 80 |
+| `python -c '…' "$@"` | аргументы функции попадают в `sys.argv[1]` и `sys.argv[2]` |
 | `timeout=5` | ждать соединения не дольше 5 с |
 
 Результат:
@@ -205,7 +216,7 @@ ConnectionRefusedError [Errno 111] Connection refused
 1. Имя `orders` разрешилось в ClusterIP, поэтому ошибки DNS нет.
 2. `Connection refused` — активный отказ, а не молчание.
 3. Отказ пришёл за 0,02 с. Таймаут в 5 с означал бы потерянные пакеты (NetworkPolicy, маршрутизация, 03-5).
-4. Правило: мгновенный отказ при пустом EndpointSlice — это не проблема сети.
+4. Мгновенный отказ при пустом EndpointSlice — это не проблема сети.
 
 #### Шаг 5. Найти правило REJECT на узле
 
@@ -226,13 +237,14 @@ docker exec lab-worker iptables-save | grep 'lab-03-2/orders'
 Результат:
 
 ```
--A KUBE-SERVICES -d 10.96.88.241/32 -p tcp -m comment --comment "lab-03-2/orders has no endpoints" \
-  -m tcp --dport 80 -j REJECT --reject-with icmp-port-unreachable
+-A KUBE-SERVICES -d 10.96.88.241/32 -p tcp -m comment --comment "lab-03-2/orders has no endpoints" -m tcp --dport 80 -j REJECT --reject-with icmp-port-unreachable
 ```
 
-Разбор вывода (в реальном выводе правило идёт одной строкой):
+Строка вывода длинная, но приведена целиком: так её печатает `iptables-save`.
 
-1. `-A KUBE-SERVICES` — правило добавлено в цепочку, через которую проходит трафик к Service.
+Разбор вывода:
+
+1. `-A KUBE-SERVICES` — правило в цепочке `KUBE-SERVICES` таблицы `filter`. Цепочка с тем же именем есть и в таблице `nat`, но правила отказа kube-proxy пишет в `filter`; `grep` скрывает заголовок таблицы.
 2. `-d 10.96.88.241/32 … --dport 80` — условие: адрес и порт нашего Service.
 3. Комментарий `has no endpoints` — kube-proxy сам пишет причину.
 4. `-j REJECT --reject-with icmp-port-unreachable` — действие: отказ с ICMP-ответом «порт недоступен». Клиент видит `Connection refused` сразу.
@@ -268,7 +280,7 @@ orders-9vf5b   IPv4          8000    10.244.3.8,10.244.2.10   12s
 
 Разбор вывода:
 
-1. Service изменён. Контроллер EndpointSlice пересчитал адреса за доли секунды.
+1. Service изменён. Контроллер EndpointSlice сразу пересчитал адреса.
 2. Тот же объект `orders-9vf5b` теперь содержит два адреса: IP двух подов.
 3. В колонке `PORTS` стоит `8000`: имя `http` из `targetPort` превратилось в номер порта контейнера.
 4. Код `200` — запрос прошёл через ClusterIP до пода.
@@ -300,15 +312,15 @@ service/orders patched
 NAME           ADDRESSTYPE   PORTS   ENDPOINTS                AGE
 orders-9vf5b   IPv4          8080    10.244.2.10,10.244.3.8   15s
 ConnectionRefusedError [Errno 111] Connection refused
-0.020s
+…
 ```
 
 Разбор вывода:
 
 1. Адреса в EndpointSlice на месте, порт изменился на `8080`.
-2. Симптом прежний — `Connection refused`. Причина другая.
-3. Пакет дошёл до пода. Отказ послало ядро пода: на порту 8080 нет процесса.
-4. Различие читается по EndpointSlice: пусто — ищите селектор или готовность подов; адреса есть, порт чужой — ищите `targetPort`.
+2. Симптом прежний — `Connection refused`, время ответа снова порядка миллисекунд (последняя строка). Причина другая.
+3. Пакет дошёл до пода. Отказ послало ядро пода: на порту 8080 нет процесса, и ядро ответило TCP RST, а не ICMP.
+4. Различие читается по EndpointSlice: пусто — ищите селектор; адреса есть, но не готовы — ищите readiness; адреса готовы, порт чужой — ищите `targetPort`.
 
 #### Шаг 8. Задать targetPort по имени
 
@@ -342,7 +354,7 @@ orders-9vf5b   IPv4          8000    10.244.2.10,10.244.3.8   30s
 Разбор вывода:
 
 1. Имя `http` снова разрешено в номер 8000 по описанию порта в поде.
-2. Адреса не менялись, поэтому поды не перезапускались.
+2. Адреса те же: правка Service не трогает поды, они не перезапускались.
 3. Ответ `200` подтверждает: Service работает.
 
 #### Итог
@@ -353,7 +365,8 @@ orders-9vf5b   IPv4          8000    10.244.2.10,10.244.3.8   30s
 |---|---|
 | Service без эндпоинтов отвечает мгновенным отказом | `probe orders 80`, время около 0,02 с |
 | Причина отказа — правило REJECT в kube-proxy | `iptables-save` на узле |
-| Пустой EndpointSlice значит: селектор или готовность | `kubectl get endpointslice -l …` |
+| Пустой EndpointSlice значит: селектор не совпал | `kubectl get endpointslice -l …` |
+| Неготовые поды видны в EndpointSlice с `ready: false` | `kubectl describe endpointslice -l …` |
 | Адреса есть, отказ есть: неверный `targetPort` | колонка `PORTS` в EndpointSlice |
 | Имя порта надёжнее числа | `targetPort: http` |
 
@@ -376,15 +389,15 @@ namespace "lab-03-2" deleted
 Error from server (NotFound): namespaces "lab-03-2" not found
 ```
 
-Разбор вывода: последняя строка подтверждает, что namespace удалён, а с ним Deployment, Service, EndpointSlice и клиентский под.
+Разбор вывода: последняя строка подтверждает, что namespace удалён, а с ним Deployment, Service, EndpointSlice и клиентский под. Удаление может занять около 30 с: процессы `sleep` и `python` работают в контейнерах как PID 1 и не обрабатывают SIGTERM, поэтому kubelet ждёт конца периода остановки (по умолчанию 30 с).
 
 #### Вопросы для самопроверки
 
-1. Service создан, `curl` отказывает за 20 мс. Какую команду выполните первой и что она покажет?
+1. Service создан, клиент получает отказ за 20 мс. Какую команду выполните первой и что она покажет?
 
 <details><summary>Ответ</summary>
 
-`kubectl get endpointslice -l kubernetes.io/service-name=<имя>`. Пустые `PORTS` и `ENDPOINTS` означают, что Service не нашёл ни одного готового пода: ошибка в селекторе или поды не Ready. Если адреса есть, проверяйте `targetPort`.
+`kubectl get endpointslice -l kubernetes.io/service-name=<имя>`. Пустые `PORTS` и `ENDPOINTS` означают, что селектор не выбрал ни одного пода. Если адреса есть, проверьте их готовность (`kubectl describe endpointslice`, поле `Ready`), а затем `targetPort`.
 
 </details>
 
@@ -416,10 +429,6 @@ kube-proxy ставит для такого Service правило REJECT с ICM
 
 <details><summary>Ответ</summary>
 
-Адреса не попадут в EndpointSlice как готовые, список будет пуст. Симптом тот же, что при опечатке в селекторе: kube-proxy поставит REJECT. Отличие видно в `kubectl get pods`: у подов в колонке `READY` будет `0/1`.
+Адреса подов останутся в EndpointSlice, но с условием `ready: false`, и колонка `ENDPOINTS` в `kubectl get endpointslice` их всё равно покажет. Готовых адресов нет, поэтому kube-proxy поставит то же правило REJECT, и симптом совпадёт с опечаткой в селекторе. Отличие видно в `kubectl describe endpointslice` (`Ready: false`) и в `kubectl get pods`: в колонке `READY` будет `0/1`.
 
 </details>
-
----
-
-→ Дальше: в этой работе клиент ходил к Service изнутри кластера. Следующий вопрос — как Service принимает трафик снаружи и что при этом происходит с адресом клиента. Его решает политика `externalTrafficPolicy`, которая разбирается в следующей лабораторной работе этой части.
