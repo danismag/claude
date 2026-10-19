@@ -4,7 +4,7 @@
 
 ## Где мы на карте
 
-Эта часть разбирает kube-scheduler: как он выбирает узел для пода и какие правила размещения ему можно задать. Она опирается на три части. В 01-1 scheduler назван компонентом control plane, в 01-2 разобраны taint'ы узла и вытеснение с `tolerationSeconds`, в 05-1 requests названы единственными числами, по которым scheduler считает место на узле.
+Эта часть разбирает kube-scheduler: как он выбирает узел для пода и какие правила размещения ему можно задать. Она опирается на три части. В 01-1 scheduler назван компонентом control plane. В 01-2 разобраны taint'ы узла и вытеснение с `tolerationSeconds`. В 05-1 requests названы числами, по которым scheduler считает место на узле.
 
 Следующие части используют то, что здесь решает scheduler. Автомасштабирование (05-4) реагирует на поды, для которых не нашлось узла, а drain и PodDisruptionBudget (05-5) перемещают поды, и scheduler снова выбирает им места.
 
@@ -27,7 +27,7 @@
 
 **Планировщик** (scheduler, процесс `kube-scheduler`) берёт каждый под без поля `spec.nodeName` и записывает в него имя узла. Выбор идёт в три действия: отбросить узлы, где под не сможет работать, оценить оставшиеся и привязать под к лучшему. Kubelet на выбранном узле видит свой новый под и запускает его (01-2).
 
-Узлы отбрасывают по правилам пяти видов: хватает ли свободных requests (05-1), совпадают ли метки, пускает ли taint, подходит ли топология и доступны ли том и устройство. Всё остальное, например образ или язык приложения, scheduler не проверяет.
+Узлы отбрасывают по правилам пяти видов. Хватает ли свободных requests (05-1), совпадают ли метки, пускает ли taint, подходит ли топология, доступны ли том и устройство. Всё остальное, например образ или язык приложения, scheduler не проверяет.
 
 ### Что планировщик знает и чего не знает
 
@@ -61,7 +61,7 @@ Scheduler решает при создании пода и больше его �
                          список неподходящих ◄── Pending
 ```
 
-Схема 2. Точки расширения scheduler (жирные названия плагинов в документации): PreEnqueue пускает под в очередь, Filter и Score выбирают узел, PostFilter включается, когда узлов нет.
+Схема 2. Точки расширения scheduler слева направо: PreEnqueue пускает под в очередь, Filter и Score выбирают узел, PostFilter включается, когда узлов нет.
 
 ### Фильтры и оценка
 
@@ -83,7 +83,7 @@ Scheduler решает при создании пода и больше его �
 
 Под в списке неподходящих ждёт события, которое может помочь. Раньше любое событие кластера (новый узел, удалённый под) возвращало в очередь все такие поды, и scheduler тратил время на заведомо бесполезные попытки. Теперь каждый плагин сообщает **подсказку** (QueueingHint): помогает ли это событие именно этому поду.
 
-Пример: под отброшен из-за taint, и плагин TaintToleration возвращает его в очередь только при событии «у узла изменились taint'ы», а удаление чужого пода его не интересует. Подсказки включены всегда, они стали GA в 1.34, а настройки у них нет. Если событий нет, под всё равно возвращается в очередь не позже чем через 5 минут.
+Пример: под отброшен из-за taint. Плагин TaintToleration вернёт его в очередь при событии «у узла изменились taint'ы», а удаление чужого пода его не интересует. Подсказки включены всегда, они стали GA в 1.34, настройки у них нет. Если событий нет, под всё равно возвращается в очередь не позже чем через 5 минут.
 
 ### Scheduling gates: под, который ждёт разрешения
 
@@ -192,7 +192,7 @@ affinity:
 
 ### Рядом и врозь: pod affinity и anti-affinity
 
-**Pod affinity** (привязка к подам) тянет под к узлу или зоне, где уже есть нужные поды, а **pod anti-affinity** (отталкивание от подов) не пускает туда, где они есть. Область действия задаёт `topologyKey`: метка узла, значение которой определяет «домен» (по hostname домен — один узел, по зоне — вся зона).
+**Pod affinity** (привязка к подам) тянет под туда, где уже есть нужные поды. **Pod anti-affinity** (отталкивание от подов) не пускает под туда, где они есть. Область действия задаёт `topologyKey`: метка узла, чьё значение определяет «домен». По hostname домен — один узел, по зоне — вся зона.
 
 ```yaml
 affinity:
@@ -271,7 +271,7 @@ tolerations:
 
 **PriorityClass** (класс приоритета) — объект кластера с числом: чем оно больше, тем важнее поды. Под называет класс в `priorityClassName`, а число копируется в `spec.priority`. Поды без класса получают приоритет 0, если ни у одного класса нет `globalDefault: true`.
 
-Когда подходящего узла нет, включается **вытеснение** (preemption). Scheduler ищет узел, на котором удаление подов с меньшим приоритетом освободит место, и удаляет минимально нужные поды: по правилам graceful shutdown и с учётом PodDisruptionBudget по мере возможности (05-5). Новому поду записывается `status.nominatedNodeName`, чтобы место за ним сохранилось, пока жертвы завершаются. С версии 1.33 вытеснение асинхронное (beta, включено): цикл планирования не ждёт удаления.
+Когда подходящего узла нет, включается **вытеснение** (preemption). Scheduler ищет узел, где удаление подов с меньшим приоритетом освободит место, и удаляет минимально нужные. Поды завершаются штатно, а PodDisruptionBudget учитывается по мере возможности (05-5). Новому поду записывается `status.nominatedNodeName`, чтобы место за ним сохранилось, пока жертвы завершаются. С версии 1.33 вытеснение асинхронное (beta, включено): цикл планирования не ждёт удаления.
 
 ```yaml
 apiVersion: scheduling.k8s.io/v1
@@ -358,9 +358,9 @@ anti-affinity rules. no new claims to deallocate, preemption: 0/4 nodes are avai
 
 | Фрагмент сообщения | Причина | Где смотреть |
 |---|---|---|
-| Insufficient cpu / memory | requests не помещаются | 05-1, `describe node` |
-| had untolerated taint(s) | у узла taint без toleration | `describe node` |
-| didn't match Pod's node affinity/selector | нет подходящей метки узла | `get nodes --show-labels` |
+| Insufficient cpu / memory | requests не помещаются | 05-1, describe node |
+| had untolerated taint(s) | у узла taint без toleration | describe node |
+| didn't match Pod's node affinity/selector | нет подходящей метки узла | get nodes --show-labels |
 | didn't match pod anti-affinity rules | узлы заняты подами из правила | селектор правила |
 | didn't match pod topology spread constraints | нарушится maxSkew | §5, правило spread |
 | had volume node affinity conflict | том привязан к другому узлу | 04-2 |
@@ -425,11 +425,11 @@ Rollout Deployment с жёстким spread по узлам зависает, х
 | Prioritized list, admin access | GA | 1.36 |
 | Extended resource, device taints (DRA) | GA | 1.37 |
 
-Версия 1.37 на стенд не берётся: функции DRA из последней строки на стенде 1.36 в beta и включены, но проверять их без устройств нельзя.
+Версия 1.37 на стенд не берётся. Функции DRA из последней строки на стенде 1.36 находятся в beta и включены, но без устройств проверить их нельзя.
 
 ### Чего планировщик не делает
 
-Scheduler не перепланирует работающие поды, не измеряет нагрузку и не вытесняет поды ради устройств DRA. Групповое планирование (**gang scheduling**, все поды задания стартуют вместе или никто) в ядре Kubernetes пока в beta, для заданий машинного обучения его дают очереди вроде Kueue. Перекос после массовых операций исправляют descheduler с политикой `RemovePodsViolatingTopologySpreadConstraint` или rollout.
+Scheduler не перепланирует работающие поды, не измеряет нагрузку и не вытесняет поды ради устройств DRA. Групповое планирование (**gang scheduling**, когда все поды задания стартуют вместе или никто) в ядре Kubernetes пока в beta. Для заданий машинного обучения его дают очереди вроде Kueue. Перекос после массовых операций исправляют descheduler с политикой `RemovePodsViolatingTopologySpreadConstraint` или rollout.
 
 ---
 
@@ -561,14 +561,14 @@ kubectl get nodes -L lab-05-3/zone
 node/lab-worker labeled
 node/lab-worker2 labeled
 node/lab-worker3 labeled
-NAME                 STATUS   ROLES           …   ZONE
+NAME                 STATUS   ROLES           …   LAB-05-3/ZONE
 lab-control-plane    Ready    control-plane   …
 lab-worker           Ready    <none>          …   zone-a
 ```
 
 Разбор вывода:
 
-1. Три узла помечены; колонка в выводе называется по метке.
+1. Три узла помечены; колонка называется по ключу метки.
 2. У control-plane значение пусто, поэтому домена зоны для него нет.
 
 #### Шаг 2. Шесть реплик без правил
@@ -687,7 +687,7 @@ lab-worker2:Running×2 lab-worker3:Running×1 lab-worker:Running×3
 | 6 реплик без правил | расклад 3/2/1 | встроенный spread мягкий |
 | 4 реплики, required anti-affinity | 3 Running, 1 Pending | реплик больше узлов — лишние ждут |
 | Событие FailedScheduling | причина по каждой группе узлов | читать по группам и итогу вытеснения |
-| 6 реплик, maxSkew 1 по зоне | 3 в `zone-a`, 3 в `zone-b` | spread считает домены, а не узлы |
+| 6 реплик, maxSkew 1 по зоне | по 3 пода в каждой зоне | spread считает домены, а не узлы |
 
 **Уборка.**
 
@@ -798,7 +798,7 @@ kubectl get events --field-selector reason=FailedScheduling \
 0/4 nodes are available: … 3 node(s) didn't match pod topology spread constraints. …
 ```
 
-Разбор вывода: три worker'а отброшены правилом spread. Старые и новый поды считаются вместе, на worker'е вышло бы 2 пода при минимуме 0 на control-plane, то есть перекос 2 против допустимого 1 (§5).
+Разбор вывода: три worker'а отброшены правилом spread. Старые и новый поды считаются вместе. На worker'е вышло бы 2 пода при минимуме 0 на control-plane, то есть перекос 2 против допустимого 1 (§5).
 
 #### Шаг 3. Вылечить через matchLabelKeys
 
@@ -839,7 +839,7 @@ deployment "hs-mlk" successfully rolled out
 | Что делали | Что увидели | Вывод |
 |---|---|---|
 | rollout при `maxSkew: 1` по узлам | surge-под Pending, rollout стоит | старые и новые поды считаются вместе |
-| Событие FailedScheduling | `didn't match pod topology spread constraints` | правило spread отбрасывает все worker'ы |
+| Событие FailedScheduling | сообщение про topology spread constraints | правило spread отбрасывает все worker'ы |
 | То же с `matchLabelKeys` | rollout проходит | счёт ведётся по ревизиям |
 
 **Уборка.**
@@ -1038,7 +1038,7 @@ lab-worker3         <none>
 | Что делали | Что увидели | Вывод |
 |---|---|---|
 | NoSchedule | новый под Pending, старые остались | влияет только на новые поды |
-| NoExecute | `t-plain` выселен сразу | работающие поды без toleration уходят |
+| NoExecute | под без toleration выселен сразу | работающие поды без toleration уходят |
 | `tolerationSeconds: 20` | выселен через 20 секунд | задержка считается от появления taint |
 | Toleration без секунд | под остался | терпимость бессрочная |
 
@@ -1119,7 +1119,8 @@ spec:
         resources: {requests: {cpu: "10"}}
 EOF
 kubectl rollout status deploy/batch
-kubectl get pods -l app=batch -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName,PRIO:.spec.priority
+kubectl get pods -l app=batch \
+  -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName,PRIO:.spec.priority
 ```
 
 Разбор команд:
@@ -1150,7 +1151,8 @@ kubectl run critical --image=registry.k8s.io/pause:3.10 --overrides='{"spec":{
   "priorityClassName":"lab-05-3-high","containers":[{"name":"critical",
   "image":"registry.k8s.io/pause:3.10","resources":{"requests":{"cpu":"10"}}}]}}'
 kubectl wait --for=condition=Ready pod/critical
-kubectl get events --field-selector reason=Preempted -o custom-columns=OBJ:.involvedObject.name,MSG:.message
+kubectl get events --field-selector reason=Preempted \
+  -o custom-columns=OBJ:.involvedObject.name,MSG:.message
 kubectl get pods -l app=batch
 ```
 
@@ -1168,7 +1170,7 @@ kubectl get pods -l app=batch
 ```
 critical Ready after 1s on lab-worker3
 batch-55c5fc9bfc-drfgg   Preempted by pod d93570d8-… on node lab-worker3
-batch-55c5fc9bfc-9x8g8   Pending — 3 Insufficient cpu ... 1 No preemption victims found for incoming pod
+batch-55c5fc9bfc-9x8g8   Pending — 3 Insufficient cpu … No preemption victims found …
 ```
 
 Разбор вывода:
@@ -1350,11 +1352,11 @@ No resources found
 
 | Что делали | Что ожидаем | Вывод |
 |---|---|---|
-| Под со шлюзом | `SchedulingGated`, событий нет | шлюз держит под вне очереди |
+| Под со шлюзом | статус SchedulingGated, событий нет | шлюз держит под вне очереди |
 | Снятие шлюза | под получает узел | снимает шлюз внешний контроллер |
 | Spread с `Ignore` | 3 Running, 1 Pending | control-plane считается доменом |
 | Spread с `Honor` | 4 Running | узлы с taint'ом не считаются |
-| `get deviceclasses` | `No resources found` | DRA включён, устройств нет |
+| Запрос классов DRA | No resources found | DRA включён, устройств нет |
 
 **Уборка.**
 
@@ -1380,4 +1382,4 @@ Namespace и каталог удалены, текущий namespace конте�
 
 ## → Дальше
 
-Scheduler решает один раз и по requests, поэтому поды, для которых места нет, остаются Pending. Следующая часть, 05-4, показывает, как кластер реагирует на это автоматически: HPA меняет число реплик по нагрузке, а Cluster Autoscaler и Karpenter добавляют узлы для подов, которые scheduler не смог разместить. Без понимания requests и условия `Unschedulable`, разобранных здесь, не понять, чем сигнал к масштабированию отличается от обычной задержки старта.
+Scheduler решает один раз и по requests, поэтому поды без места остаются Pending. Следующая часть, 05-4, показывает, как кластер реагирует на это автоматически. HPA меняет число реплик по нагрузке, а Cluster Autoscaler и Karpenter добавляют узлы для подов, которые scheduler не смог разместить. Без requests и причины `Unschedulable`, разобранных здесь, не понять, чем сигнал к масштабированию отличается от обычной задержки старта.
