@@ -869,11 +869,11 @@ done
 
 ```
 busybox:1.37                           -> Error from server (Forbidden): pods "t-…" …
-docker.io/library/busybox:1.37                -> Error from server (Forbidden): pods "t-…" is forbidden: …
-localhost:5001/busybox:1.37                   -> pod/t-… created (server dry run)
-localhost:5001/orders-api:2.0                 -> pod/t-… created (server dry run)
-registry.k8s.io/pause:3.10                    -> pod/t-… created (server dry run)
-registry.k8s.io.example.com/pause:3.10        -> Error from server (Forbidden): pods "t-…" is forbidden: …
+docker.io/library/busybox:1.37                -> Error from server (Forbidden): …
+localhost:5001/busybox:1.37                   -> pod/t-… created (dry run)
+localhost:5001/orders-api:2.0                 -> pod/t-… created (dry run)
+registry.k8s.io/pause:3.10                    -> pod/t-… created (dry run)
+registry.k8s.io.example.com/pause:3.10        -> Error from server (Forbidden): …
 ```
 
 Разбор вывода:
