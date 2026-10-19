@@ -273,17 +273,24 @@ PostgreSQL записывает пароль суперпользователя 
 
 Значения по умолчанию задаёт автор чарта, поэтому их число отличается у каждого чарта. Ниже — значения `groundhog2k/postgres` 1.6.8 и ограничения самого подхода.
 
-### Значения чарта
+### Значения чарта: под и доступ
+
+Первая группа значений определяет, что и с какими правами запускается.
 
 - **Образ.** Реестр `docker.io`, репозиторий `postgres`, тег пустой (берётся `appVersion`, здесь `18.6`), политика загрузки `IfNotPresent`.
 - **Пароль.** Не задан: без `settings.superuserPassword` или `settings.existingSecret` под не стартует. Имя суперпользователя по умолчанию `postgres`.
-- **Тип и диск.** StatefulSet (режим Deployment включает ключ `useDeployment`), режим доступа ReadWriteOnce, размер задаёт `storage.requestedSize`; без него том будет `emptyDir` и данные пропадут вместе с подом.
-- **Каталог данных.** Том монтируется в `/var/lib/postgresql/data`, а `PGDATA` равен `/var/lib/postgresql/data/pg` (ключи `settings.dataDir` и `settings.pgDir`). Образ PostgreSQL 18 сменил свой `PGDATA` на `/var/lib/postgresql/18/docker`, но чарт задаёт переменную явно, поэтому для 17 и 18 путь одинаков.
-- **Пробы.** Все три запускают `pg_isready -h localhost`; startup даёт до 30 попыток с периодом 10 с, liveness и readiness — 3 неудачи по 10 с.
-- **Судьба PVC.** `persistentVolumeClaimRetentionPolicy` пуст, поэтому действует поведение Kubernetes по умолчанию: PVC сохраняется при удалении и при уменьшении числа реплик (02-3).
-- **Запросы ресурсов.** Пусто: под получает класс QoS BestEffort (05-1).
 - **Безопасность.** Процесс идёт от uid и gid 999, корневая файловая система только для чтения, повышение привилегий запрещено, все capabilities сброшены.
 - **Порт.** Service типа ClusterIP, порт 5432.
+- **Пробы.** Все три запускают `pg_isready -h localhost`; startup даёт до 30 попыток с периодом 10 с, liveness и readiness — 3 неудачи по 10 с.
+
+### Значения чарта: данные и ресурсы
+
+Вторая группа определяет, где лежат данные и сколько ресурсов получает под.
+
+- **Тип и диск.** StatefulSet (режим Deployment включает ключ `useDeployment`), режим доступа ReadWriteOnce, размер задаёт `storage.requestedSize`; без него том будет `emptyDir` и данные пропадут вместе с подом.
+- **Каталог данных.** Том монтируется в `/var/lib/postgresql/data`, а `PGDATA` равен `/var/lib/postgresql/data/pg` (ключи `settings.dataDir` и `settings.pgDir`). Образ PostgreSQL 18 сменил свой `PGDATA` на `/var/lib/postgresql/18/docker`, но чарт задаёт переменную явно, поэтому для 17 и 18 путь одинаков.
+- **Судьба PVC.** `persistentVolumeClaimRetentionPolicy` пуст, поэтому действует поведение Kubernetes по умолчанию: PVC сохраняется при удалении и при уменьшении числа реплик (02-3).
+- **Запросы ресурсов.** Пусто: под получает класс QoS BestEffort (05-1).
 
 ### Ограничения подхода
 
@@ -1192,8 +1199,9 @@ helm history db -n lab-07-2 | tail -2
 Error: UPGRADE FAILED: …
 NAME            READY   STATUS             RESTARTS   AGE
 db-postgres-0   0/1     CrashLoopBackOff   …          …
-FATAL:  database files are incompatible with server
-DETAIL:  The data directory was initialized by PostgreSQL version 17, which is not compatible …
+… FATAL:  database files are incompatible with server
+… DETAIL:  The data directory was initialized by PostgreSQL version 17, which is not
+compatible with this version 18.6 …
 2   …   deployed   …   Upgrade complete
 3   …   failed     …   Upgrade "db" failed: …
 ```

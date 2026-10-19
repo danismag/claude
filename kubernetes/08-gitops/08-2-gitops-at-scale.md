@@ -336,35 +336,43 @@ Flux расшифровывает SOPS сам, а Argo CD нужен плаги�
 
 ## Лабораторные работы
 
-Работы начинаются со стенда после 08-1: Argo CD и Gitea они не ставят. В кластере уже работают Gitea и Argo CD 3.5.5, репозиторий `~/lab/k8s/gitops` содержит `apps/orders-api` с overlays staging и prod, есть файл `~/lab/k8s/gitea.env`. Namespace у объектов задают overlays из 07-3, поэтому окружения лежат в `lab-07-3-staging` и `lab-07-3-prod`; префикс `lab-08-2` для этих namespace не используется. Собственные временные файлы работ — в `~/lab/k8s/08-2/`. Работы выполняйте по порядку.
+Работы начинаются со стенда, который оставила 08-1: Gitea в namespace `lab-08-1`, Argo CD 3.5.5 в `argocd` и репозиторий `~/lab/k8s/08-1/orders-gitops` с base и overlay staging. Если вы выполнили необязательную полную уборку 08-1, сначала повторите шаги 1–4 её работы 1. Окружения этой части живут в namespace `lab-08-2-staging` и `lab-08-2-prod`, временные файлы — в `~/lab/k8s/08-2/`. Полная уборка стенда GitOps — в конце работы 3, поэтому работы выполняйте по порядку.
 
-Сначала подготовка: пароль Gitea, функция коммита и namespace окружений. Оболочка не помнит функции между сессиями, поэтому `gpush` задаётся заново.
+Сначала подготовка. Команды загружают пароль Gitea, задают функцию коммита, добавляют в репозиторий overlay prod из 07-3 и переводят оба overlay в namespace этой части. Оболочка не помнит функции и переменные между сессиями, поэтому `gpush` задаётся заново.
 
 ```bash
 mkdir -p ~/lab/k8s/08-2
-. ~/lab/k8s/gitea.env
-gpush() { git -C ~/lab/k8s/gitops add -A && git -C ~/lab/k8s/gitops commit -qm "$1" && \
-  git -C ~/lab/k8s/gitops push -q \
-  "http://$GITEA_USER:$GITEA_PASS@git.localhost:8088/lab/orders-gitops.git" main && \
-  git -C ~/lab/k8s/gitops rev-parse --short HEAD; }
+. ~/lab/k8s/08-1/gitea.env
+R=~/lab/k8s/08-1/orders-gitops
+GIT_URL="http://$GITEA_USER:$GITEA_PASS@git.localhost:8088/lab/orders-gitops.git"
+gpush() { git -C $R add -A && git -C $R commit -qm "$1" && \
+  git -C $R push -q "$GIT_URL" main && git -C $R rev-parse --short HEAD; }
 kubectl -n argocd delete app orders-staging --ignore-not-found
-for ns in lab-07-3-staging lab-07-3-prod; do
-  kubectl create ns $ns 2>/dev/null
-  kubectl -n $ns get secret postgres >/dev/null 2>&1 || \
-    kubectl -n $ns create secret generic postgres \
+kubectl delete ns lab-08-1-staging --ignore-not-found
+O=$R/apps/orders-api/overlays
+cp -r ~/lab/k8s/07-3/orders-api/overlays/prod $O/
+sed -i 's/^namespace: .*/namespace: lab-08-2-staging/' $O/staging/kustomization.yaml
+sed -i 's/^namespace: .*/namespace: lab-08-2-prod/' $O/prod/kustomization.yaml
+gpush "orders-api: prod overlay, namespaces lab-08-2"
+for ns in lab-08-2-staging lab-08-2-prod; do
+  kubectl create ns $ns
+  kubectl -n $ns create secret generic postgres \
     --from-literal=DATABASE_URL=postgresql://orders:orders-lab-pass@postgres.orders:5432/orders
 done
 ```
 
 | Часть команды | Значение |
 |---|---|
-| `. ~/lab/k8s/gitea.env` | загрузить `GITEA_USER` и `GITEA_PASS` из файла |
-| `gpush() { … }` | функция: коммит, отправка в Gitea, печать короткого хеша |
-| `delete app orders-staging --ignore-not-found` | убрать Application из 08-1: ApplicationSet не забирает чужие объекты |
-| `create ns $ns 2>/dev/null` | создать namespace, ошибку «уже есть» скрыть |
+| `. ~/lab/k8s/08-1/gitea.env` | загрузить `GITEA_USER` и `GITEA_PASS` из файла 08-1 |
+| `gpush() { … }` | функция из 08-1: коммит, отправка в Gitea, печать короткого хеша |
+| `delete app orders-staging --ignore-not-found` | убрать Application 08-1, если он остался |
+| `cp -r …/07-3/orders-api/overlays/prod` | взять overlay prod из 07-3: 3 реплики и образ по дайджесту |
+| `sed -i 's/^namespace: .*/…/'` | перевести overlay в namespace этой части |
 | `create secret generic postgres` | секрет базы; в Git его нет |
 
-Команды ничего не печатают, кроме строк `namespace/… created` и `secret/postgres created`. Секрет создан вне Git намеренно: способы хранить его в Git описаны в §3.
+Результат: короткий хеш коммита, затем строки `namespace/… created` и `secret/postgres created` для двух namespace. Секрет создан вне Git намеренно: способы хранить его в Git описаны в §3.
+
+Application `orders-staging` из 08-1 удаляется на случай, если уборка 08-1 пропущена. Иначе ApplicationSet забрал бы одноимённый объект себе и переписал его по шаблону, а старые объекты остались бы в `lab-08-1-staging`.
 
 ### Лабораторная работа 1. ApplicationSet и корневое Application
 
@@ -381,8 +389,8 @@ done
 ```
  Git: argocd/orders-appset.yaml
         ▲ читает
- Application root ──► ApplicationSet orders-api ──► Application orders-staging ─► lab-07-3-staging
- (создан вручную)      generator: каталоги            Application orders-prod    ─► lab-07-3-prod
+ Application root ──► ApplicationSet orders-api ──► Application orders-staging ─► lab-08-2-staging
+ (создан вручную)      generator: каталоги            Application orders-prod    ─► lab-08-2-prod
                        apps/orders-api/overlays/*
 ```
 
@@ -393,8 +401,8 @@ done
 Команда создаёт файл ApplicationSet в каталоге `argocd/` репозитория и отправляет его в Gitea.
 
 ```bash
-mkdir -p ~/lab/k8s/gitops/argocd
-cat > ~/lab/k8s/gitops/argocd/orders-appset.yaml <<'E'
+mkdir -p $R/argocd
+cat > $R/argocd/orders-appset.yaml <<'E'
 apiVersion: argoproj.io/v1alpha1
 kind: ApplicationSet
 metadata: {name: orders-api, namespace: argocd}
@@ -402,7 +410,7 @@ spec:
   goTemplate: true
   generators:
   - git:
-      repoURL: http://gitea.gitea.svc:3000/lab/orders-gitops.git
+      repoURL: http://gitea.lab-08-1.svc:3000/lab/orders-gitops.git
       revision: main
       directories:
       - path: apps/orders-api/overlays/*
@@ -413,12 +421,12 @@ spec:
     spec:
       project: default
       source:
-        repoURL: http://gitea.gitea.svc:3000/lab/orders-gitops.git
+        repoURL: http://gitea.lab-08-1.svc:3000/lab/orders-gitops.git
         targetRevision: main
         path: '{{ .path.path }}'
       destination:
         server: https://kubernetes.default.svc
-        namespace: 'lab-07-3-{{ .path.basename }}'
+        namespace: 'lab-08-2-{{ .path.basename }}'
       ignoreDifferences:
       - {group: apps, kind: Deployment, jsonPointers: [/spec/replicas]}
       syncPolicy:
@@ -434,7 +442,7 @@ gpush "argocd: ApplicationSet for orders overlays"
 | `path: apps/orders-api/overlays/*` | маска каталогов: `staging` и `prod` |
 | `name: 'orders-{{ .path.basename }}'` | имя Application из имени каталога |
 | `path: '{{ .path.path }}'` | источник Application — найденный каталог |
-| `namespace: 'lab-07-3-{{ .path.basename }}'` | namespace, совпадающий с тем, что задаёт overlay |
+| `namespace: 'lab-08-2-{{ .path.basename }}'` | namespace, совпадающий с тем, что задаёт overlay |
 | `ignoreDifferences`, `RespectIgnoreDifferences=true` | защита `replicas` от HPA, как в 08-1 |
 
 Результат: команда печатает короткий хеш нового коммита, например `3c1a9f0`.
@@ -453,7 +461,7 @@ metadata: {name: root, namespace: argocd}
 spec:
   project: default
   source:
-    repoURL: http://gitea.gitea.svc:3000/lab/orders-gitops.git
+    repoURL: http://gitea.lab-08-1.svc:3000/lab/orders-gitops.git
     targetRevision: main
     path: argocd
   destination: {server: https://kubernetes.default.svc, namespace: argocd}
@@ -479,7 +487,7 @@ EOF
 ```bash
 sleep 60
 kubectl -n argocd get applicationset,app
-kubectl -n lab-07-3-prod get deploy orders-api -o jsonpath=\
+kubectl -n lab-08-2-prod get deploy orders-api -o jsonpath=\
 'prod replicas={.status.readyReplicas} image={.spec.template.spec.containers[0].image}{"\n"}'
 ```
 
@@ -528,7 +536,7 @@ prod replicas=3 image=localhost:5001/orders-api@sha256:ad4f8fd2…
 <summary>Ответ</summary>
 
 1. ApplicationSet не забирает Application, которые создали не он. Объект с тем же именем остался бы чужим, и ApplicationSet не смог бы им управлять.
-2. Генератор найдёт новый каталог в течение опроса Git (по умолчанию до 180 с), и появится Application `orders-qa`. Namespace `lab-07-3-qa` при этом нужно создать заранее, как в подготовке.
+2. Генератор найдёт новый каталог в течение опроса Git (по умолчанию до 180 с), и появится Application `orders-qa`. Namespace `lab-08-2-qa` при этом нужно создать заранее, как в подготовке.
 3. Без finalizer'а удаление `root` не каскадирует на ApplicationSet и порождённые Application. Это нужно для порядка уборки в работе 3.
 
 </details>
@@ -590,7 +598,7 @@ echo "2.1 digest: $D"
 ```bash
 t0=$(date +%s)
 sed -i "s/digest: sha256:.*/digest: $D/" \
-  ~/lab/k8s/gitops/apps/orders-api/overlays/prod/kustomization.yaml
+  $R/apps/orders-api/overlays/prod/kustomization.yaml
 gpush "prod: promote orders-api 2.1 ($D)"
 ```
 
@@ -610,13 +618,13 @@ gpush "prod: promote orders-api 2.1 ($D)"
 
 ```bash
 kubectl -n argocd annotate app orders-prod argocd.argoproj.io/refresh=normal --overwrite
-kubectl -n lab-07-3-prod rollout status deploy/orders-api
+kubectl -n lab-08-2-prod rollout status deploy/orders-api
 echo "after $(( $(date +%s)-t0 ))s"
-kubectl -n lab-07-3-prod exec deploy/orders-api -- python -c \
+kubectl -n lab-08-2-prod exec deploy/orders-api -- python -c \
   "import urllib.request as u;print(u.urlopen('http://127.0.0.1:8000/version').read().decode())"
 kubectl -n argocd get app orders-prod \
   -o jsonpath='{.status.sync.status}/{.status.health.status} {.status.sync.revision}{"\n"}'
-git -C ~/lab/k8s/gitops log --oneline -3 -- apps/orders-api/overlays/prod
+git -C $R log --oneline -3 -- apps/orders-api/overlays/prod
 ```
 
 | Часть команды | Значение |
@@ -698,14 +706,14 @@ Synced/Healthy def057c16fdeeaf7ac9e4119fb6d73672ce1ed39
 
 ```bash
 kubectl -n argocd get app orders-staging -o jsonpath='{.metadata.finalizers}{"\n"}'
-mv ~/lab/k8s/gitops/apps/orders-api/overlays/staging ~/lab/k8s/08-2/staging-saved
+mv $R/apps/orders-api/overlays/staging ~/lab/k8s/08-2/staging-saved
 gpush "remove staging overlay"
 t0=$(date +%s)
 kubectl -n argocd annotate applicationset orders-api \
   argocd.argoproj.io/application-set-refresh=true --overwrite
 until ! kubectl -n argocd get app orders-staging >/dev/null 2>&1; do sleep 1; done
 echo "Application gone after $(( $(date +%s)-t0 ))s"
-echo "resources in lab-07-3-staging: $(kubectl -n lab-07-3-staging \
+echo "resources in lab-08-2-staging: $(kubectl -n lab-08-2-staging \
   get deploy,svc,httproute --no-headers 2>/dev/null | wc -l)"
 ```
 
@@ -722,7 +730,7 @@ echo "resources in lab-07-3-staging: $(kubectl -n lab-07-3-staging \
 ```
 ["resources-finalizer.argocd.argoproj.io"]
 Application gone after 4s
-resources in lab-07-3-staging: 0
+resources in lab-08-2-staging: 0
 ```
 
 Разбор:
@@ -737,7 +745,7 @@ resources in lab-07-3-staging: 0
 Команда возвращает каталог и коммитит, после чего ждёт нового Application.
 
 ```bash
-mv ~/lab/k8s/08-2/staging-saved ~/lab/k8s/gitops/apps/orders-api/overlays/staging
+mv ~/lab/k8s/08-2/staging-saved $R/apps/orders-api/overlays/staging
 gpush "restore staging overlay"
 t0=$(date +%s)
 kubectl -n argocd annotate applicationset orders-api \
@@ -763,19 +771,19 @@ kubectl -n argocd get app orders-staging
 
 ```bash
 sed -i '/^  goTemplate: true/a\  syncPolicy:\n    preserveResourcesOnDeletion: true' \
-  ~/lab/k8s/gitops/argocd/orders-appset.yaml
+  $R/argocd/orders-appset.yaml
 gpush "appset: preserveResourcesOnDeletion"
 kubectl -n argocd annotate applicationset orders-api \
   argocd.argoproj.io/application-set-refresh=true --overwrite
 sleep 20
 kubectl -n argocd get app orders-staging -o jsonpath='{.metadata.finalizers}{"\n"}'
-mv ~/lab/k8s/gitops/apps/orders-api/overlays/staging ~/lab/k8s/08-2/staging-saved
+mv $R/apps/orders-api/overlays/staging ~/lab/k8s/08-2/staging-saved
 gpush "remove staging overlay again"
 kubectl -n argocd annotate applicationset orders-api \
   argocd.argoproj.io/application-set-refresh=true --overwrite
 sleep 15
 kubectl -n argocd get app
-kubectl -n lab-07-3-staging get deploy,svc,httproute --no-headers | wc -l
+kubectl -n lab-08-2-staging get deploy,svc,httproute --no-headers | wc -l
 ```
 
 | Часть команды | Значение |
@@ -806,7 +814,7 @@ root            Synced        Healthy
 Теперь вернём каталог: ApplicationSet создаст Application заново и примет уцелевшие ресурсы, без пересоздания подов.
 
 ```bash
-mv ~/lab/k8s/08-2/staging-saved ~/lab/k8s/gitops/apps/orders-api/overlays/staging
+mv ~/lab/k8s/08-2/staging-saved $R/apps/orders-api/overlays/staging
 gpush "restore staging overlay"
 kubectl -n argocd annotate applicationset orders-api \
   argocd.argoproj.io/application-set-refresh=true --overwrite
@@ -814,7 +822,7 @@ sleep 15
 kubectl -n argocd get app orders-staging
 ```
 
-Ожидаемый результат: `orders-staging` снова `Synced` и `Healthy`; возраст подов в `lab-07-3-staging` не сбросился.
+Ожидаемый результат: `orders-staging` снова `Synced` и `Healthy`; возраст подов в `lab-08-2-staging` не сбросился.
 
 #### Шаг 4. Запретить ApplicationSet удалять Application
 
@@ -822,15 +830,15 @@ kubectl -n argocd get app orders-staging
 
 ```bash
 sed -i '/preserveResourcesOnDeletion/a\    applicationsSync: create-update' \
-  ~/lab/k8s/gitops/argocd/orders-appset.yaml
+  $R/argocd/orders-appset.yaml
 gpush "appset: applicationsSync create-update"
-mv ~/lab/k8s/gitops/apps/orders-api/overlays/staging ~/lab/k8s/08-2/staging-saved
+mv $R/apps/orders-api/overlays/staging ~/lab/k8s/08-2/staging-saved
 gpush "remove staging overlay third time"
 kubectl -n argocd annotate applicationset orders-api \
   argocd.argoproj.io/application-set-refresh=true --overwrite
 sleep 20
 kubectl -n argocd get app orders-staging
-kubectl -n lab-07-3-staging get deploy --no-headers | wc -l
+kubectl -n lab-08-2-staging get deploy --no-headers | wc -l
 ```
 
 | Часть команды | Значение |
@@ -845,7 +853,7 @@ kubectl -n lab-07-3-staging get deploy --no-headers | wc -l
 Разбор: Application не удалён, ресурсы работают, а Argo CD сообщает об ошибке источника. Так сбой превращается из аварии в сигнал, который видно в статусе. Вернём каталог и очистим стенд.
 
 ```bash
-mv ~/lab/k8s/08-2/staging-saved ~/lab/k8s/gitops/apps/orders-api/overlays/staging
+mv ~/lab/k8s/08-2/staging-saved $R/apps/orders-api/overlays/staging
 gpush "restore staging overlay"
 ```
 
@@ -860,14 +868,14 @@ gpush "restore staging overlay"
 
 **Уборка.** Порядок важен. Сначала удаляется корневое Application без каскада, затем ApplicationSet, затем Argo CD, Gitea и CRD. Ресурсы окружений уйдут вместе с их namespace. Команды убирают стенд GitOps целиком, но не трогают `orders` и сам кластер.
 
-Репозиторий `~/lab/k8s/gitops` остаётся локально.
+Репозиторий `$R` остаётся локально.
 
 ```bash
 kubectl -n argocd delete app root
 kubectl -n argocd delete applicationset orders-api
 kubectl delete -n argocd \
   -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.5/manifests/install.yaml
-kubectl delete ns argocd gitea lab-07-3-staging lab-07-3-prod
+kubectl delete ns argocd gitea lab-08-2-staging lab-08-2-prod
 kubectl get crd -o name | grep argoproj.io | xargs -r kubectl delete
 rm -f ~/lab/k8s/gitea.env
 rm -rf ~/lab/k8s/08-2
