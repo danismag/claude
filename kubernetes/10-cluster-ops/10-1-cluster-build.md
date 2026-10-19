@@ -386,7 +386,7 @@ kubeadm reset                                        # убрать с узла 
 | certificate key (Secret kubeadm-certs) | 2 часа | Secret удаляется |
 | сертификаты компонентов, kubeconfig | 1 год (8760 ч) | компонент не подключится, продлевает kubeadm (10-4) |
 | CA (ca, etcd/ca, front-proxy-ca) | 10 лет (87600 ч) | замена вручную |
-| клиентский сертификат kubelet | 1 год (`--cluster-signing-duration`) | kubelet обновляет сам (10-4) |
+| клиентский сертификат kubelet | 1 год (флаг controller-manager) | kubelet обновляет сам (10-4) |
 
 Тайм-ауты `timeouts` в v1beta4 ограничивают ожидание фаз kubeadm.
 
@@ -800,7 +800,7 @@ ConfigMap и привязки (`kubeadm:kubelet-bootstrap`, `kubeadm:node-autoap
 - Узлы `lab-control-plane` и `lab-worker`.
 - Около 30 минут.
 
-**Схема опыта.** Идём от общего к частному: сроки всех сертификатов, затем файлы и CA, затем kubeconfig-файлы control plane, затем сертификаты kubelet и следы входа узла.
+**Схема опыта.** Идём от общего к частному: файлы pki и их CA, затем сертификат API-сервера и kubeconfig-файлы control plane, затем сертификаты kubelet и следы входа узла.
 
 ```
 lab-control-plane:  /etc/kubernetes/pki/*  (шаги 1–2)     *.conf (шаг 3)
@@ -810,58 +810,17 @@ lab-worker:         /var/lib/kubelet/pki/* (шаги 4–5)     config.yaml, kub
 
 Схема 9. Где искать сертификаты: pki и kubeconfig-файлы на control plane, pki kubelet на каждом узле, запросы и токены в кластере.
 
-#### Шаг 1. Посмотреть сроки всех сертификатов
+#### Шаг 1. Найти файлы pki и их CA
 
-Команда `kubeadm certs check-expiration` читает файлы и kubeconfig на узле и печатает остаток срока каждого сертификата.
-
-```bash
-docker exec lab-control-plane kubeadm certs check-expiration
-```
-
-Разбор команды:
-
-| Часть команды | Значение |
-|---|---|
-| `kubeadm certs check-expiration` | показать сроки сертификатов и CA |
-| `docker exec lab-control-plane` | выполнить на узле control plane |
-
-Результат (даты у вас будут другие):
-
-```
-CERTIFICATE                EXPIRES                  RESIDUAL TIME   CERTIFICATE AUTHORITY
-admin.conf                 Oct 14, 2027 15:47 UTC   364d            ca
-apiserver                  Oct 14, 2027 15:47 UTC   364d            ca
-apiserver-etcd-client      Oct 14, 2027 15:47 UTC   364d            etcd-ca
-apiserver-kubelet-client   Oct 14, 2027 15:47 UTC   364d            ca
-controller-manager.conf    Oct 14, 2027 15:47 UTC   364d            ca
-etcd-healthcheck-client    Oct 14, 2027 15:47 UTC   364d            etcd-ca
-etcd-peer                  Oct 14, 2027 15:47 UTC   364d            etcd-ca
-etcd-server                Oct 14, 2027 15:47 UTC   364d            etcd-ca
-front-proxy-client         Oct 14, 2027 15:47 UTC   364d            front-proxy-ca
-scheduler.conf             Oct 14, 2027 15:47 UTC   364d            ca
-super-admin.conf           Oct 14, 2027 15:47 UTC   364d            ca
-CERTIFICATE AUTHORITY   EXPIRES                  RESIDUAL TIME
-ca                      Oct 11, 2036 08:23 UTC   9y
-etcd-ca                 Oct 11, 2036 08:23 UTC   9y
-front-proxy-ca          Oct 11, 2036 08:23 UTC   9y
-```
-
-Разбор вывода:
-
-1. Первая таблица содержит одиннадцать строк: четыре kubeconfig-файла и семь сертификатов из дерева `pki`. Остаток срока около года (`364d`), потому что сертификаты компонентов живут 8760 часов.
-2. Последний столбец называет CA, который подписал сертификат: `ca`, `etcd-ca` или `front-proxy-ca` (схема 4).
-3. Вторая таблица показывает три CA со сроком около десяти лет. Их срок не меняет ни `renew`, ни обновление кластера.
-4. Файла `kubelet.conf` в таблице нет: клиентский сертификат kubelet обновляет сам kubelet (шаг 4).
-5. В этом выводе дата `Oct 14, 2027` отличается от даты создания кластера, потому что пример снят после обновления, которое продлило сертификаты (10-3). На только что созданном стенде остаток будет 365 дней.
-
-#### Шаг 2. Найти файлы pki и прочитать сертификат API-сервера
-
-Выведем содержимое каталога `pki`, а затем из сертификата API-сервера имя, издателя, срок и список адресов (SAN).
+Выведем содержимое каталога `pki`, а затем для каждого листового сертификата — CA, который его подписал. Сроки этих сертификатов разобраны в 10-4, здесь важна только связь «сертификат → CA».
 
 ```bash
 docker exec lab-control-plane ls /etc/kubernetes/pki /etc/kubernetes/pki/etcd
-docker exec lab-control-plane openssl x509 -in /etc/kubernetes/pki/apiserver.crt \
-  -noout -subject -issuer -enddate -ext subjectAltName
+docker exec lab-control-plane sh -c 'cd /etc/kubernetes/pki &&
+  for c in apiserver apiserver-kubelet-client apiserver-etcd-client front-proxy-client \
+    etcd/server etcd/peer etcd/healthcheck-client; do
+    printf "%-26s %s\n" "$c" "$(openssl x509 -in $c.crt -noout -issuer)"
+  done'
 ```
 
 Разбор команды:
@@ -869,10 +828,9 @@ docker exec lab-control-plane openssl x509 -in /etc/kubernetes/pki/apiserver.crt
 | Часть команды | Значение |
 |---|---|
 | `ls /etc/kubernetes/pki …/etcd` | перечислить файлы ключей и сертификатов |
-| `openssl x509 -in apiserver.crt` | прочитать сертификат |
-| `-noout` | не печатать сам сертификат |
-| `-subject -issuer -enddate` | имя, подписавший CA, дата окончания |
-| `-ext subjectAltName` | список адресов и имён в сертификате |
+| `sh -c 'cd … && for c in …'` | пройти по семи листовым сертификатам внутри узла |
+| `openssl x509 -noout -issuer` | напечатать только издателя, то есть подписавший CA |
+| `printf "%-26s %s\n"` | выровнять имя файла и издателя в две колонки |
 
 Ожидаемый результат:
 
@@ -903,19 +861,56 @@ peer.crt
 peer.key
 server.crt
 server.key
+apiserver                  issuer=CN=kubernetes
+apiserver-kubelet-client   issuer=CN=kubernetes
+apiserver-etcd-client      issuer=CN=etcd-ca
+front-proxy-client         issuer=CN=front-proxy-ca
+etcd/server                issuer=CN=etcd-ca
+etcd/peer                  issuer=CN=etcd-ca
+etcd/healthcheck-client    issuer=CN=etcd-ca
+```
+
+Разбор вывода:
+
+1. Файлы соответствуют схеме 4: три CA (`ca`, `etcd/ca`, `front-proxy-ca`), сертификаты под ними и пара `sa.key` и `sa.pub` без сертификата. Пар ключей одиннадцать: `ca`, `apiserver`, `apiserver-kubelet-client`, `apiserver-etcd-client`, `front-proxy-ca`, `front-proxy-client`, `etcd/ca`, `etcd/server`, `etcd/peer`, `etcd/healthcheck-client` и `sa`.
+2. Издатель `CN=kubernetes` — кластерный CA: так называется его сертификат `ca.crt`. Он подписал сертификаты API-сервера и его клиента к kubelet.
+3. `apiserver-etcd-client` лежит рядом с файлами API-сервера, но подписан `etcd-ca`: иначе etcd его не примет.
+4. Пробелы вокруг знака равенства в `issuer` зависят от версии openssl.
+
+#### Шаг 2. Прочитать сертификат API-сервера
+
+Из сертификата API-сервера выведем имя, издателя, срок и список адресов (SAN).
+
+```bash
+docker exec lab-control-plane openssl x509 -in /etc/kubernetes/pki/apiserver.crt \
+  -noout -subject -issuer -enddate -ext subjectAltName
+```
+
+Разбор команды:
+
+| Часть команды | Значение |
+|---|---|
+| `openssl x509 -in apiserver.crt` | прочитать сертификат |
+| `-noout` | не печатать сам сертификат |
+| `-subject -issuer -enddate` | имя, подписавший CA, дата окончания |
+| `-ext subjectAltName` | список адресов и имён в сертификате |
+
+Ожидаемый результат:
+
+```
 subject=CN=kube-apiserver
 issuer=CN=kubernetes
-notAfter=Oct 14 15:47:30 2027 GMT
+notAfter=<дата создания стенда плюс год> GMT
 X509v3 Subject Alternative Name:
     DNS:kubernetes, DNS:kubernetes.default, DNS:kubernetes.default.svc, …, IP Address:10.96.0.1, …
 ```
 
 Разбор вывода:
 
-1. Файлы соответствуют схеме 4: три CA (`ca`, `etcd/ca`, `front-proxy-ca`), сертификаты под ними и пара `sa.key` и `sa.pub` без сертификата. Пар ключей одиннадцать: `ca`, `apiserver`, `apiserver-kubelet-client`, `apiserver-etcd-client`, `front-proxy-ca`, `front-proxy-client`, `etcd/ca`, `etcd/server`, `etcd/peer`, `etcd/healthcheck-client` и `sa`.
-2. Издатель `CN=kubernetes` — это кластерный CA: так называется его сертификат `ca.crt`.
+1. Владелец `CN=kube-apiserver`, издатель — кластерный CA.
+2. Срок — год от создания стенда (8760 часов, §2).
 3. В SAN есть `kubernetes.default.svc` и `10.96.0.1`: по этим адресам поды обращаются к API-серверу через Service `kubernetes`.
-4. Пробелы вокруг знака равенства в `subject` зависят от версии openssl.
+4. Остальные записи SAN — имя узла, его IP-адрес, `localhost` и `127.0.0.1` из `certSANs` (работа 1, шаг 2).
 
 #### Шаг 3. Прочитать kubeconfig-файлы control plane
 
@@ -962,13 +957,12 @@ subject=CN=system:kube-scheduler
 
 #### Шаг 4. Прочитать сертификаты kubelet на рабочем узле
 
-Клиентский сертификат kubelet лежит не в `/etc/kubernetes`, а в `/var/lib/kubelet/pki`. Выведем файлы, имя и срок текущего сертификата, а также настройку ротации.
+Клиентский сертификат, полученный при TLS bootstrap, лежит не в `/etc/kubernetes`, а в `/var/lib/kubelet/pki`. Выведем файлы, имя и срок текущего сертификата, а также ссылки на него в `kubelet.conf`.
 
 ```bash
 docker exec lab-worker ls -l /var/lib/kubelet/pki/
 docker exec lab-worker openssl x509 -in /var/lib/kubelet/pki/kubelet-client-current.pem \
   -noout -subject -enddate
-docker exec lab-worker grep -E 'rotateCertificates|serverTLSBootstrap' /var/lib/kubelet/config.yaml
 docker exec lab-worker grep -E 'client-(certificate|key):' /etc/kubernetes/kubelet.conf
 ```
 
@@ -979,10 +973,9 @@ docker exec lab-worker grep -E 'client-(certificate|key):' /etc/kubernetes/kubel
 | `ls -l /var/lib/kubelet/pki/` | файлы сертификатов kubelet с символическими ссылками |
 | `kubelet-client-current.pem` | ссылка на актуальный клиентский сертификат |
 | `-subject -enddate` | имя владельца и дата окончания |
-| `grep -E 'rotateCertificates\|serverTLSBootstrap'` | настройки ротации в конфиге kubelet |
 | `client-(certificate\|key):` | какие файлы указаны в kubelet.conf |
 
-Результат:
+Результат, сокращённо (у `ls -l` оставлены только имена и цель ссылки):
 
 ```
 kubelet-client-2026-10-14-08-23-53.pem
@@ -990,7 +983,6 @@ kubelet-client-current.pem -> /var/lib/kubelet/pki/kubelet-client-2026-10-14-08-
 kubelet.crt  kubelet.key
 subject=O=system:nodes, CN=system:node:lab-worker
 notAfter=Oct 14 08:18:53 2027 GMT
-rotateCertificates: true
 ```
 
 Ожидаемый результат последней команды:
@@ -1005,9 +997,8 @@ rotateCertificates: true
 1. Файл `kubelet-client-<дата>.pem` — сертификат, который выдал CSR при TLS bootstrap. Дата в имени — момент выдачи. Ссылка `kubelet-client-current.pem` указывает на него; при ротации ссылка перейдёт на новый файл.
 2. Файлы `kubelet.crt` и `kubelet.key` — серверный сертификат kubelet, самоподписанный (шаг 5).
 3. Владелец `CN=system:node:lab-worker` в группе `O=system:nodes`: этим именем kubelet входит в кластер, и авторизация Node ограничивает его права (06-1).
-4. Срок окончания равен году от выдачи без пяти минут: подписывающий контроллер сдвигает сертификат назад на запас для расхождения часов.
-5. `rotateCertificates: true` включает автоматическую ротацию. Строки `serverTLSBootstrap` в конфиге нет, поэтому серверный сертификат остаётся самоподписанным.
-6. В `kubelet.conf` вместо данных стоят пути к файлу сертификата: kubeadm переписал файл на ротируемый сертификат (фаза kubelet-finalize).
+4. Срок окончания равен году от выдачи без пяти минут. Подписывающий контроллер ставит начало срока на 5 минут раньше текущего времени, запас на расхождение часов. Для долгих сертификатов он настолько же укорачивает и конец срока.
+5. В `kubelet.conf` вместо данных стоят пути к ссылке `kubelet-client-current.pem`. Сам `kubelet.conf` kubelet записал в конце TLS bootstrap, поэтому после ротации он подхватит новый сертификат без правки kubeconfig. На первом узле control plane тот же переход делает фаза kubelet-finalize.
 
 #### Шаг 5. Проверить серверный сертификат kubelet и список CSR
 
@@ -1040,7 +1031,7 @@ No resources found
 1. Владелец и издатель различаются именами, но обе записи созданы самим kubelet: он сам сделал и временный CA, и сертификат. Число после `@` — время создания.
 2. Такой сертификат не подписан CA кластера, поэтому API-сервер, metrics-server и другие клиенты не могут проверить его по CA. Поэтому metrics-server на стенде запущен с `--kubelet-insecure-tls` (00-1).
 3. CSR в кластере нет, потому что контроллер очистки удаляет одобренные запросы через час. Запросы TLS bootstrap, которые создали узлы при присоединении, уже удалены.
-4. Если включить `serverTLSBootstrap: true`, в списке появятся запросы `kubernetes.io/kubelet-serving` в состоянии Pending, и их придётся одобрять (§3). Здесь мы только читаем и этого не делаем.
+4. Если включить `serverTLSBootstrap: true`, в списке появятся запросы `kubernetes.io/kubelet-serving` в состоянии Pending, и их придётся одобрять (§3, 10-4). Здесь мы только читаем и этого не делаем.
 
 #### Шаг 6. Найти токены присоединения
 
@@ -1075,10 +1066,10 @@ ks -n kube-system get secret -o name | grep bootstrap-token
 
 | Что узнали | Где видно |
 |---|---|
-| сертификаты компонентов живут год, три CA — десять лет | `kubeadm certs check-expiration`, шаг 1 |
-| три CA подписывают разные сертификаты, пар ключей одиннадцать | `/etc/kubernetes/pki`, шаг 2 |
+| три CA подписывают разные сертификаты, пар ключей одиннадцать | `/etc/kubernetes/pki`, шаг 1 |
+| сертификат API-сервера выписан на имена и адреса из SAN | `openssl x509 -ext`, шаг 2 |
 | имя и группа компонента записаны в сертификате его kubeconfig | `subject`, шаг 3 |
-| клиентский сертификат kubelet ротируется сам, файл-ссылка меняется | `/var/lib/kubelet/pki`, шаг 4 |
+| узел получил клиентский сертификат через CSR, срок короче года на 5 минут | `/var/lib/kubelet/pki`, шаг 4 |
 | серверный сертификат kubelet самоподписан без `serverTLSBootstrap` | шаг 5 |
 | токен присоединения живёт 24 часа | `kubeadm token list`, шаг 6 |
 
@@ -1093,10 +1084,10 @@ ks -n kube-system get secret -o name | grep bootstrap-token
 
 </details>
 
-2. Что случится, если на рабочем узле выключить `rotateCertificates`?
+2. Почему клиентский сертификат kubelet истекает на пять минут раньше, чем через год после выдачи?
 <details><summary>Ответ</summary>
 
-Клиентский сертификат kubelet перестанет обновляться. Через год он истечёт, kubelet не сможет войти в API-сервер, и узел станет NotReady.
+Подписывающий контроллер в controller-manager сдвигает начало срока на 5 минут назад, чтобы пережить расхождение часов. Для сертификатов длиннее 8 часов конец срока сдвигается на те же 5 минут.
 
 </details>
 
@@ -1226,7 +1217,7 @@ L='certs|kubeconfig|etcd|control-plane|kubelet-start|wait-control-plane|upload-c
 L+='|mark-control-plane|bootstrap-token|kubelet-finalize|addons'
 grep -oE "\[($L)\]" \
   ~/lab/k8s/10-1/create.log | awk '!seen[$0]++'
-grep -E 'Announced new etcd member|Marking the node' ~/lab/k8s/10-1/create.log | cut -c1-110
+grep -E 'Announced new etcd member|Marking the node' ~/lab/k8s/10-1/create.log | cut -c1-96
 ```
 
 Разбор команды:
@@ -1237,7 +1228,7 @@ grep -E 'Announced new etcd member|Marking the node' ~/lab/k8s/10-1/create.log |
 | `awk '!seen[$0]++'` | оставить первое появление каждой метки |
 | `Announced new etcd member` | строка, когда новый узел стал членом etcd |
 | `Marking the node` | строка фазы mark-control-plane |
-| `cut -c1-110` | обрезать длинные строки |
+| `cut -c1-96` | обрезать длинные строки до 96 знаков |
 
 Ожидаемый результат:
 
@@ -1255,16 +1246,16 @@ grep -E 'Announced new etcd member|Marking the node' ~/lab/k8s/10-1/create.log |
 [addons]
 [etcd] Announced new etcd member joining to the existing etcd cluster
 [etcd] Announced new etcd member joining to the existing etcd cluster
-[mark-control-plane] Marking the node lab-10-1-control-plane as control-plane by adding the label…
-[mark-control-plane] Marking the node lab-10-1-control-plane2 as control-plane by adding the label…
-[mark-control-plane] Marking the node lab-10-1-control-plane3 as control-plane by adding the label…
+[mark-control-plane] Marking the node lab-10-1-control-plane as control-plane by adding the labe
+[mark-control-plane] Marking the node lab-10-1-control-plane as control-plane by adding the tain
+… (по две строки для control-plane2 и control-plane3)
 ```
 
 Разбор вывода:
 
 1. Первые одиннадцать меток идут в порядке фаз `kubeadm init` (схема 2). Метка фазы `addon` в журнале выглядит как `[addons]`. Фаза preflight пропущена: kind отключает её в конфигурации.
 2. Две строки `Announced new etcd member` — это присоединение второго и третьего узла control plane: каждый стал новым членом etcd, а не отдельным кластером.
-3. Метку `mark-control-plane` напечатали все три узла: первый на `init`, остальные на `join`.
+3. Строки `mark-control-plane` напечатали все три узла, по две на узел (метки и taint): первый на `init`, остальные на `join`.
 4. Строк `[download-certs]` нет: ключи CA kind передал копированием файлов, а не через Secret `kubeadm-certs` (§3).
 
 #### Шаг 4. Увидеть топологию: узлы, контейнеры и балансировщик
@@ -1277,7 +1268,7 @@ docker ps --filter label=io.x-k8s.kind.cluster=lab-10-1 --format '{{.Names}}  {{
 kubectl --kubeconfig ~/lab/k8s/10-1/kubeconfig config view \
   -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
 docker exec lab-10-1-external-load-balancer cat /home/envoy/cds.yaml | \
-  grep -E 'address:|port_value|path:'
+  grep -E ' (address|port_value|path): '
 ```
 
 Разбор команды:
@@ -1288,7 +1279,7 @@ docker exec lab-10-1-external-load-balancer cat /home/envoy/cds.yaml | \
 | `docker ps --filter label=…` | контейнеры этого кластера |
 | `config view -o jsonpath` | адрес сервера из kubeconfig |
 | `/home/envoy/cds.yaml` | файл Envoy со списком backend |
-| `grep -E 'address:\|port_value\|path:'` | адреса, порты и путь проверки здоровья |
+| `grep -E ' (address\|port_value\|path): '` | адреса, порты и путь проверки здоровья |
 
 Ожидаемый результат:
 
@@ -1303,10 +1294,13 @@ lab-10-1-control-plane3  kindest/node:v1.36.1
 lab-10-1-external-load-balancer  envoyproxy/envoy:v1.36.2
 lab-10-1-worker  kindest/node:v1.36.1
 https://127.0.0.1:<порт>
-          address: <IP узла>
-          port_value: 6443
-… (ещё два backend)
       path: /healthz
+              address: lab-10-1-control-plane
+              port_value: 6443
+              address: lab-10-1-control-plane2
+              port_value: 6443
+              address: lab-10-1-control-plane3
+              port_value: 6443
 ```
 
 Разбор вывода:
@@ -1314,7 +1308,7 @@ https://127.0.0.1:<порт>
 1. Три узла имеют роль `control-plane`, а рабочий узел — `<none>`. Все узлы Ready.
 2. Контейнеров пять: четыре узла и `lab-10-1-external-load-balancer` на образе Envoy. До kind 0.32 здесь был HAProxy.
 3. Адрес в kubeconfig — `127.0.0.1` и порт, который Docker привязал к контейнеру балансировщика. Клиент хоста не знает адресов узлов.
-4. В конфигурации Envoy три backend на порту 6443 и проверка здоровья по пути `/healthz`. Параметры проверки: интервал 2 секунды, тайм-аут 3 секунды, узел исключается после двух неудач подряд.
+4. В конфигурации Envoy три backend на порту 6443 и проверка здоровья по пути `/healthz`. Backend заданы именами контейнеров, а не IP: Envoy разрешает их через DNS сети Docker. Параметры проверки: интервал 2 секунды, тайм-аут 3 секунды, узел исключается после двух неудач подряд.
 
 #### Шаг 5. Проверить членов etcd и держателей аренды
 
@@ -1490,7 +1484,7 @@ Error from server …   (текст другой, чем выше)
 Разбор вывода:
 
 1. Запись не проходит. Для записи API-серверу нужно согласие большинства членов etcd, а живой член один из трёх.
-2. Готовность тоже не проходит: проверка etcd внутри `/readyz` и `/healthz` не выполняется. Балансировщик исключает последний backend по `/healthz`, поэтому вместо таймаута вы можете увидеть `connection refused` или `EOF`.
+2. Готовность тоже не проходит: проверка etcd внутри `/readyz` и `/healthz` не выполняется. Последний backend не проходит проверку здоровья, но Envoy по умолчанию всё равно шлёт на него соединения (panic mode: здоровых backend меньше половины). Поэтому чаще ошибку возвращает сам API-сервер, а не балансировщик.
 3. Поды на рабочем узле продолжают работать: kubelet и контейнеры не зависят от API. Но Deployment не заменит упавший под, а новые объекты нельзя создать.
 4. Вывод для практики: в кластере из трёх узлов нельзя останавливать два узла control plane одновременно.
 
@@ -1595,4 +1589,4 @@ kind копирует файлы CA из `/etc/kubernetes/pki` первого у
 
 ## → Дальше
 
-В этой части мы собрали кластер и увидели, что в стековой топологии каждый узел control plane несёт собственный член etcd, а кворум решает, пишет ли кластер. Часть 10-2 открывает этот член: как посмотреть его состояние, снять снимок, восстановить базу и что делать, когда она разрастается до квоты. Она идёт следующей: отказ из работы 3 вылечился возвратом узлов, а при потере данных спасает только снимок etcd.
+В этой части мы собрали кластер и увидели стековую топологию: каждый узел control plane несёт собственный член etcd. Пишет ли кластер, решает кворум этих членов. Часть 10-2 открывает этот член: как посмотреть его состояние, снять снимок, восстановить базу и что делать, когда она разрастается до квоты. Она идёт следующей: отказ из работы 3 вылечился возвратом узлов, а при потере данных спасает только снимок etcd.
