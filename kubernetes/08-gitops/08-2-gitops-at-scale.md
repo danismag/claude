@@ -1,182 +1,367 @@
 # 08-2. GitOps в масштабе
 
-> Модуль 8 «GitOps» · часть 2 из 2 · 🟡🔴 · ~1,5 ч чтения + ~45 мин лабы · Нужно: Argo CD, Gitea и репозиторий `lab/orders-gitops` из 08-1. В конце лабы Argo CD и Gitea удаляются.
+> Модуль 08 «GitOps» · часть 2 из 2 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд после 08-1 (Gitea 1.27.0, Argo CD 3.5.5, репозиторий `~/lab/k8s/gitops`, файл `~/lab/k8s/gitea.env`), overlays из 07-3, образ `orders-api:2.1` в реестре стенда (03-4) · Опирается на: 08-1 (Application, sync, selfHeal, prune, `ignoreDifferences`), 07-3 (overlays и `digest`), 01-3 (finalizer)
+
+## Где мы на карте
+
+В 08-1 один Application следил за одним каталогом. Эта часть отвечает на вопрос, что меняется, когда сервисов десятки, окружений несколько, а кластеров больше одного. Мы разберём, как описать конфигурацию в Git и как перенести версию из staging в prod. Отдельно посмотрим, где хранить секреты, если в Git им не место.
+
+Часть опирается на 08-1: Application, sync и health, `selfHeal`, `prune`, `ignoreDifferences`. Дальше курс переходит от доставки приложений к расширению самого API. Часть 09-1 разбирает CRD и операторы, а ApplicationSet и Application из этой части тоже относятся к CRD.
+
+```
+ Git: config-репозиторий
+   argocd/                     ← какие приложения существуют
+   apps/<сервис>/base          ← общее
+   apps/<сервис>/overlays/<env>← различия окружений
+        │
+        ▼
+ root (Application) ──► ApplicationSet ──► Application staging, Application prod ──► ресурсы
+        ▲
+        └── CI сервиса пишет в Git новый дайджест образа (промоушен)
+```
+
+Схема 1. Что хранит Git и кто на что ссылается: корневое Application читает каталог `argocd/`, ApplicationSet создаёт по Application на каждое окружение.
 
 ---
 
-## Зачем это DevOps-у
+## 1. Какую задачу решает GitOps в масштабе
 
-Одно Application руками — это демо. В работе — десятки сервисов в нескольких окружениях и кластерах, и вопросы другие: «как добавить новый сервис, не трогая Argo CD руками», «как промоутить версию из staging в prod», «где хранить секреты, если всё в Git», «почему удаление одной папки в Git снесло окружение» (кейс части). На собеседовании: «app-of-apps vs ApplicationSet», «как хранить секреты в GitOps», «Argo CD или Flux».
+Один Application создают руками за минуту, а сотню так создавать нельзя. Здесь собраны проблемы, которые появляются с ростом, и приёмы, которые их закрывают.
 
-Сквозной сценарий: overlays staging и prod orders-api становятся двумя Application, которые создаёт ApplicationSet; prod обновляется коммитом дайджеста, собранного CI.
+### Что ломается при росте
+
+Рост добавляет три измерения: сервисы, окружения и кластеры. Для 30 сервисов в 3 окружениях получается 90 Application, и каждое нужно создать, изменить и удалить, не открывая UI. Ручной `kubectl apply` для самих Application возвращает все проблемы, от которых избавлял GitOps: нет ревью, нет истории, нельзя воспроизвести.
+
+Вторая проблема — версии. Образ собирают один раз, а в окружениях он должен появляться по очереди, и каждое появление должно оставлять след в Git. Третья — секреты: Git остаётся единственным источником истины, но хранить в нём пароли нельзя.
+
+### Приёмы, которые это решают
+
+Каждая проблема закрывается своим приёмом, и дальше они разобраны по порядку.
+
+- **Структура репозиториев** — где лежат код и конфигурация и чем отличаются окружения (§2).
+- **Генерация Application** — один шаблон вместо сотни ручных объектов (§2).
+- **Промоушен** — перенос проверенной версии между окружениями коммитом (§3).
+- **Секреты вне открытого текста** — шифрование или ссылки на внешнее хранилище (§3).
+- **Мультикластерность** — одно описание, много адресатов (§2).
+
+### Чем отличается от 08-1
+
+В 08-1 механизм один: Application сравнивает Git и кластер. Здесь тот же механизм работает на многих объектах сразу, поэтому ошибка в одном файле задевает все окружения, а не одно. Такую цену платят за автоматизацию, и она определяет всё, что идёт дальше: защиту от массового удаления, ревью каталога `argocd/` и промоушен по дайджесту.
 
 ---
 
-## 1. Как Argo CD управляет самим собой: app-of-apps 🟡
+## 2. Как устроена конфигурация в Git
 
-Application, источником которого служит каталог с **другими** Application/ApplicationSet. Один корневой объект создаётся руками (или при установке), всё остальное — из Git.
+Конфигурацию масштабного GitOps описывают три слоя: структура репозиториев, объекты Argo CD в Git и генераторы, которые создают Application по шаблону.
 
-```
-Git: lab/orders-gitops
-  argocd/orders-appset.yaml          ← описание «какие приложения есть»
-  apps/orders-api/base/
-  apps/orders-api/overlays/{staging,prod}/
+### Структура репозиториев
 
-кластер: Application root (path: argocd) ─► ApplicationSet orders-api ─► Application orders-staging, orders-prod
-```
-
-Проверено:
+**Config-репозиторий** (config repository) — репозиторий, в котором лежат только манифесты и версии, без кода сервиса. Рядом с ним стоит **app-репозиторий** (application repository): код, Dockerfile и тесты одного сервиса. CI сервиса собирает образ из app-репозитория и записывает его версию в config-репозиторий.
 
 ```
-NAME                                    AGE
-applicationset.argoproj.io/orders-api   23s
-NAME                                     SYNC STATUS   HEALTH STATUS
-application.argoproj.io/orders-prod      Synced        Healthy
-application.argoproj.io/orders-staging   Synced        Healthy
-application.argoproj.io/root             Synced        Healthy
-prod replicas=3 image=localhost:5001/orders-api@sha256:ad4f8fd2…
+app-репо сервиса                         config-репо
+  src/, Dockerfile                         apps/orders-api/base/
+  CI: сборка, тесты, push образа  ───►     apps/orders-api/overlays/staging/
+       коммит дайджеста                    apps/orders-api/overlays/prod/
+                                           argocd/orders-appset.yaml
 ```
 
-Плюсы: настройки приложений (включая `ignoreDifferences` из 08-1) — в Git и на ревью; новый кластер поднимается применением одного корневого объекта. Минус классического app-of-apps — каждое дочернее Application пишут руками; для «одинаковых» приложений это делает ApplicationSet.
+Схема 2. Две стороны разделены: CI пишет в config-репозиторий, а Argo CD читает только его.
 
-## 2. ApplicationSet: генераторы 🟡
+Разделение нужно по двум причинам. Коммит с новой версией не запускает сборку заново, потому что лежит в другом репозитории. А права на prod-каталог выдают отдельно от прав на код.
 
-ApplicationSet — шаблон Application + **генератор** параметров:
+Схем размещения четыре, и у каждой своя область применения.
+
+- **Monorepo конфигурации** — манифесты всех сервисов в одном репозитории, как на стенде. Подходит одной платформенной команде и десяткам сервисов.
+- **Репозиторий на сервис** — манифесты рядом с кодом. Команды независимы, но промоушен требует запроса на слияние в каждом репозитории.
+- **App- и config-репозитории** — самый частый вариант в средних компаниях: код отдельно, версии и манифесты отдельно.
+- **Окружения ветками** — ветки `staging` и `prod`. Это анти-рецепт: слияние между ветками тащит лишние изменения, а истории расходятся.
+
+Окружения различают каталогами: overlay Kustomize (07-3) или файл значений Helm. Каталог можно защитить правилом владельцев (CODEOWNERS) и сравнить с соседним командой `diff`, а ветку так не сравнить.
+
+### Корневое Application: app-of-apps
+
+**App-of-apps** — приём, при котором Application указывает на каталог, где лежат другие объекты Argo CD. Корневое Application создают вручную один раз, остальное приходит из Git.
+
+```
+kubectl apply (один раз)
+        │
+        ▼
+ Application root ── path: argocd/ ──► ApplicationSet orders-api
+                                       Application platform-tools
+                                       AppProject team-a
+```
+
+Схема 3. Один объект создан руками, всё остальное — из каталога `argocd/`.
+
+Выигрыш в том, что настройки самих приложений, включая `ignoreDifferences` из 08-1, лежат в Git и проходят ревью. Новый кластер поднимается применением одного корневого объекта. Проблема классического приёма — каждое дочернее Application пишут руками, и для однотипных приложений это превращается в копирование. Эту работу берёт ApplicationSet.
+
+### ApplicationSet и генераторы
+
+**ApplicationSet** — объект Argo CD, который состоит из шаблона Application и **генератора** (generator): источника параметров. Контроллер ApplicationSet запускает генератор, подставляет каждый набор параметров в шаблон и создаёт по одному Application на набор.
+
+```
+ генератор ──► набор параметров ──► шаблон Application ──► Application
+ (каталоги,      {path.basename:      name: orders-{{...}}
+  список,         staging}            destination: lab-07-3-{{...}}
+  кластеры)      {path.basename: prod}
+```
+
+Схема 4. Из двух каталогов генератор получает два набора параметров, а шаблон превращает их в два Application.
+
+Генераторов несколько, и в таблице собраны основные.
 
 | Генератор | Откуда параметры | Типичный случай |
 |---|---|---|
-| `list` | список в самом объекте | несколько окружений с явными параметрами |
-| `git` (directories / files) | каталоги или JSON/YAML-файлы в репозитории | «папка = приложение/окружение» |
-| `cluster` | зарегистрированные в Argo CD кластеры (по меткам) | одно приложение во все кластеры |
-| `matrix`, `merge` | комбинация генераторов | сервисы × кластеры |
-| `scmProvider`, `pullRequest` | репозитории организации, открытые PR | preview-окружения на PR |
+| `list` | список в самом объекте | несколько окружений с явными значениями |
+| `git`, каталоги | подкаталоги репозитория | папка равна окружению |
+| `git`, файлы | JSON и YAML файлы в репозитории | параметры лежат в файле |
+| `clusters` | кластеры, зарегистрированные в Argo CD | одно приложение во все кластеры |
+| `matrix`, `merge` | комбинация других генераторов | сервисы на кластеры |
+| `pullRequest` | открытые запросы на слияние | preview-окружение на запрос |
 
-Стенд — генератор каталогов (проверено):
+Шаблон ссылается на параметры в фигурных скобках. Мы включаем `goTemplate: true`, тогда параметры читаются через точку, например `.path.basename`. Без этой настройки работает простая подстановка с другим синтаксисом, и перепутать их легко.
 
-```yaml
-spec:
-  goTemplate: true
-  generators:
-  - git:
-      repoURL: http://gitea.gitea.svc:3000/lab/orders-gitops.git
-      revision: main
-      directories: [{path: apps/orders-api/overlays/*}]
-  template:
-    metadata:
-      name: 'orders-{{ .path.basename }}'
-    spec:
-      source: {repoURL: …, targetRevision: main, path: '{{ .path.path }}'}
-      destination: {server: https://kubernetes.default.svc, namespace: 'lab-07-3-{{ .path.basename }}'}
-      ignoreDifferences: [{group: apps, kind: Deployment, jsonPointers: [/spec/replicas]}]
-      syncPolicy:
-        automated: {prune: true, selfHeal: true}
-        syncOptions: [RespectIgnoreDifferences=true]
-```
+Главное свойство ApplicationSet: он владеет созданными Application. Исчез набор параметров — исчезло и Application. Эта связь делает ApplicationSet удобным и опасным одновременно (§5).
 
-Новое окружение — новый каталог overlay в Git; Argo CD создаст Application сам.
+### Генератор pullRequest
 
-### Ловушка: удаление каталога удаляет окружение 🔴
-
-Проверено: у сгенерированного Application есть `finalizers: ["resources-finalizer.argocd.argoproj.io"]`. Каталог `overlays/staging` убрали из Git:
+**Preview-окружение** (preview environment) — временная копия приложения, которую поднимают под каждый открытый запрос на слияние (pull request) и убирают после закрытия. Генератор `pullRequest` опрашивает Git-сервер и выдаёт параметр на каждый открытый запрос.
 
 ```
-commit ca290d0
-Application gone after 4s
-resources in lab-07-3-staging: 0          ← Deployment, Service, ConfigMap, HTTPRoute удалены каскадно
+ PR #12 открыт  ──┐
+ PR #15 открыт  ──┼─► генератор pullRequest ─► Application orders-pr-12, orders-pr-15
+ PR #12 закрыт  ──┘                            Application orders-pr-12 удалён
 ```
 
-Опечатка в пути генератора, неудачный рефакторинг структуры репозитория, force-push не той ветки — и ApplicationSet удаляет приложения **вместе с ресурсами**. Защита:
+Схема 5. Жизнь preview-окружения привязана к запросу: открыт — есть Application, закрыт — генератор перестал его выдавать.
 
-```yaml
-spec:
-  syncPolicy:
-    preserveResourcesOnDeletion: true     # Application удаляется, ресурсы остаются
-    applicationsSync: create-update        # ApplicationSet не удаляет Application вообще (create-only — и не обновляет)
-```
+Генератор поддерживает Gitea, GitHub, GitLab, Bitbucket и Azure DevOps. Для Gitea обязательны поля `owner`, `repo` и `api`, а токен задаётся ссылкой `tokenRef` на Secret. Шаблон получает параметры `number`, `branch`, `branch_slug` (ветка в виде имени по RFC 1123, не длиннее 50 знаков) и `head_sha`. Метки запроса доступны как `labels` только при `goTemplate: true`.
 
-⚠️ Эти два поля на стенде не включались — проверено только поведение по умолчанию. Плюс защита ветки `main` (без force-push), ревью изменений в каталоге `argocd/`, и для stateful-приложений — `prune: false` у Application.
+Опрашивает Git-сервер генератор раз в `requeueAfterSeconds`, по умолчанию раз в 1800 с, то есть раз в 30 минут. Ускоряет доставку webhook, но по документации Argo CD webhook ApplicationSet умеет события GitHub и GitLab, а Gitea в списке нет. На стенде мы этот генератор не запускаем: он описан для понимания, а preview-окружения требуют отдельного токена и решения, куда их публиковать.
 
-## 3. Структура репозиториев 🟡
+### Многокластерность
 
-| Схема | Как | Когда |
-|---|---|---|
-| **monorepo конфигурации** | все манифесты всех сервисов и окружений в одном репозитории (как стенд) | одна платформенная команда, десятки сервисов |
-| **repo на сервис** | манифесты рядом с кодом сервиса | команды независимы, но промоушен = MR в каждый репозиторий |
-| **app-репо + config-репо** | код и Dockerfile — в репозитории сервиса; манифесты и версии — в отдельном config-репозитории | самый частый: CI сервиса пишет версию в config-репо |
-| окружения — ветки | `staging`, `prod` ветки | анти-рецепт: merge между ветками тащит лишнее, история расходится; окружения — каталоги |
-
-Принципы: окружения различаются **каталогами** (overlays/values), а не ветками; в Git — только то, что применяется к кластеру (нет секретов, нет сгенерированных артефактов); права на каталог prod — у меньшего круга, чем на staging.
-
-## 4. Промоушен: CI пишет дайджест в Git 🟡🔴
+**Кластерный генератор** (cluster generator, ключ `clusters`) выдаёт набор параметров на каждый кластер, который зарегистрирован в Argo CD. Регистрация — это Secret с меткой `argocd.argoproj.io/secret-type: cluster` в namespace `argocd`.
 
 ```
-CI сервиса: сборка → push образа → дайджест sha256:…
-          → коммит в config-репо: overlays/staging/kustomization.yaml (images.digest)
-          → тесты на staging → MR в overlays/prod (тот же дайджест) → ревью → merge
-Argo CD:  видит коммит → sync → rollout
+ Secret cluster-prod-eu  (метка env=prod) ┐
+ Secret cluster-prod-us  (метка env=prod) ┼─► clusters{selector env=prod}
+ Secret cluster-dev      (метка env=dev)  ┘        │
+                                                   ▼
+                              Application <кластер>-orders, destination.server = адрес кластера
 ```
 
-Проверено на стенде: дайджест `2.1` получен из реестра (`HEAD /v2/orders-api/manifests/2.1` → `Docker-Content-Digest`), записан в prod-overlay коммитом `def057c`:
+Схема 6. Селектор по меткам выбирает кластеры, а `server` каждого кластера попадает в `destination` шаблона.
 
-```
-2.1 digest: sha256:053e1ef23615b9db38c3aef750040bf4a3770532248bd13a2956c8d26c4ffd36
-commit def057c
-deployment "orders-api" successfully rolled out
-after 6s
-{"version": "2.1", "pod": "orders-api-864d698dfc-8l6pc"}
-Synced/Healthy def057c16fdeeaf7ac9e4119fb6d73672ce1ed39
-```
+Шаблон получает параметры `name`, `server` и метки кластера `metadata.labels.<ключ>`. Локальный кластер, где работает Argo CD, по умолчанию не имеет такого Secret, и селектор по метке его не выбирает. Чтобы включить локальный кластер, для него создают Secret явно. Генераторы комбинируют: `matrix` берёт список сервисов и список кластеров и создаёт Application на каждую пару.
 
-Промоушен — **тот же дайджест**, а не пересборка (курс `cicd` 03-1). История промоушенов — это `git log` каталога prod: кто, когда, какой дайджест. Автоматизация вместо CI-коммитов — Argo CD Image Updater (следит за реестром и пишет в Git или в параметры Application) или Kargo (стадии и промоушен как объекты) — ⚠️ на стенде не ставились.
-
-Доступ CI к config-репо — отдельным ключом/токеном только на запись в нужные каталоги; кластер CI не нужен вообще.
-
-## 5. Секреты в GitOps 🔴
-
-Git — источник истины, но секреты в нём хранить нельзя, даже base64 (04-1). Варианты:
-
-| Подход | В Git | Кто расшифровывает | Плюсы | Минусы |
-|---|---|---|---|---|
-| **External Secrets Operator** | `ExternalSecret`: ссылка «ключ X из Vault/AWS SM/Lockbox» | ESO в кластере, кладёт обычный Secret | секреты живут в менеджере, ротация там же | нужен внешний менеджер секретов; Secret в etcd (04-1 — шифрование) |
-| **Secrets Store CSI Driver** | `SecretProviderClass` | драйвер, монтирует файлом | секрет может не попадать в etcd | только тома; синхронизация в Secret — опционально |
-| **SOPS** (+ age/KMS) | зашифрованный файл, ключи видны, значения — нет | плагин Argo CD (KSOPS, helm-secrets) или Flux (нативно) | секреты версионируются рядом с манифестами | ключ расшифровки в кластере; ротация — перешифровать файлы |
-| **Sealed Secrets** | `SealedSecret`, зашифрованный публичным ключом контроллера | контроллер в кластере | просто, без внешних систем | привязан к ключу кластера; бэкап ключа обязателен |
-| секрет создаётся вне GitOps | ничего | человек/скрипт | быстро на стенде (так сделано в лабах) | не воспроизводимо, нет аудита |
-
-⚠️ Ни один из инструментов на стенде не ставился — секрет `postgres` в лабах создаётся командой вне Git. Практичный выбор: есть Vault или облачный менеджер — ESO; нет — SOPS с age/KMS (Flux) или Sealed Secrets. В любом варианте Argo CD не должен показывать значения в diff: для Secret'ов он маскирует данные, но плагины рендеринга видят их в открытом виде — права на repo-server и логи.
-
-## 6. Argo CD и Flux 🟡
-
-| | Argo CD | Flux |
-|---|---|---|
-| Модель | Application (что → куда), центральный контроллер | набор контроллеров: GitRepository/OCIRepository → Kustomization / HelmRelease |
-| UI | встроенный, сильный | нет своего (Weave GitOps, Headlamp — сторонние) |
-| Мультикластер | из одного Argo CD во многие кластеры | обычно Flux в каждом кластере |
-| Helm | рендерит сам (`helm template`), `helm list` пуст (07-3) | HelmRelease через Helm SDK — настоящий релиз с историей |
-| SOPS | через плагины | встроено |
-| Генерация приложений | ApplicationSet | Kustomization с подстановками, ResourceSet в новых версиях |
-| Порог входа | ниже (UI, наглядный diff) | выше, но меньше «магии» |
-
-Оба — проекты CNCF graduated. Типичный выбор: Argo CD, когда важны UI и централизованное управление многими кластерами; Flux — когда нужны «кирпичики» и нативный SOPS/Helm-релизы.
+Многокластерная схема меняет и модель доступа. Один Argo CD хранит учётные данные всех кластеров, значит, его компрометация открывает все кластеры. Альтернатива — отдельный Argo CD в каждом кластере (так обычно работает Flux, §3).
 
 ---
 
-## 🔧 Лаба
+## 3. Как управлять версиями и секретами
 
-### Шаг 0. Подготовка
+Управление масштабом сводится к трём действиям: перенести версию между окружениями, связать это с CI и спрятать секреты. Затем сравним Argo CD с Flux.
 
-Нужны Argo CD, Gitea, `~/lab/k8s/gitops` и функции `gpush`/`refresh` из 08-1 (`. ~/lab/k8s/gitea.env`).
+### Промоушен по окружениям
+
+**Промоушен** (promotion) — перенос проверенной версии из одного окружения в другое. В GitOps это коммит: в overlay следующего окружения записывается тот же **дайджест** (digest) образа, что проверен в предыдущем. Дайджест — хеш содержимого образа вида `sha256:…`, он однозначно определяет образ, в отличие от тега, который можно переписать (07-3).
+
+```
+ CI: сборка ─► push образа ─► дайджест sha256:…
+        │
+        ▼
+ коммит в overlays/staging ─► Argo CD ─► rollout в staging ─► проверки
+        │
+        ▼  запрос на слияние с тем же дайджестом
+ overlays/prod (ревью владельцев) ─► Argo CD ─► rollout в prod
+```
+
+Схема 7. Версия идёт по цепочке коммитов: каждый шаг оставляет запись в Git, а дайджест остаётся одним и тем же.
+
+Тот же дайджест нужен затем, что в prod должен попасть именно проверенный образ, а не новая сборка из того же исходного кода. История промоушенов читается командой `git log` по каталогу prod: кто, когда и какой дайджест выкатил. Доступ CI к config-репозиторию выдают отдельным ключом или токеном, и только на запись в нужные каталоги. Кластер CI при этом не нужен вообще, в этом и состоит pull-модель.
+
+### Связь с CI: коммит или автоматика
+
+Записывать дайджест можно тремя способами. Первый: шаг пайплайна CI делает коммит в config-репозиторий (курс `cicd`). Он прост, прозрачен и годится большинству команд.
+
+Второй способ — **Argo CD Image Updater**, отдельный контроллер, который следит за реестром и при появлении нового образа обновляет приложение. Он умеет два вида записи: в параметры Application в кластере или коммитом в Git. Первый вид обходит Git и ломает принцип «Git — источник истины», поэтому для prod выбирают запись в Git. Конфигурация Image Updater в версиях 1.x вынесена в собственный CRD; точный вид настройки зависит от версии, смотрите документацию проекта.
+
+Третий способ — **Kargo**, платформа промоушена, в которой стадии, источники версий (Warehouse) и сами переносы (Freight) описаны объектами Kubernetes. Kargo подходит, когда цепочка длинная, а правила переноса сложные. Для одного сервиса и двух окружений хватает коммита из CI.
+
+Есть и смежная идея: **Source Hydrator** в Argo CD рендерит манифесты и записывает готовый результат в отдельную ветку. Своё состояние он хранит в git note с версии 3.3. Так в Git виден итоговый YAML, а не только исходные шаблоны. Приём молодой, и в курсе мы его не разбираем.
+
+### Секреты в GitOps
+
+Секреты хранить в Git открытым текстом нельзя, и base64 не шифрование: значение остаётся в истории навсегда (04-1). Четыре подхода решают задачу по-разному; общие принципы работы с секретами и ключами разобраны в курсе security.
+
+| Подход | Что лежит в Git | Кто расшифровывает |
+|---|---|---|
+| External Secrets Operator | ссылка на значение во внешнем хранилище | оператор в кластере |
+| SOPS | файл с зашифрованными значениями | плагин Argo CD или Flux |
+| Sealed Secrets | SealedSecret, зашифрованный публичным ключом | контроллер в кластере |
+| секрет вне GitOps | ничего | человек или скрипт |
+
+**External Secrets Operator** (ESO) читает значения из внешнего хранилища, например Vault или облачного менеджера секретов, и создаёт из них обычный Secret. В Git лежит объект `ExternalSecret` со ссылкой на ключ, а не на значение. Секрет живёт и ротируется в хранилище, ESO периодически обновляет Secret. Минус: нужно само хранилище, а созданный Secret всё равно хранится в etcd (04-1). Актуальная линия — v2.x (v2.13.0 на 16.10.2026), версия API — `external-secrets.io/v1`; `v1beta1` ESO перестал обслуживать с v0.17.0.
+
+**SOPS** (Secrets OPerationS) шифрует значения в YAML-файле, оставляя ключи видимыми, так что в ревью видно, какой параметр изменился. Ключи шифрования берут из облачного KMS или из **age** — простой утилиты шифрования с короткими ключами. Flux расшифровывает SOPS сам, а Argo CD для этого нужен плагин (например, KSOPS или helm-secrets). Закрытый ключ приходится хранить в кластере, а ротация означает перешифровку файлов.
+
+**Sealed Secrets** шифрует Secret открытым ключом контроллера, который работает в кластере. Утилита `kubeseal` создаёт `SealedSecret`, и расшифровать его может только контроллер этого кластера. Это просто и не требует внешних систем. Платой становится привязка к кластеру: без резервной копии закрытого ключа восстановить секреты в новом кластере нельзя. По умолчанию контроллер создаёт новый ключ шифрования каждые 30 дней, старые остаются для расшифровки.
+
+Выбор такой: есть Vault или облачный менеджер — ESO; нет внешнего хранилища — SOPS с age или KMS, либо Sealed Secrets для одного кластера. Во всех вариантах Argo CD маскирует значения Secret в diff, но плагины рендеринга видят их открытыми. Поэтому права на `argocd-repo-server` и его логи защищают так же строго, как сами секреты. Версии SOPS и Sealed Secrets перед установкой сверьте с релизами проектов.
+
+### Argo CD и Flux
+
+**Flux** — второй GitOps-инструмент уровня CNCF graduated, набор контроллеров вместо одного центрального. Источник (GitRepository или OCIRepository) отделён от применения (Kustomization и HelmRelease). Сравним по основным свойствам.
+
+| Свойство | Argo CD | Flux |
+|---|---|---|
+| Модель | Application «что куда», центральный контроллер | набор контроллеров, источник и применение раздельно |
+| Интерфейс | свой UI, наглядный diff | своего UI нет, есть сторонние |
+| Много кластеров | один Argo CD управляет многими | обычно Flux в каждом кластере |
+| Helm | рендерит сам, список релизов Helm пуст (07-1) | HelmRelease создаёт настоящий релиз Helm |
+| SOPS | через плагины | встроен |
+| Генерация приложений | ApplicationSet | Kustomization с подстановками |
+
+Из свежих изменений Flux: версия 2.7 (сентябрь 2025) перевела API автоматизации образов в GA и добавила ExternalArtifact и ArtifactGenerator. Версия 2.8 (февраль 2026) поддержала Helm 4. Flux выбирают, когда нужны отдельные «кирпичики», нативный SOPS и релизы Helm. Argo CD выбирают, когда важны UI и централизованное управление кластерами.
+
+---
+
+## 4. Как увидеть состояние
+
+Состояние GitOps в масштабе читается на трёх уровнях: ApplicationSet, порождённые Application и сам Git.
+
+### ApplicationSet и его условия
+
+Команда `kubectl -n argocd get applicationset` показывает объекты, а их условия лежат в `status.conditions`. Нас интересуют три условия: `ErrorOccurred` (генератор или шаблон дали ошибку), `ParametersGenerated` (параметры получены) и `ResourcesUpToDate` (Application созданы и обновлены). Сначала смотрят `ErrorOccurred`: опечатка в шаблоне или недоступный репозиторий видны именно там. Журнал контроллера: `kubectl -n argocd logs deploy/argocd-applicationset-controller`.
+
+### Что сгенерируется до слияния
+
+Команда `argocd appset generate` рендерит ApplicationSet локально и печатает Application, которые получились бы из него, ничего не создавая. Ею проверяют изменение генератора в запросе на слияние: какие Application появятся и какие исчезнут. Это единственная защита от массового удаления, которая срабатывает до слияния, а не после.
+
+### Git как журнал
+
+Кто и что выкатил в prod, читается из `git log` каталога prod. Application показывает, какая ревизия применена: `kubectl -n argocd get app -o custom-columns=NAME:.metadata.name,REV:.status.sync.revision`. Сравнение ревизии Application с `git rev-parse` ветки отвечает на вопрос, доехал ли коммит.
+
+---
+
+## 5. Что ломается и как найти причину
+
+Поломки масштаба связаны с тем, что один объект управляет многими. Ошибка в одном месте задевает все окружения сразу.
+
+### Удаление каталога удаляет окружение
+
+Если каталог пропал из Git, генератор перестаёт выдавать его параметры, и ApplicationSet удаляет Application. Сгенерированному Application по умолчанию ставится finalizer `resources-finalizer.argocd.argoproj.io` (01-3), поэтому удаление каскадное: пропадают Deployment, Service, ConfigMap и HTTPRoute. Опечатка в пути генератора, перенос каталогов или принудительная отправка не той ветки действуют так же. PVC из `volumeClaimTemplates` StatefulSet не принадлежат Application и остаются, поэтому данные целы, но доступность потеряна.
+
+Защита состоит из слоёв.
+
+- **`preserveResourcesOnDeletion: true`** — Application удаляется без каскада, ресурсы остаются.
+- **`applicationsSync: create-update`** — ApplicationSet создаёт и обновляет Application, но не удаляет. Значения: `create-only`, `create-update`, `create-delete`, `sync` (по умолчанию).
+- **Защита ветки** — запрет принудительной отправки в `main` и обязательное ревью каталога `argocd/`.
+- **Проверка до слияния** — `argocd appset generate` на ветке запроса.
+- **`prune: false`** — у Application с данными, чтобы удаление из Git не удаляло объекты.
+
+Оговорка из документации: `create-only` и `create-update` не защищают от удаления самого ApplicationSet, потому что тогда Application удаляет владелец-ссылка. От этого помогает finalizer `resources-finalizer.argocd.argoproj.io` на самом ApplicationSet и каскад в фоне.
+
+### Корневое Application и порядок удаления
+
+Корневое Application без finalizer при удалении оставляет все созданные им объекты, в том числе ApplicationSet. Это удобно для уборки: сначала удаляют корневое, потом ApplicationSet. Обратный порядок не работает, потому что корневое Application с `selfHeal` пересоздаёт удалённый ApplicationSet из Git.
+
+### Другие причины
+
+Типичные случаи, у каждого свой признак.
+
+- **Опечатка в `path` генератора** — Application не создаются, `ErrorOccurred` или пустой список параметров.
+- **Application не создаётся** — на стенде одноимённый Application уже существует и принадлежит не ApplicationSet; такой объект сначала удаляют.
+- **Prod ушёл вперёд staging** — дайджест записали в prod, минуя staging; ловится ревью и CODEOWNERS.
+- **Расшифровка не работает** — нет ключа age или плагина; Secret не создан, а Application в `Degraded`.
+- **Секрет в Git открытым текстом** — удаление коммита не помогает, значение считается скомпрометированным и меняется.
+
+---
+
+## 6. Пределы и значения по умолчанию
+
+Числа и версии части собраны здесь, по группам. На стенде стоят Argo CD 3.5.5 (на 12.10.2026 это последняя версия), Gitea 1.27.0 и Kubernetes 1.36.
+
+### Опрос и генераторы
+
+- **Опрос Git** — раз в 180 с (`timeout.reconciliation`, 08-1); ускоряют webhook и аннотация `refresh`.
+- **Генератор pullRequest** — `requeueAfterSeconds` по умолчанию 1800 с, `branch_slug` не длиннее 50 знаков.
+
+### Защита от удаления
+
+- **`applicationsSync`** — по умолчанию `sync`: создание, изменение и удаление разрешены.
+- **Флаги контроллера ApplicationSet** — `--policy` (те же четыре значения) и `--enable-policy-override` (по умолчанию `false`).
+- **`--dryrun true`** — контроллер ничего не создаёт и не удаляет.
+
+### Версии и безопасность
+
+- **ESO** — линия v2.x, API `external-secrets.io/v1`.
+- **Sealed Secrets** — новый ключ шифрования каждые 30 дней по умолчанию.
+- **CVE октября 2026** — обход ограничений AppProject через PreDelete и PostDelete хуки исправлен в 3.3.15, 3.4.10 и 3.5.4, поэтому 3.5.5 на стенде его содержит.
+- **CRD ApplicationSet** слишком велик для client-side apply: Argo CD ставят с `--server-side` (08-1).
+- **Argo CD 3.5** встраивает Helm 4 и игнорирует параметр `helm.version: v3`.
+
+---
+
+## Лабораторные работы
+
+Работы начинаются со стенда после 08-1: Argo CD и Gitea они не ставят. В кластере уже работают Gitea и Argo CD 3.5.5, репозиторий `~/lab/k8s/gitops` содержит `apps/orders-api` с overlays staging и prod, есть файл `~/lab/k8s/gitea.env`. Namespace у объектов задают overlays из 07-3, поэтому окружения лежат в `lab-07-3-staging` и `lab-07-3-prod`; префикс `lab-08-2` для этих namespace не используется. Собственные временные файлы работ — в `~/lab/k8s/08-2/`. Работы выполняйте по порядку.
+
+Сначала подготовка: пароль Gitea, функция коммита и namespace окружений. Оболочка не помнит функции между сессиями, поэтому `gpush` задаётся заново.
 
 ```bash
-kubectl -n argocd delete app orders-staging --ignore-not-found        # осталось из 08-1 — теперь им управляет ApplicationSet
+mkdir -p ~/lab/k8s/08-2
+. ~/lab/k8s/gitea.env
+gpush() { git -C ~/lab/k8s/gitops add -A && git -C ~/lab/k8s/gitops commit -qm "$1" && \
+  git -C ~/lab/k8s/gitops push -q \
+  "http://$GITEA_USER:$GITEA_PASS@git.localhost:8088/lab/orders-gitops.git" main && \
+  git -C ~/lab/k8s/gitops rev-parse --short HEAD; }
+kubectl -n argocd delete app orders-staging --ignore-not-found
 for ns in lab-07-3-staging lab-07-3-prod; do
   kubectl create ns $ns 2>/dev/null
-  kubectl -n $ns get secret postgres >/dev/null 2>&1 || kubectl -n $ns create secret generic postgres \
+  kubectl -n $ns get secret postgres >/dev/null 2>&1 || \
+    kubectl -n $ns create secret generic postgres \
     --from-literal=DATABASE_URL=postgresql://orders:orders-lab-pass@postgres.orders:5432/orders
 done
 ```
 
-### Шаг 1. ApplicationSet в Git и корневое Application
+| Часть команды | Значение |
+|---|---|
+| `. ~/lab/k8s/gitea.env` | загрузить `GITEA_USER` и `GITEA_PASS` из файла |
+| `gpush() { … }` | функция: коммит, отправка в Gitea, печать короткого хеша |
+| `delete app orders-staging --ignore-not-found` | убрать Application из 08-1: ApplicationSet не забирает чужие объекты |
+| `create ns $ns 2>/dev/null` | создать namespace, ошибку «уже есть» скрыть |
+| `create secret generic postgres` | секрет базы; в Git его нет |
+
+Команды ничего не печатают, кроме строк `namespace/… created` и `secret/postgres created`. Секрет создан вне Git намеренно: способы хранить его в Git описаны в §3.
+
+### Лабораторная работа 1. ApplicationSet и корневое Application
+
+**Цель.** Описать окружения одним ApplicationSet в Git, подключить его корневым Application и увидеть, что Application появляются без ручных объектов.
+
+**Что понадобится.**
+
+- стенд после 08-1 и подготовка выше;
+- overlays `staging` и `prod` в `apps/orders-api/overlays/`;
+- около 2 минут на ожидание синхронизации.
+
+**Схема опыта.**
+
+```
+ Git: argocd/orders-appset.yaml
+        ▲ читает
+ Application root ──► ApplicationSet orders-api ──► Application orders-staging ─► lab-07-3-staging
+ (создан вручную)      generator: каталоги            Application orders-prod    ─► lab-07-3-prod
+                       apps/orders-api/overlays/*
+```
+
+Схема 8. Руками создан один объект `root`; остальные породили Git и генератор.
+
+#### Шаг 1. Записать ApplicationSet в Git
+
+Команда создаёт файл ApplicationSet в каталоге `argocd/` репозитория и отправляет его в Gitea.
 
 ```bash
 mkdir -p ~/lab/k8s/gitops/argocd
@@ -202,7 +387,9 @@ spec:
         repoURL: http://gitea.gitea.svc:3000/lab/orders-gitops.git
         targetRevision: main
         path: '{{ .path.path }}'
-      destination: {server: https://kubernetes.default.svc, namespace: 'lab-07-3-{{ .path.basename }}'}
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: 'lab-07-3-{{ .path.basename }}'
       ignoreDifferences:
       - {group: apps, kind: Deployment, jsonPointers: [/spec/replicas]}
       syncPolicy:
@@ -210,157 +397,484 @@ spec:
         syncOptions: [RespectIgnoreDifferences=true]
 E
 gpush "argocd: ApplicationSet for orders overlays"
+```
+
+| Часть команды | Значение |
+|---|---|
+| `generators: - git: directories` | выдавать набор параметров на каждый подкаталог |
+| `path: apps/orders-api/overlays/*` | маска каталогов: `staging` и `prod` |
+| `name: 'orders-{{ .path.basename }}'` | имя Application из имени каталога |
+| `path: '{{ .path.path }}'` | источник Application — найденный каталог |
+| `namespace: 'lab-07-3-{{ .path.basename }}'` | namespace, совпадающий с тем, что задаёт overlay |
+| `ignoreDifferences`, `RespectIgnoreDifferences=true` | защита `replicas` от HPA, как в 08-1 |
+
+Результат: команда печатает короткий хеш нового коммита, например `3c1a9f0`.
+
+Разбор: хеш показывает, что файл попал в `main`. ApplicationSet пока только лежит в Git, в кластере его нет, и Application не созданы.
+
+#### Шаг 2. Создать корневое Application
+
+Команда создаёт в кластере единственный объект, вручную: Application `root`, который читает каталог `argocd/`.
+
+```bash
 kubectl apply -f - <<'EOF'
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata: {name: root, namespace: argocd}
 spec:
   project: default
-  source: {repoURL: http://gitea.gitea.svc:3000/lab/orders-gitops.git, targetRevision: main, path: argocd}
+  source:
+    repoURL: http://gitea.gitea.svc:3000/lab/orders-gitops.git
+    targetRevision: main
+    path: argocd
   destination: {server: https://kubernetes.default.svc, namespace: argocd}
   syncPolicy: {automated: {prune: true, selfHeal: true}}
 EOF
-sleep 60; kubectl -n argocd get applicationset,app
-kubectl -n lab-07-3-prod get deploy orders-api -o jsonpath='{.status.readyReplicas} {.spec.template.spec.containers[0].image}{"\n"}'
 ```
 
-Проверено: вывод в §1.
+| Часть команды | Значение |
+|---|---|
+| `path: argocd` | источник — каталог с ApplicationSet |
+| `destination … namespace: argocd` | объекты Argo CD живут в своём namespace |
+| `automated: {prune, selfHeal}` | применять и возвращать к Git без ручного sync |
+| нет `finalizers` | при удалении `root` дочерние объекты останутся |
 
-### Шаг 2. Промоушен дайджеста в prod
+Результат: `application.argoproj.io/root created`.
+
+Разбор: `root` не содержит ни одного приложения, он только указывает на каталог. Все остальные объекты придут оттуда.
+
+#### Шаг 3. Проверить, что Application появились
+
+Команда ждёт минуту, пока Argo CD прочитает Git, и показывает ApplicationSet, Application и образ prod.
 
 ```bash
-D=$(curl -sI -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' http://127.0.0.1:5001/v2/orders-api/manifests/2.1 \
-  | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}'); echo $D
-sed -i "s/digest: sha256:.*/digest: $D/" ~/lab/k8s/gitops/apps/orders-api/overlays/prod/kustomization.yaml
+sleep 60
+kubectl -n argocd get applicationset,app
+kubectl -n lab-07-3-prod get deploy orders-api -o jsonpath=\
+'prod replicas={.status.readyReplicas} image={.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `get applicationset,app` | оба типа объектов за один запрос |
+| `jsonpath … readyReplicas` | число готовых реплик prod |
+| `containers[0].image` | образ, который сейчас в Deployment |
+
+Результат:
+
+```
+NAME                                    AGE
+applicationset.argoproj.io/orders-api   23s
+NAME                                     SYNC STATUS   HEALTH STATUS
+application.argoproj.io/orders-prod      Synced        Healthy
+application.argoproj.io/orders-staging   Synced        Healthy
+application.argoproj.io/root             Synced        Healthy
+prod replicas=3 image=localhost:5001/orders-api@sha256:ad4f8fd2…
+```
+
+Разбор:
+
+1. `applicationset … orders-api` — `root` применил файл из Git; руками этот объект не создавали.
+2. `orders-prod` и `orders-staging` — Application создал ApplicationSet, по одному на каталог.
+3. `Synced / Healthy` у всех трёх — Git и кластер совпадают, ресурсы работают.
+4. `prod replicas=3 image=…@sha256:…` — prod работает на образе, закреплённом дайджестом (07-3).
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Руками создан один объект, остальное идёт из Git | шаг 2, шаг 3 |
+| Каталог в Git превращается в Application | `orders-staging`, `orders-prod` |
+| Корневое Application читает не приложения, а описание приложений | `path: argocd` |
+
+**Уборка.** Ничего не удаляется: ApplicationSet и Application нужны для работ 2 и 3.
+
+**Вопросы для самопроверки.**
+
+1. Почему в подготовке пришлось удалить Application `orders-staging` из 08-1?
+2. Что произойдёт, если добавить каталог `overlays/qa` и отправить коммит?
+3. Зачем у `root` нет finalizer'а?
+
+<details>
+<summary>Ответ</summary>
+
+1. ApplicationSet не забирает Application, которые создали не он. Объект с тем же именем остался бы чужим, и ApplicationSet не смог бы им управлять.
+2. Генератор найдёт новый каталог в течение опроса Git (по умолчанию до 180 с), и появится Application `orders-qa`. Namespace `lab-07-3-qa` при этом нужно создать заранее, как в подготовке.
+3. Без finalizer'а удаление `root` не каскадирует на ApplicationSet и порождённые Application. Это нужно для порядка уборки в работе 3.
+
+</details>
+
+### Лабораторная работа 2. Промоушен дайджеста
+
+**Цель.** Перенести версию 2.1 в prod одним коммитом с дайджестом и прочитать историю промоушена из Git.
+
+**Что понадобится.**
+
+- работа 1 выполнена: Application `orders-prod` существует;
+- образ `orders-api:2.1` в реестре стенда `127.0.0.1:5001`;
+- подготовленные функции `gpush` и данные Gitea.
+
+**Схема опыта.**
+
+```
+ реестр :5001  ── HEAD /v2/orders-api/manifests/2.1 ──► Docker-Content-Digest
+                                                         │
+ overlays/prod/kustomization.yaml  ◄── digest: sha256:… ─┘  (коммит в Git)
+                      │
+                      ▼
+          Argo CD: sync ─► rollout ─► /version отвечает 2.1
+```
+
+Схема 9. Дайджест берётся из реестра, записывается в Git, а в кластер его доставляет Argo CD.
+
+#### Шаг 1. Получить дайджест образа
+
+Команда спрашивает у реестра заголовок `Docker-Content-Digest` для тега 2.1.
+
+```bash
+D=$(curl -sI \
+  -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+  http://127.0.0.1:5001/v2/orders-api/manifests/2.1 \
+  | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+echo "2.1 digest: $D"
+```
+
+| Часть команды | Значение |
+|---|---|
+| `curl -sI` | запрос HEAD без тела, молча |
+| `Accept: …manifest.v2+json` | запросить манифест в формате v2, чтобы реестр вернул его дайджест |
+| `tr -d '\r'` | убрать возврат каретки из заголовков HTTP |
+| `awk … tolower($1)==…` | взять значение заголовка независимо от регистра |
+
+Результат:
+
+```
+2.1 digest: sha256:053e1ef23615b9db38c3aef750040bf4a3770532248bd13a2956c8d26c4ffd36
+```
+
+Разбор: 64 шестнадцатеричных знака после `sha256:` — хеш манифеста образа. Он не изменится, пока образ тот же, даже если тег `2.1` переставят.
+
+#### Шаг 2. Записать дайджест в prod-overlay
+
+Команда подставляет дайджест в overlay prod, отправляет коммит и запоминает время.
+
+```bash
+t0=$(date +%s)
+sed -i "s/digest: sha256:.*/digest: $D/" \
+  ~/lab/k8s/gitops/apps/orders-api/overlays/prod/kustomization.yaml
 gpush "prod: promote orders-api 2.1 ($D)"
+```
+
+| Часть команды | Значение |
+|---|---|
+| `t0=$(date +%s)` | момент старта для замера |
+| `sed -i "s/digest: sha256:.*/digest: $D/"` | заменить строку `digest` на новую |
+| `gpush "prod: promote …"` | коммит с дайджестом в сообщении |
+
+Результат: хеш коммита, на стенде автора это было `def057c`; у вас он другой.
+
+Разбор: изменилась одна строка в одном файле. Это и есть промоушен: ревью видит ровно то, что уйдёт в prod.
+
+#### Шаг 3. Дождаться выкатки и проверить версию
+
+Команда просит Argo CD перечитать Git, ждёт rollout и спрашивает у приложения версию.
+
+```bash
 kubectl -n argocd annotate app orders-prod argocd.argoproj.io/refresh=normal --overwrite
 kubectl -n lab-07-3-prod rollout status deploy/orders-api
-kubectl -n lab-07-3-prod exec deploy/orders-api -- python -c "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8000/version').read().decode())"
+echo "after $(( $(date +%s)-t0 ))s"
+kubectl -n lab-07-3-prod exec deploy/orders-api -- python -c \
+  "import urllib.request as u;print(u.urlopen('http://127.0.0.1:8000/version').read().decode())"
+kubectl -n argocd get app orders-prod \
+  -o jsonpath='{.status.sync.status}/{.status.health.status} {.status.sync.revision}{"\n"}'
 git -C ~/lab/k8s/gitops log --oneline -3 -- apps/orders-api/overlays/prod
 ```
 
-Проверено: вывод в §4. Агент брал дайджест из сети kind (`kind-registry:5000`), с хоста — `127.0.0.1:5001`.
+| Часть команды | Значение |
+|---|---|
+| `annotate … refresh=normal` | не ждать опроса в 180 с (08-1) |
+| `rollout status` | блокироваться, пока Deployment не обновится |
+| `exec … urlopen('…/version')` | спросить версию у самого пода |
+| `-o jsonpath … sync.revision` | какую ревизию Git применил Argo CD |
+| `git log --oneline -3 -- <каталог>` | три последних коммита, затронувших prod |
 
-### Шаг 3. Удаление каталога — удаление окружения
+Результат:
+
+```
+deployment "orders-api" successfully rolled out
+after 6s
+{"version": "2.1", "pod": "orders-api-864d698dfc-8l6pc"}
+Synced/Healthy def057c16fdeeaf7ac9e4119fb6d73672ce1ed39
+```
+
+Команда `git log` печатает три строки: хеш и сообщение, первая из которых начинается с `prod: promote orders-api 2.1`.
+
+Разбор:
+
+1. `successfully rolled out`, `after 6s` — от коммита до готового rollout прошло 6 с, потому что мы ускорили опрос аннотацией `refresh`.
+2. `"version": "2.1"` — работает новая версия; имя пода у вас будет другим.
+3. `Synced/Healthy` и ревизия `def057c…` совпадают с хешем коммита: кластер применил именно его.
+4. `git log` по каталогу prod — готовый журнал промоушенов: кто, когда и какой дайджест.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Промоушен — коммит одной строки с дайджестом | шаг 2 |
+| Ревизия Application равна хешу коммита | шаг 3, строка `Synced/Healthy` |
+| История выкаток читается из `git log` каталога | шаг 3 |
+| `refresh` заменяет ожидание опроса в 180 с | `after 6s` |
+
+**Уборка.** Ничего не удаляется: состояние prod нужно работе 3.
+
+**Вопросы для самопроверки.**
+
+1. Чем дайджест лучше тега `2.1` в overlay prod?
+2. Что Argo CD покажет в `sync.revision` после промоушена?
+3. Зачем CI в этой схеме не нужен доступ к кластеру?
+
+<details>
+<summary>Ответ</summary>
+
+1. Тег можно переписать, и тогда prod получит не тот образ, что проверили в staging. Дайджест определяет содержимое образа, и кластер не запустит другой.
+2. Полный хеш коммита с промоушеном, в нашем прогоне `def057c…`. Совпадение с `git rev-parse` ветки значит, что изменение доехало.
+3. CI пишет только в Git, а применяет изменение Argo CD изнутри кластера. Поэтому ключ CI даёт запись в config-репозиторий и не даёт доступа к API кластера.
+
+</details>
+
+### Лабораторная работа 3. Удаление окружения и защита от него
+
+**Цель.** Увидеть, как удаление каталога из Git сносит окружение, и включить защиту `preserveResourcesOnDeletion` и `applicationsSync`. После этого убрать стенд GitOps целиком.
+
+**Что понадобится.**
+
+- работы 1 и 2 выполнены;
+- каталог `overlays/staging` в репозитории и два Application;
+- около 10 минут.
+
+**Схема опыта.**
+
+```
+ Шаг 1:  убрать overlays/staging из Git ─► Application исчез ─► ресурсы удалены
+ Шаг 2:  вернуть каталог                ─► Application создан заново
+ Шаг 3:  preserveResourcesOnDeletion    ─► Application исчез, ресурсы остались
+ Шаг 4:  applicationsSync: create-update─► Application не удалён вовсе
+```
+
+Схема 10. Четыре исхода одного и того же действия «убрать каталог из Git» при разных настройках.
+
+#### Шаг 1. Убрать каталог и замерить удаление
+
+Команда читает finalizer Application, переносит каталог `staging` из репозитория, отправляет коммит и ждёт исчезновения Application.
 
 ```bash
 kubectl -n argocd get app orders-staging -o jsonpath='{.metadata.finalizers}{"\n"}'
-git -C ~/lab/k8s/gitops mv apps/orders-api/overlays/staging /tmp/staging-saved 2>/dev/null || mv ~/lab/k8s/gitops/apps/orders-api/overlays/staging /tmp/staging-saved
+mv ~/lab/k8s/gitops/apps/orders-api/overlays/staging ~/lab/k8s/08-2/staging-saved
 gpush "remove staging overlay"
-kubectl -n argocd annotate applicationset orders-api argocd.argoproj.io/application-set-refresh=true --overwrite
-sleep 10; kubectl -n argocd get app; kubectl -n lab-07-3-staging get deploy,svc,cm
-mv /tmp/staging-saved ~/lab/k8s/gitops/apps/orders-api/overlays/staging
-gpush "restore staging overlay"
-kubectl -n argocd annotate applicationset orders-api argocd.argoproj.io/application-set-refresh=true --overwrite
-sleep 10; kubectl -n argocd get app orders-staging
+t0=$(date +%s)
+kubectl -n argocd annotate applicationset orders-api \
+  argocd.argoproj.io/application-set-refresh=true --overwrite
+until ! kubectl -n argocd get app orders-staging >/dev/null 2>&1; do sleep 1; done
+echo "Application gone after $(( $(date +%s)-t0 ))s"
+echo "resources in lab-07-3-staging: $(kubectl -n lab-07-3-staging \
+  get deploy,svc,httproute --no-headers 2>/dev/null | wc -l)"
 ```
 
-Проверено: вывод в §2 — 4 с до удаления Application и всех ресурсов, 4 с до восстановления.
+| Часть команды | Значение |
+|---|---|
+| `get app … {.metadata.finalizers}` | какие finalizer'ы висят на Application |
+| `mv … staging-saved` | убрать каталог из репозитория, сохранив копию вне его |
+| `annotate applicationset … application-set-refresh=true` | заставить контроллер сразу запустить генератор |
+| `until ! kubectl … get app` | ждать, пока Application перестанет существовать |
+| `get deploy,svc,httproute … wc -l` | посчитать оставшиеся объекты в namespace |
 
-### Уборка: GitOps-стенд целиком
+Результат:
 
-Порядок важен: сначала ApplicationSet (его приложения удалят свои ресурсы finalizer'ом), затем корневое Application, затем Argo CD и Gitea.
+```
+["resources-finalizer.argocd.argoproj.io"]
+Application gone after 4s
+resources in lab-07-3-staging: 0
+```
+
+Разбор:
+
+1. Finalizer `resources-finalizer.argocd.argoproj.io` — он делает удаление Application каскадным.
+2. `gone after 4s` — Application исчез через 4 секунды после того, как контроллер перечитал Git.
+3. `resources … : 0` — вместе с ним удалены Deployment, Service и HTTPRoute: окружения больше нет.
+4. Никто не нажимал «удалить»: действие выполнил генератор, который перестал находить каталог.
+
+#### Шаг 2. Вернуть каталог
+
+Команда возвращает каталог и коммитит, после чего ждёт нового Application.
 
 ```bash
-kubectl -n argocd delete app root                       # без finalizer: ApplicationSet остаётся
-kubectl -n argocd delete applicationset orders-api      # удалит orders-staging/prod и их ресурсы
-kubectl delete -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.5/manifests/install.yaml
-kubectl delete ns argocd gitea lab-07-3-staging lab-07-3-prod
-kubectl get crd -o name | grep argoproj.io | xargs -r kubectl delete
-rm -f ~/lab/k8s/gitea.env                                # репозиторий ~/lab/k8s/gitops остаётся локально
-curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders     # 200 — сквозной сценарий не затронут
+mv ~/lab/k8s/08-2/staging-saved ~/lab/k8s/gitops/apps/orders-api/overlays/staging
+gpush "restore staging overlay"
+t0=$(date +%s)
+kubectl -n argocd annotate applicationset orders-api \
+  argocd.argoproj.io/application-set-refresh=true --overwrite
+until kubectl -n argocd get app orders-staging >/dev/null 2>&1; do sleep 1; done
+echo "Application back after $(( $(date +%s)-t0 ))s"
+kubectl -n argocd get app orders-staging
 ```
 
+| Часть команды | Значение |
+|---|---|
+| `mv … staging-saved … staging` | вернуть каталог на место |
+| `until kubectl … get app` | ждать, пока Application снова появится |
+| `get app orders-staging` | показать статус возвращённого Application |
+
+Результат: Application возвращается примерно через 4 секунды; затем, после синхронизации, `orders-staging` снова `Synced` и `Healthy`. Строки `back after …` и таблицы статуса точно не снимались, у вас значения будут свои.
+
+Разбор: возврат каталога так же прост, как удаление, и окружение собирается заново из Git. Но на пересборку нужно время, а данные в томах, которых нет в манифестах, при этом не вернуть.
+
+#### Шаг 3. Включить preserveResourcesOnDeletion
+
+Команда добавляет защиту в ApplicationSet через Git, ждёт обновления Application и повторяет удаление каталога. Ожидаемый результат ниже на стенде автора не снимался.
+
+```bash
+sed -i '/^  goTemplate: true/a\  syncPolicy:\n    preserveResourcesOnDeletion: true' \
+  ~/lab/k8s/gitops/argocd/orders-appset.yaml
+gpush "appset: preserveResourcesOnDeletion"
+kubectl -n argocd annotate applicationset orders-api \
+  argocd.argoproj.io/application-set-refresh=true --overwrite
+sleep 20
+kubectl -n argocd get app orders-staging -o jsonpath='{.metadata.finalizers}{"\n"}'
+mv ~/lab/k8s/gitops/apps/orders-api/overlays/staging ~/lab/k8s/08-2/staging-saved
+gpush "remove staging overlay again"
+kubectl -n argocd annotate applicationset orders-api \
+  argocd.argoproj.io/application-set-refresh=true --overwrite
+sleep 15
+kubectl -n argocd get app
+kubectl -n lab-07-3-staging get deploy,svc,httproute --no-headers | wc -l
+```
+
+| Часть команды | Значение |
+|---|---|
+| `sed -i '/^  goTemplate: true/a\…'` | вставить блок `syncPolicy` после строки `goTemplate` |
+| `preserveResourcesOnDeletion: true` | не вешать каскадный finalizer на Application |
+| `get app orders-staging … finalizers` | проверить, что finalizer снят |
+| `get app` | какие Application остались |
+| `get deploy,svc,httproute … wc -l` | сколько объектов окружения уцелело |
+
+Ожидаемый результат (на стенде автора не снимался):
+
+```
+(пусто или [])
+NAME            SYNC STATUS   HEALTH STATUS
+orders-prod     Synced        Healthy
+root            Synced        Healthy
+3
+```
+
+Разбор:
+
+1. Пустой список finalizer'ов — контроллер обновил существующий Application и снял каскад.
+2. В списке нет `orders-staging` — Application удалён, как и раньше.
+3. Число 3 (Deployment, Service, HTTPRoute) — ресурсы остались в кластере без владельца, а не удалены.
+4. Если в пункте 1 finalizer остался, ресурсы будут удалены, как в шаге 1: защиту проверяют до удаления каталога.
+
+Теперь вернём каталог: ApplicationSet создаст Application заново и примет уцелевшие ресурсы, без пересоздания подов.
+
+```bash
+mv ~/lab/k8s/08-2/staging-saved ~/lab/k8s/gitops/apps/orders-api/overlays/staging
+gpush "restore staging overlay"
+kubectl -n argocd annotate applicationset orders-api \
+  argocd.argoproj.io/application-set-refresh=true --overwrite
+sleep 15
+kubectl -n argocd get app orders-staging
+```
+
+Ожидаемый результат: `orders-staging` снова `Synced` и `Healthy`; возраст подов в `lab-07-3-staging` не сбросился.
+
+#### Шаг 4. Запретить ApplicationSet удалять Application
+
+Команда добавляет `applicationsSync: create-update` и повторяет удаление каталога. Ожидаемый результат на стенде автора не снимался.
+
+```bash
+sed -i '/preserveResourcesOnDeletion/a\    applicationsSync: create-update' \
+  ~/lab/k8s/gitops/argocd/orders-appset.yaml
+gpush "appset: applicationsSync create-update"
+mv ~/lab/k8s/gitops/apps/orders-api/overlays/staging ~/lab/k8s/08-2/staging-saved
+gpush "remove staging overlay third time"
+kubectl -n argocd annotate applicationset orders-api \
+  argocd.argoproj.io/application-set-refresh=true --overwrite
+sleep 20
+kubectl -n argocd get app orders-staging
+kubectl -n lab-07-3-staging get deploy --no-headers | wc -l
+```
+
+| Часть команды | Значение |
+|---|---|
+| `applicationsSync: create-update` | ApplicationSet создаёт и обновляет Application, но не удаляет |
+| вторая строка `sed` | вставить поле после `preserveResourcesOnDeletion` |
+| `get app orders-staging` | Application должен остаться |
+| `get deploy … wc -l` | Deployment должен остаться |
+
+Ожидаемый результат (на стенде автора не снимался): `orders-staging` остаётся в списке с ошибочным статусом, потому что путь источника не найден. Команда `get deploy` возвращает 1.
+
+Разбор: Application не удалён, ресурсы работают, а Argo CD сообщает об ошибке источника. Так сбой превращается из аварии в сигнал, который видно в статусе. Вернём каталог и очистим стенд.
+
+```bash
+mv ~/lab/k8s/08-2/staging-saved ~/lab/k8s/gitops/apps/orders-api/overlays/staging
+gpush "restore staging overlay"
+```
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Удаление каталога из Git каскадно удаляет окружение | шаг 1, 0 ресурсов за 4 с |
+| Возврат каталога пересоздаёт Application | шаг 2 |
+| `preserveResourcesOnDeletion` оставляет ресурсы | шаг 3 |
+| `applicationsSync: create-update` оставляет и Application | шаг 4 |
+
+**Уборка.** Порядок важен. Сначала удаляется корневое Application без каскада, затем ApplicationSet, затем Argo CD, Gitea и CRD. Ресурсы окружений уйдут вместе с их namespace. Команды убирают стенд GitOps целиком, но не трогают `orders` и сам кластер.
+
+Репозиторий `~/lab/k8s/gitops` остаётся локально.
+
+```bash
+kubectl -n argocd delete app root
+kubectl -n argocd delete applicationset orders-api
+kubectl delete -n argocd \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.5/manifests/install.yaml
+kubectl delete ns argocd gitea lab-07-3-staging lab-07-3-prod
+kubectl get crd -o name | grep argoproj.io | xargs -r kubectl delete
+rm -f ~/lab/k8s/gitea.env
+rm -rf ~/lab/k8s/08-2
+unset -f gpush
+curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders
+```
+
+| Часть команды | Значение |
+|---|---|
+| `delete app root` | удалить корень, не трогая ApplicationSet |
+| `delete applicationset orders-api` | удалить генератор и его Application |
+| `delete -f …install.yaml` | удалить компоненты Argo CD |
+| `delete ns …` | удалить namespace Argo CD, Gitea и окружений вместе с содержимым |
+| `grep argoproj.io … xargs delete` | удалить CRD Argo CD |
+| `rm -f … gitea.env`, `rm -rf …/08-2` | убрать пароль и временные файлы работ |
+| `curl … /api/orders` | проверить, что демо-приложение стенда работает |
+
+Результат последней команды: `200`. Это значит, что namespace `orders` и вход стенда не затронуты.
+
+**Вопросы для самопроверки.**
+
+1. Почему в уборке сначала удаляют `root`, а не ApplicationSet?
+2. Чем `preserveResourcesOnDeletion` отличается от `applicationsSync: create-update`?
+3. Почему защита от удаления не заменяет ревью каталога `argocd/`?
+
+<details>
+<summary>Ответ</summary>
+
+1. Корневое Application с `selfHeal` пересоздаст удалённый ApplicationSet из Git. Если сначала удалить корень, который не имеет finalizer'а, ApplicationSet остаётся и затем удаляется без повторного создания.
+2. `preserveResourcesOnDeletion` позволяет Application исчезнуть, но оставляет его ресурсы. `applicationsSync: create-update` не даёт ApplicationSet удалять Application вовсе, поэтому окружение остаётся под управлением Argo CD.
+3. Защита ограничивает последствия, но не исключает ошибку: неверная маска или неверная ветка всё равно оставят приложения без управления. Ревью и `argocd appset generate` ловят ошибку до слияния.
+
+</details>
+
 ---
 
-## 🔥 Кейс из прода: «рефакторинг репозитория удалил прод»
+## → Дальше
 
-**Контекст.** Платформенная команда перекладывала config-репозиторий: `apps/<сервис>/overlays/<env>` → `services/<сервис>/<env>`. ApplicationSet с генератором каталогов `apps/*/overlays/*` и дефолтной политикой. MR с перемещением файлов смержили утром; ApplicationSet в той же ветке обновили вторым MR — через час.
-
-**Разбор.**
-1. После первого MR генератор не нашёл ни одного каталога по старой маске — и удалил все сгенерированные Application.
-2. У сгенерированных Application стоит `resources-finalizer.argocd.argoproj.io` — удаление каскадное: Deployment'ы, Service'ы, HTTPRoute'ы 40 сервисов в трёх окружениях (воспроизведение — шаг 3 лабы на одном окружении: 4 секунды).
-3. PVC StatefulSet'ов уцелели (PVC из `volumeClaimTemplates` не принадлежат Application), поэтому данные не потеряны — потерян час доступности.
-
-**Фикс.**
-- `preserveResourcesOnDeletion: true` в ApplicationSet; для критичных — `applicationsSync: create-update` (ApplicationSet не удаляет Application).
-- Изменения в каталоге `argocd/` и структуре репозитория — одним MR с ApplicationSet и с обязательным ревью платформенной команды; защита `main` от force-push.
-- Dry-run генератора перед merge: `argocd appset generate` (CLI) на ветке MR — какие Application появятся/исчезнут.
-- Алерт на массовое удаление Application.
-
-**Что запомнить.**
-- ApplicationSet по умолчанию удаляет приложения, которые генератор перестал находить, — вместе с ресурсами.
-- Перемещение каталогов в GitOps-репозитории — изменение прода.
-- `preserveResourcesOnDeletion` и ревью `argocd/` — обязательны.
-
----
-
-## 💼 Вопросы с собеседования
-
-### 🟢 Junior
-
-**1. Что такое app-of-apps?**
-Application, чей источник — каталог с другими Application/ApplicationSet. Позволяет держать конфигурацию самого Argo CD в Git и поднимать всё из одного корневого объекта.
-
-**2. Как добавить новый сервис в GitOps?**
-Добавить манифесты/overlay в config-репозиторий (и Application или каталог, который подхватит ApplicationSet), пройти ревью; Argo CD синхронизирует сам. Руками в кластере ничего не создаётся.
-
-### 🟡 Middle
-
-**3. App-of-apps или ApplicationSet?**
-App-of-apps — явный список Application (каждое пишется руками), гибко для разнородных приложений. ApplicationSet — шаблон и генератор (каталоги, кластеры, список, PR) для однотипных; меньше копипасты, но изменения генератора массово создают и удаляют приложения.
-
-**4. Как промоутить версию из staging в prod?**
-CI собирает образ один раз, записывает дайджест в staging-каталог config-репозитория; после проверки — тот же дайджест MR'ом в prod-каталог; Argo CD применяет. История промоушенов — git log. Автоматизация — Image Updater, Kargo.
-
-**5. Где хранить секреты в GitOps?**
-Не в Git открытым текстом. External Secrets Operator (ссылки на Vault/облачный менеджер), Secrets Store CSI, SOPS (зашифрованные файлы, расшифровка плагином/Flux), Sealed Secrets (шифрование ключом контроллера). Выбор — по наличию внешнего менеджера и требованиям к ротации.
-
-### 🔴 Senior
-
-**6. Чем опасен ApplicationSet и как защититься?**
-Генератор перестал находить источник (опечатка, рефакторинг, неверная ветка) — ApplicationSet удаляет Application, а finalizer каскадно удаляет ресурсы. Защита: `preserveResourcesOnDeletion`, `applicationsSync: create-update`, ревью и защита ветки, dry-run генерации, алерты.
-
-**7. Как организовать GitOps для 30 сервисов в 3 окружениях и 2 кластерах?**
-App-репо + config-репо; в config-репо — каталоги сервис/окружение (Kustomize overlays или Helm values); ApplicationSet с matrix (сервисы × кластеры); AppProject на команду; промоушен MR'ом дайджеста; секреты — ESO; права на prod-каталоги через CODEOWNERS; webhook для быстрой доставки.
-
-**8. Argo CD или Flux?**
-Argo CD — UI, наглядный diff, централизованное управление многими кластерами, ApplicationSet; Helm рендерится без релиза. Flux — модульные контроллеры в каждом кластере, нативные HelmRelease и SOPS, меньше центральной точки отказа. Оба graduated CNCF; выбор — по модели эксплуатации и требованиям к UI.
-
----
-
-## ⚠️ Подводные камни
-
-- ApplicationSet удаляет приложения и их ресурсы, когда генератор их больше не видит.
-- Перемещение каталогов и смена масок генератора — изменение прода.
-- Окружения ветками — расходящиеся истории; используйте каталоги.
-- Секреты в Git даже в base64 — утечка навсегда (история Git).
-- Промоушен пересборкой вместо дайджеста — в prod не то, что тестировали.
-- Корневое Application без finalizer'а при удалении оставляет ApplicationSet и всё, что он создал.
-- CI с доступом к кластеру «на всякий случай» сводит на нет смысл pull-модели.
-
----
-
-## Чеклист
-
-- [ ] Подниму app-of-apps с корневым Application.
-- [ ] Напишу ApplicationSet с генератором каталогов и объясню другие генераторы.
-- [ ] Защищу окружения от каскадного удаления ApplicationSet'ом.
-- [ ] Промоутну версию коммитом дайджеста.
-- [ ] Выберу способ хранения секретов и аргументирую.
-- [ ] Сравню Argo CD и Flux.
-
----
-
-## Задание со звёздочкой
-
-Настройте preview-окружение на каждый Pull Request:
-
-1. Включите в Gitea Actions или вручную создавайте ветки `pr-<N>` с изменённым overlay.
-2. ApplicationSet с генератором `pullRequest` (провайдер `gitea`, ⚠️ на стенде не проверялся) или `git` по веткам: Application `orders-pr-<N>` в namespace `lab-pr-<N>`, HTTPRoute `pr-<N>.lab.localhost`.
-3. Закройте PR — окружение должно исчезнуть. Какие ресурсы останутся (PVC? Secret'ы?) и как их убирать?
-4. Добавьте `preserveResourcesOnDeletion` и объясните, почему для preview-окружений он **не** нужен, а для prod — обязателен.
-
----
-
-→ Следующая часть: **09-1. CRD и операторы** — модуль «Расширение API»: свой CRD со схемой и валидацией, что делает оператор и reconcile, CloudNativePG: кластер PostgreSQL из трёх реплик, failover при удалении primary с замером.
+GitOps доставляет любые манифесты, и многие из них описывают не приложения, а новые типы объектов: ApplicationSet, Application и ExternalSecret кто-то объявил в API. Модуль 09 показывает, как Kubernetes расширяют своими типами. Часть 09-1 разбирает CRD и операторы: как описывают тип и что делает контроллер. Без этого ApplicationSet остаётся магией, а оператор CloudNativePG держит базу из трёх реплик по тому же принципу.
