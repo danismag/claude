@@ -1557,7 +1557,7 @@ Error from server (NotFound): configmaps "ha-lost" not found
 kind delete cluster --name lab-10-1 --kubeconfig ~/lab/k8s/10-1/kubeconfig
 rm -rf ~/lab/k8s/10-1
 unset -f ks kh
-unset HOLDER SECOND SURV E
+unset HOLDER SECOND SURV E L
 docker ps -a --filter label=io.x-k8s.kind.cluster=lab-10-1 --format '{{.Names}}'
 ```
 
