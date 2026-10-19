@@ -213,7 +213,7 @@ A шпаргалки (kubectl, Helm, Kustomize, argocd, crictl, etcdctl, kubeadm
 - Показ частей HTML-страницей (§7 п. 9) отменён заказчиком: части показываются в Markdown.
 - План обновлён по исследованию (§4а); файлы старых частей переименованы под новую нумерацию, ссылки в черновиках нового формата переведены автоматически, смысловая проверка — на ревью.
 - Правила читаемости вынесены в `00-readability-rules.md` в корне; читаемость проверяется числами (средняя длина предложения, абзацы, стоп-слова, таблицы, списки) и правится отдельным проходом ревью.
-- Пробная лабораторная 03-2 лежит отдельным файлом `03-networking/03-2-sample-lab.md`; при переработке 03-2 она войдёт в часть как работа 1, файл удалится.
+- Пробная лабораторная 03-2 вошла в часть 03-2 как работа 1, отдельный файл удалён.
 
 ---
 
@@ -233,7 +233,7 @@ A шпаргалки (kubectl, Helm, Kustomize, argocd, crictl, etcdctl, kubeadm
 | 02-3 | прогон 2026-10-14; ревью по kube_features.go и validation.go ветки release-1.36, CHANGELOG 1.36/1.37 | kind 0.32.0, k8s 1.36.1 | rollout undo sts/web и set env (л3 ш1, ш3; в прогоне — патч), хеши ревизий заменены обозначениями; л3 ш5 maxUnavailable целиком (гейт выключен в 1.36); формат get pvc -o custom-columns; вывод getent ahostsv4; времена born в лабе 2; get controllerrevisions описан словами |
 | 02-4 | прогон 2026-10-14 (работы 1, 3); ревью по job_controller.go, коду CronJob v2 | kind 0.32.0, k8s 1.36.1 | работа 2 целиком (Indexed Job, FailIndex, successPolicy, podReplacementPolicy — время замены ~10/~30 с выведено из кода); лаба 4: taint control-plane, JSON updateStrategy, cordon/uncordon; лаба 1 шаг 4 custom-columns; поведение CronJob при >100 пропусках — по коду master; jsonpath с T+= (л3 ш3) |
 | 02-5 | прогон 2026-10-14; ревью по kube_features.go и prober/worker.go release-1.36 | kind 0.32.0, k8s 1.36.1 | сообщения kubectl (р1 ш1–2, р4 ш1–2); хвост error_window=0s; формат «deleted in N s» (р2 ш3); работа 2 шаг 4 целиком (pause:3.10, FailedPreStopHook); работа 4 целиком (get pods, PostgreSQL на emptyDir); объяснение TimeoutError в варианте A; переписанный load.py |
-| 03-2, работа 1 | прогон 2026-10-14 (шаги 3–7); ревью по kubernetes/website и коду kube-proxy | kind 0.32.0, k8s 1.36.1 | сообщения kubectl в шагах 1–2 и уборке; время второго отказа (шаг 7); вывод шага 8; вид `describe endpointslice` с `Ready: false`; удаление ns ~30 с |
+| 03-2 | прогон 2026-10-14 (шаги 3–7); ревью по kubernetes/website и коду kube-proxy | kind 0.32.0, k8s 1.36.1 | сообщения kubectl в шагах 1–2 и уборке; время второго отказа (шаг 7); вывод шага 8; вид `describe endpointslice` с `Ready: false`; удаление ns ~30 с |
 
 Новые части и разделы §4а реального вывода не имеют: их работы начинаются фразой «Эту работу вы выполняете сами…». Непроверенное в старой версии: установка на Ubuntu; kubectx, kubens, stern, k9s, krew; CronJob «too many missed start times»; LoadBalancer в kind; NodeLocal DNSCache; `ingress2gateway`; KMS v2; снапшоты CSI; Prometheus Adapter, Cluster Autoscaler, Karpenter; graceful node shutdown; MutatingAdmissionPolicy; `helm push` в OCI и `helm diff`; UI Argo CD, генератор `pullRequest`, ESO, SOPS, Sealed Secrets; pluto и kubent; managed-кластеры.
 
