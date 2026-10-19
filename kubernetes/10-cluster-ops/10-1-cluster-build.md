@@ -30,7 +30,7 @@
 
 Компоненты кластера общаются по TLS и проверяют друг друга по сертификатам, поэтому без подготовки они даже не соединятся. Минимальный набор такой.
 
-- **Ключи и сертификаты.** Три центра сертификации и одиннадцать пар ключей для API-сервера, etcd, kubelet и служебных клиентов.
+- **Ключи и сертификаты.** Одиннадцать пар ключей: три центра сертификации, сертификаты API-сервера, etcd и служебных клиентов, пара для токенов ServiceAccount.
 - **Kubeconfig-файлы.** По одному у администратора, controller-manager, scheduler и каждого kubelet.
 - **Манифесты static pods.** Четыре файла для API-сервера, controller-manager, scheduler и etcd (01-2).
 - **Токен для новых узлов.** Узел без сертификата должен как-то доказать, что ему можно войти.
@@ -91,9 +91,9 @@ preflight ─► certs ─► kubeconfig ─► etcd ─► control-plane ─►
 
 ### Конфигурация kubeadm v1beta4
 
-Параметры сборки лежат в одном YAML-файле из нескольких документов, который передают флагом `--config`. Версия формата `kubeadm.k8s.io/v1beta4` введена в kubeadm 1.31; версия v1beta3 устарела, а срок её удаления в документации не назван. Старый файл переводит команда `kubeadm config migrate`, а новые файлы сразу пишут в v1beta4.
+Параметры сборки лежат в одном YAML-файле из нескольких документов, который передают флагом `--config`. Версия формата `kubeadm.k8s.io/v1beta4` введена в kubeadm 1.31. Версия v1beta3 устарела: документация пакета обещает удалить её «в 1.34 или позже», но kubeadm 1.36 её ещё читает. Старый файл переводит команда `kubeadm config migrate`, а новые файлы сразу пишут в v1beta4.
 
-В файле три типа документов kubeadm и два типа компонентов.
+Для `init` и `join` в файле бывают три типа документов kubeadm и два типа компонентов.
 
 - **ClusterConfiguration** — свойства кластера: версия, `controlPlaneEndpoint`, подсети, флаги API-сервера, настройки etcd, срок сертификатов. Он попадает в кластер, в ConfigMap `kubeadm-config`.
 - **InitConfiguration** — свойства первого запуска: токены, адрес этого узла, имя узла, пропускаемые фазы. Он нужен только `init` и в кластер не попадает, потому что содержит токены.
@@ -112,7 +112,7 @@ kubeadm.yaml  (--config)
 
 Схема 3. Документы файла kubeadm и то, куда они попадают. Смотрите на правый столбец: в кластер уходит всё, кроме InitConfiguration.
 
-Точечные правки без полного файла делают **patches** — файлы-заплатки, которые kubeadm накладывает на манифесты static pods перед записью. kind использует тот же приём: поле `kubeadmConfigPatches` в его конфигурации (06-4) складывается с конфигурацией, которую kind генерирует сам.
+Точечные правки без полного файла делают **patches** — файлы-заплатки, которые kubeadm накладывает на манифесты static pods перед записью. У kind есть похожее поле `kubeadmConfigPatches` (06-4), но оно правит сам файл конфигурации kubeadm, а не манифесты.
 
 ### PKI кластера
 
@@ -140,7 +140,7 @@ kubeadm создаёт три независимых CA в каталоге `/et
 Несколько файлов нуждаются в пояснении.
 
 - **SAN** (subject alternative name, альтернативное имя субъекта) — список адресов и имён внутри сертификата. Клиент сверяет с ним адрес, по которому подключился. В `apiserver.crt` входят `kubernetes`, `kubernetes.default.svc`, ClusterIP Service `kubernetes` (первый адрес сети Service, 10.96.0.1), адрес узла и адрес из `controlPlaneEndpoint`.
-- **Aggregation layer** (слой агрегации) — механизм, через который API-сервер передаёт запросы расширениям API, например metrics-server на стенде. API-сервер подписывает передачу сертификатом `front-proxy-client` и сообщает расширению имя пользователя в заголовках, а расширение проверяет подпись по `front-proxy-ca`.
+- **Aggregation layer** (слой агрегации) — механизм, через который API-сервер передаёт запросы расширениям API, например metrics-server на стенде. API-сервер подключается к расширению с клиентским сертификатом `front-proxy-client` и передаёт имя пользователя в заголовках. Расширение проверяет этот сертификат по `front-proxy-ca`.
 - **sa.key и sa.pub** — пара ключей без сертификата. controller-manager подписывает ею токены ServiceAccount (06-1), а API-сервер проверяет подпись публичным ключом. Поэтому у всех узлов control plane эта пара одинакова.
 
 Клиентские сертификаты kubelet в каталоге pki не хранятся: они лежат на самом узле в `/var/lib/kubelet/pki` и выдаются через CSR (следующий раздел).
@@ -165,7 +165,7 @@ kubeadm создаёт три независимых CA в каталоге `/et
 Процедура идёт в четыре шага (схема 5).
 
 1. **Обнаружение (discovery).** `kubeadm join` скачивает без аутентификации ConfigMap `cluster-info` из namespace `kube-public`. В нём лежит CA кластера и адрес API-сервера, а подпись ConfigMap сделана токеном. Узел проверяет подпись токеном, а CA сверяет с хешем из команды (`--discovery-token-ca-cert-hash`). Хеш защищает от подмены API-сервера.
-2. **Запрос.** kubelet подключается к API-серверу с токеном как пользователь группы `system:bootstrappers:kubeadm:default-node-token`. Эта группа имеет право только создавать CSR. kubelet генерирует закрытый ключ и отправляет CSR с **signer** `kubernetes.io/kube-apiserver-client-kubelet` (signer — тип запроса, который определяет, кто его подпишет и как одобрят).
+2. **Запрос.** kubelet подключается к API-серверу с токеном как пользователь группы `system:bootstrappers:kubeadm:default-node-token`. Права у группы узкие: создавать CSR и читать то немногое, что нужно `kubeadm join`, например узлы (привязка `kubeadm:get-nodes`). kubelet генерирует закрытый ключ и отправляет CSR с **signer** `kubernetes.io/kube-apiserver-client-kubelet` (signer — тип запроса, который определяет, кто его подпишет и как одобрят).
 3. **Одобрение.** Контроллер одобрения CSR в controller-manager видит запрос и одобряет автоматически: kubeadm заранее создал ClusterRoleBinding `kubeadm:node-autoapprove-bootstrap`, который разрешает это группе токена.
 4. **Подпись и запись.** Контроллер подписи подписывает CSR ключом кластерного CA. kubelet забирает сертификат (`CN=system:node:<имя>`, `O=system:nodes`), кладёт его в `/var/lib/kubelet/pki`, пишет `kubelet.conf` и дальше работает уже без токена.
 
@@ -192,7 +192,7 @@ kubeadm создаёт три независимых CA в каталоге `/et
 
 ### Присоединение рабочего узла
 
-Рабочий узел присоединяет команда `kubeadm join`. Она нужна из трёх значений: адреса API-сервера, токена и хеша CA.
+Рабочий узел присоединяет команда `kubeadm join`. Ей нужны три значения: адрес API-сервера, токен и хеш CA.
 
 ```bash
 kubeadm join k8s-api.example.com:6443 --token abcdef.0123456789abcdef \
@@ -205,7 +205,7 @@ kubeadm join k8s-api.example.com:6443 --token abcdef.0123456789abcdef \
 
 ### Топологии HA control plane
 
-**HA** (high availability, высокая доступность) control plane — три или пять узлов с API-сервером, на которых кластер переживает потерю одного узла. API-сервер не хранит состояние, поэтому все его копии работают одновременно за балансировщиком. Scheduler и controller-manager работают по одному активному (01-1). Сложность только в etcd: у kubeadm для него две топологии.
+**HA** (high availability, высокая доступность) control plane — три или пять узлов с API-сервером: три узла переживают потерю одного, пять — потерю двух. API-сервер не хранит состояние, поэтому все его копии работают одновременно за балансировщиком. Scheduler и controller-manager работают по одному активному (01-1). Сложность только в etcd: у kubeadm для него две топологии.
 
 - **Стековый etcd** (stacked etcd) — на каждом узле control plane работает свой член etcd рядом с API-сервером. Это топология по умолчанию: она проще и требует меньше машин. Узел выходит из строя целиком, и кластер теряет и API-сервер, и член etcd.
 - **Внешний etcd** (external etcd) — etcd работает на отдельных машинах, а API-сервер подключается к нему по адресам из поля `etcd.external` с тремя файлами: CA, сертификат и ключ клиента. Отказы API-сервера и etcd становятся независимыми, но нужно вдвое больше машин и отдельная работа с etcd (10-2).
@@ -244,11 +244,9 @@ kind не использует upload-certs. Он копирует нужные 
 
 ### Ротация сертификатов kubelet
 
-Клиентский сертификат kubelet обновляет сам kubelet. Если в `KubeletConfiguration` стоит `rotateCertificates: true` (kubeadm включает его по умолчанию), kubelet на отрезке от 70 до 90 процентов срока жизни сертификата создаёт новый CSR. Одобряет его контроллер по ClusterRoleBinding `kubeadm:node-autoapprove-certificate-rotation` для группы `system:nodes`. kubelet кладёт новый файл в `/var/lib/kubelet/pki` и переключает ссылку `kubelet-client-current.pem`.
+Клиентский сертификат, полученный при TLS bootstrap, kubelet дальше обновляет сам. kubeadm включает это заранее: ставит `rotateCertificates: true` в `KubeletConfiguration` и создаёт ClusterRoleBinding `kubeadm:node-autoapprove-certificate-rotation` для группы `system:nodes`. Как идёт сама ротация и как за ней следить, разобрано в 10-4.
 
-Серверный сертификат kubelet — тот, который kubelet показывает, когда к нему подключается API-сервер для `logs` и `exec`. По умолчанию kubelet выпускает для себя самоподписанный сертификат, и API-сервер его не проверяет. Включить нормальную проверку позволяет `serverTLSBootstrap: true` в `KubeletConfiguration`. Тогда kubelet создаёт CSR с signer `kubernetes.io/kubelet-serving` и SAN из имён и адресов узла.
-
-Эти CSR автоматически не одобряются: Kubernetes не может проверить, что узел владеет перечисленными адресами. Одобряет их администратор командой `kubectl certificate approve <имя>` или отдельный контроллер вроде kubelet-csr-approver. Когда в кластере нет такого контроллера, `kubectl get csr` показывает записи в состоянии Pending, а `kubectl logs` для этого узла падает с ошибкой сертификата. Поэтому без одобряющего контроллера `serverTLSBootstrap` включать не стоит.
+Серверный сертификат kubelet по умолчанию самоподписан, и API-сервер его не проверяет. Флаг `serverTLSBootstrap: true` переводит его на CSR с signer `kubernetes.io/kubelet-serving`. Такие CSR автоматически не одобряются, поэтому без одобряющего контроллера флаг не включают (10-4).
 
 ### Карточка инструмента: kubeadm
 
@@ -293,7 +291,7 @@ kubeadm reset                                        # убрать с узла 
 - `[ERROR FileAvailable--etc-kubernetes-manifests-kube-apiserver.yaml]`: узел уже использовался, его сначала очищают `kubeadm reset`.
 - `could not find a JWS signature in the cluster-info ConfigMap for token ID`: токен истёк или опечатка в нём.
 - `cluster CA found in cluster-info ConfigMap is invalid`: хеш CA в команде не совпадает с CA кластера.
-- `timed out waiting for the condition` в фазе wait-control-plane: kubelet не запустил static pods; смотрят `journalctl -u kubelet` и `crictl ps -a` (01-2).
+- `[control-plane-check] kube-apiserver is not healthy after 4m0s`: kubelet не запустил static pods; смотрят `journalctl -u kubelet` и `crictl ps -a` (01-2).
 - `[ERROR FileContent--proc-sys-net-ipv4-ip_forward]`: в ядре выключена пересылка пакетов.
 
 **Установка:** на стенде kubeadm уже есть в образе узла, на хосте он не нужен. В Ubuntu пакеты `kubelet`, `kubeadm` и `kubectl` ставят из репозитория `pkgs.k8s.io` ветки 1.36 и фиксируют командой `apt-mark hold`, чтобы обычное обновление не сменило минорную версию. В Manjaro пакет ищут командой `pacman -Ss kubeadm`; если его нет, берут бинарный файл нужной версии с `dl.k8s.io`.
@@ -317,7 +315,7 @@ kubeadm reset                                        # убрать с узла 
 
 ### Сертификаты и kubeconfig
 
-Сроки сертификатов показывает `kubeadm certs check-expiration`: таблица из примерно десяти строк с остатком срока и именем CA, который подписал сертификат. Содержимое одного сертификата читает `openssl x509 -in файл -noout -subject -issuer -dates -ext subjectAltName`. Строка `subject` показывает имя и группы, `issuer` — подписавший CA, `dates` — срок, `subjectAltName` — адреса, на которые выписан сертификат. Для сертификатов в kubeconfig их сначала декодируют: поле `client-certificate-data` хранится в base64.
+Сроки сертификатов показывает `kubeadm certs check-expiration`: таблица из одиннадцати строк с остатком срока и именем CA, который подписал сертификат. Содержимое одного сертификата читает `openssl x509 -in файл -noout -subject -issuer -dates -ext subjectAltName`. Строка `subject` показывает имя и группы, `issuer` — подписавший CA, `dates` — срок, `subjectAltName` — адреса, на которые выписан сертификат. Для сертификатов в kubeconfig их сначала декодируют: поле `client-certificate-data` хранится в base64.
 
 На рабочем узле сертификаты kubelet лежат в `/var/lib/kubelet/pki`. Имя `kubelet-client-<дата>.pem` — выданный файл, а `kubelet-client-current.pem` — ссылка на актуальный. Работа 2 проходит по всем файлам.
 
@@ -332,9 +330,9 @@ kubeadm reset                                        # убрать с узла 
 Чтобы понять кластер kind, достаточно знать четыре факта.
 
 1. kind пишет конфигурацию kubeadm в файл `/kind/kubeadm.conf` на каждом узле. Для Kubernetes 1.36 и новее формат v1beta4; патчи `kubeadmConfigPatches` из конфигурации kind накладываются на него.
-2. На первом узле control plane kind запускает `kubeadm init --config=/kind/kubeadm.conf --skip-token-print --v=6`. Фаза preflight пропущена (`skipPhases`), потому что внутри контейнера проверки о swap, портах и ядре не имеют смысла.
+2. На первом узле control plane kind запускает `kubeadm init --config=/kind/kubeadm.conf --skip-token-print --v=6`. Фаза preflight пропущена (`skipPhases`): kind заранее кладёт образы в узел, и проверки preflight могут с этим конфликтовать.
 3. Для HA kind копирует с первого узла на остальные `admin.conf` и файлы CA из `/etc/kubernetes/pki` (кластерный CA, CA etcd, front-proxy-ca и пару sa), а затем по очереди запускает на них `kubeadm join --config /kind/kubeadm.conf --v=6`. Рабочие узлы присоединяются после узлов control plane и одновременно.
-4. Если control plane больше одного, kind создаёт контейнер балансировщика `<кластер>-external-load-balancer` и пишет его адрес в `controlPlaneEndpoint`. До kind 0.32 это был HAProxy, начиная с 0.32 — Envoy. Он слушает порт 6443 и каждые 2 секунды проверяет `/healthz` каждого API-сервера.
+4. Если control plane больше одного, kind создаёт контейнер балансировщика `<кластер>-external-load-balancer` и пишет его адрес в `controlPlaneEndpoint`. До kind 0.32 это был HAProxy, начиная с 0.32 — Envoy. Он слушает порт 6443, находит узлы control plane по именам контейнеров и каждые 2 секунды проверяет `/healthz` каждого API-сервера.
 
 На стенде `lab` один узел control plane, поэтому балансировщика там нет, а `controlPlaneEndpoint` указывает на сам узел. Лабораторная работа 1 читает эти файлы, работа 3 создаёт кластер с балансировщиком.
 
@@ -388,7 +386,7 @@ kubeadm reset                                        # убрать с узла 
 | certificate key (Secret kubeadm-certs) | 2 часа | Secret удаляется |
 | сертификаты компонентов, kubeconfig | 1 год (8760 ч) | компонент не подключится, продлевает kubeadm (10-4) |
 | CA (ca, etcd/ca, front-proxy-ca) | 10 лет (87600 ч) | замена вручную |
-| клиентский сертификат kubelet | срок CSR, 1 год | kubelet обновляет сам с 70–90 % срока |
+| клиентский сертификат kubelet | 1 год (`--cluster-signing-duration`) | kubelet обновляет сам (10-4) |
 
 Тайм-ауты `timeouts` в v1beta4 ограничивают ожидание фаз kubeadm.
 
@@ -495,7 +493,7 @@ kind: KubeProxyConfiguration
 1. Версия kubeadm совпадает с версией образа узла, `v1.36.1`.
 2. Файл содержит пять документов. Первые три принадлежат kubeadm и имеют формат `v1beta4`, как и должно быть для Kubernetes 1.36 и новее.
 3. KubeletConfiguration и KubeProxyConfiguration kubeadm не читает как свои: он кладёт их в ConfigMap и раздаёт узлам (схема 3).
-4. В файле есть и InitConfiguration, и JoinConfiguration: kind пишет один и тот же файл на каждый узел, а kubeadm берёт нужные ему документы.
+4. В файле есть и InitConfiguration, и JoinConfiguration: kind пишет на каждый узел файл из одного шаблона, а kubeadm берёт нужные ему документы.
 
 #### Шаг 2. Прочитать ключевые поля
 
@@ -523,25 +521,28 @@ docker exec lab-control-plane grep -A4 certSANs /kind/kubeadm.conf
 Ожидаемый результат:
 
 ```
-kubernetesVersion: v1.36.1
 clusterName: lab
 controlPlaneEndpoint: lab-control-plane:6443
-  podSubnet: "10.244.0.0/16"
-  serviceSubnet: "10.96.0.0/16"
-    criSocket: "unix:///run/containerd/containerd.sock"
-      unsafeSkipCAVerification: true
+kubernetesVersion: v1.36.1
+  podSubnet: 10.244.0.0/16
+  serviceSubnet: 10.96.0.0/16
+  criSocket: unix:///run/containerd/containerd.sock
+    unsafeSkipCAVerification: true
+  criSocket: unix:///run/containerd/containerd.sock
   certSANs:
   - localhost
   - 127.0.0.1
-  - …
+  extraArgs:
+  …
 ```
 
 Разбор вывода:
 
-1. `controlPlaneEndpoint` указывает на имя узла и порт 6443: на стенде один узел control plane, поэтому балансировщика нет, а внутри сети Docker имя узла разрешается само.
-2. Подсети подов и Service записаны здесь, а не заданы вручную; в `kubeadm-config` они потом сохранятся (шаг 5).
-3. Поле `unsafeSkipCAVerification: true` отключает проверку хеша CA при `join`. Для сети Docker это безопасно, для рабочего кластера нет (§3).
-4. В `certSANs` перечислены `localhost` и `127.0.0.1`. Через них сертификат API-сервера подходит адресу `127.0.0.1:<порт>`, под которым kubectl с хоста ходит в кластер kind.
+1. Ключи идут по алфавиту, а кавычек и комментариев нет: kind пропускает шаблон через свой механизм патчей, и тот заново сериализует YAML. `criSocket` встречается дважды: в InitConfiguration и в JoinConfiguration.
+2. `controlPlaneEndpoint` указывает на имя узла и порт 6443: на стенде один узел control plane, поэтому балансировщика нет, а внутри сети Docker имя узла разрешается само.
+3. Подсети подов и Service — значения kind по умолчанию; в `kubeadm-config` они потом сохранятся (шаг 5).
+4. Поле `unsafeSkipCAVerification: true` отключает проверку хеша CA при `join`. Для сети Docker это безопасно, для рабочего кластера нет (§3).
+5. В `certSANs` перечислены `localhost` и `127.0.0.1`. Через них сертификат API-сервера подходит адресу `127.0.0.1:<порт>`, под которым kubectl с хоста ходит в кластер kind.
 
 #### Шаг 3. Сравнить с значениями kubeadm по умолчанию
 
@@ -643,7 +644,7 @@ ks get node lab-control-plane -o jsonpath='{.spec.taints}{"\n"}'
 | `get cm -o name` | имена ConfigMap без таблицы |
 | `grep -E 'kubeadm\|kubelet\|kube-proxy'` | оставить ConfigMap фазы upload-config и addon |
 | `-n kube-public get cm` | ConfigMap `cluster-info` фазы bootstrap-token |
-| `get clusterrolebinding … \| grep kubeadm` | привязки ролей фазы bootstrap-token и kubeconfig |
+| `get clusterrolebinding … \| grep kubeadm` | привязки ролей фаз kubeconfig, bootstrap-token и addon |
 | `get deploy,ds -o name` | дополнения фазы addon |
 | `jsonpath='{.spec.taints}'` | taint, который поставила фаза mark-control-plane |
 
@@ -669,6 +670,8 @@ configmap/kubeadm-config
 configmap/kubelet-config
 configmap/cluster-info
 configmap/kube-root-ca.crt
+configmap/local-registry-hosting
+clusterrolebinding.rbac.authorization.k8s.io/kubeadm:apiserver-kubelet-client
 clusterrolebinding.rbac.authorization.k8s.io/kubeadm:cluster-admins
 clusterrolebinding.rbac.authorization.k8s.io/kubeadm:get-nodes
 clusterrolebinding.rbac.authorization.k8s.io/kubeadm:kubelet-bootstrap
@@ -685,8 +688,8 @@ daemonset.apps/kube-proxy
 
 1. В `/etc/kubernetes` лежат пять kubeconfig-файлов, каталог `pki` (фаза certs) и каталог `manifests` с четырьмя static pods (фазы etcd и control-plane).
 2. ConfigMap `kubeadm-config` и `kubelet-config` — результат upload-config, а `kube-proxy` — результат addon.
-3. ConfigMap `cluster-info` в `kube-public` создала фаза bootstrap-token. Остальные ConfigMap этого namespace и `kube-root-ca.crt` kubeadm не создаёт.
-4. Привязки `kubeadm:kubelet-bootstrap`, `kubeadm:node-autoapprove-bootstrap` и `kubeadm:node-autoapprove-certificate-rotation` — те самые права TLS bootstrap и ротации (схема 5). Привязка `kubeadm:cluster-admins` даёт права `admin.conf`.
+3. ConfigMap `cluster-info` в `kube-public` создала фаза bootstrap-token. `kube-root-ca.crt` создаёт controller-manager, а `local-registry-hosting` — скрипт стенда (00-1).
+4. Привязки `kubeadm:kubelet-bootstrap`, `kubeadm:node-autoapprove-bootstrap` и `kubeadm:node-autoapprove-certificate-rotation` — те самые права TLS bootstrap и ротации (схема 5). Привязка `kubeadm:cluster-admins` даёт права `admin.conf`, `kubeadm:apiserver-kubelet-client` пускает API-сервер в kubelet (logs, exec), `kubeadm:get-nodes` нужна `kubeadm join`, а `kubeadm:node-proxier` создала фаза addon для kube-proxy.
 5. CoreDNS и kube-proxy — результат addon. DaemonSet `kindnet` kubeadm не создаёт: это CNI-плагин, который ставит kind после `init`.
 6. Taint `node-role.kubernetes.io/control-plane` с эффектом `NoSchedule` поставила фаза mark-control-plane. В кластере с рабочими узлами он остаётся.
 
@@ -720,23 +723,29 @@ EOF
 
 ```
 apiVersion: kubeadm.k8s.io/v1beta4
+…
+kind: InitConfiguration
+…
+timeouts:
+  controlPlaneComponentHealthCheck: 6m0s
+…
+---
 apiServer:
   extraArgs:
   - name: audit-log-maxage
     value: "7"
+apiVersion: kubeadm.k8s.io/v1beta4
 …
 kind: ClusterConfiguration
 kubernetesVersion: v1.36.1
 …
-timeouts:
-  controlPlaneComponentHealthCheck: 6m0s
 ```
 
 Разбор вывода:
 
-1. Вывод начинается с `apiVersion: kubeadm.k8s.io/v1beta4`: версия сменилась.
+1. Оба документа получили `apiVersion: kubeadm.k8s.io/v1beta4`. Первым kubeadm добавил InitConfiguration со значениями по умолчанию, хотя на входе её не было.
 2. Словарь `extraArgs` превратился в список пар `name` и `value`. Так формат допускает повторяющиеся флаги.
-3. Поле `timeoutForControlPlane` исчезло из ClusterConfiguration, а его значение перешло в `timeouts.controlPlaneComponentHealthCheck` (§2).
+3. Поле `timeoutForControlPlane` исчезло из ClusterConfiguration, а его значение перешло в `timeouts.controlPlaneComponentHealthCheck` документа InitConfiguration (§2).
 4. Остальные поля, которых нет в исходном файле, приняли значения по умолчанию.
 
 **Итог.** Таблица подводит итог работы: что вы узнали и где это видно.
