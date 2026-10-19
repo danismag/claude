@@ -14,7 +14,7 @@ Webhook'и и finalizer'ы — два механизма, которыми оп�
 
 ## 1. Admission webhooks 🟡
 
-Webhook — внешний HTTPS-сервис, который apiserver вызывает на этапе admission (06-2 §4): **mutating** (может изменить объект — инжекция sidecar'ов, дефолты) и **validating** (может только разрешить или запретить — политики). Описание — `MutatingWebhookConfiguration` / `ValidatingWebhookConfiguration`:
+Webhook — внешний HTTPS-сервис, который apiserver вызывает на этапе admission (06-3 §1): **mutating** (может изменить объект — инжекция sidecar'ов, дефолты) и **validating** (может только разрешить или запретить — политики). Описание — `MutatingWebhookConfiguration` / `ValidatingWebhookConfiguration`:
 
 ```yaml
 webhooks:
@@ -68,7 +68,7 @@ apiserver_admission_webhook_fail_open_count{name="pods.policy.lab.local",type="v
 | 2+ реплики вебхука, PDB, PriorityClass, anti-affinity | вебхук сам по себе — критичный компонент |
 | `matchConditions` (CEL) | не вызывать вебхук для запросов, которые ему не нужны |
 | алерты на `apiserver_admission_webhook_rejection_count{error_type="calling_webhook_error"}` и латентность вебхуков | узнать раньше пользователей |
-| простые правила — ValidatingAdmissionPolicy (06-2) | в apiserver, без сетевого вызова |
+| простые правила — ValidatingAdmissionPolicy (06-3) | в apiserver, без сетевого вызова |
 
 Аварийно: удалить или поправить `…WebhookConfiguration` (`kubectl delete validatingwebhookconfiguration <имя>`) — объект конфигурации cluster-scoped и сам через вебхуки не проходит. После — вернуть, починив причину. Это должно быть в runbook'е, потому что вспоминают об этом в 3 часа ночи.
 
@@ -221,7 +221,7 @@ kubectl get validatingwebhookconfiguration lab-policy 2>&1 | tail -1      # NotF
 **Фикс.**
 - Немедленно: `kubectl delete validatingwebhookconfiguration <policy>` → поды поднялись, затем конфигурацию вернули.
 - `namespaceSelector`, исключающий `kube-system` и namespace самого вебхука; `timeoutSeconds: 5`; 3 реплики, PDB, PriorityClass.
-- `failurePolicy: Fail` — только для правил безопасности; остальные правила — `Ignore` или перенос в ValidatingAdmissionPolicy (06-2).
+- `failurePolicy: Fail` — только для правил безопасности; остальные правила — `Ignore` или перенос в ValidatingAdmissionPolicy (06-3).
 - Алерт на `calling_webhook_error` и runbook «вебхук блокирует кластер» в два шага.
 
 **Что запомнить.**
@@ -271,7 +271,7 @@ Namespace исчезнет из API, но объекты в нём остану�
 - Снятие finalizer'а оставляет внешние ресурсы (диски, LB), за которые платят.
 - `/finalize` для namespace бросает объекты в etcd.
 - busybox-`nc` для имитации зависшего сервиса закрывает соединение без открытого stdin.
-- Mutating webhook может сделать объект несовместимым с последующими validating-проверками (06-2 §4).
+- Mutating webhook может сделать объект несовместимым с последующими validating-проверками (06-3 §5).
 
 ---
 
@@ -292,7 +292,7 @@ Namespace исчезнет из API, но объекты в нём остану�
 1. Сервер на Python (`http.server` + `ssl`) в поде: принимает `AdmissionReview`, запрещает поды без метки `team`, отвечает `allowed: false` с понятным `status.message`.
 2. Сертификат для `policy-webhook.<ns>.svc` выпустите cert-manager'ом (03-4) и подставьте `caBundle` аннотацией `cert-manager.io/inject-ca-from`.
 3. Включите вебхук с `failurePolicy: Fail` для namespace с меткой, проверьте отказ и пропуск.
-4. Перепишите то же правило как ValidatingAdmissionPolicy (06-2) и сравните: строки кода, задержка, что будет при падении пода.
+4. Перепишите то же правило как ValidatingAdmissionPolicy (06-3) и сравните: строки кода, задержка, что будет при падении пода.
 
 ---
 

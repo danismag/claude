@@ -234,7 +234,7 @@ rm -f /tmp/kubelet-1.36.5 /tmp/upg-load.txt
 **Контекст.** Кластер обновили с 1.24 до 1.25 (managed, кнопкой, в окно обслуживания). Через день CI сервиса биллинга не смог задеплоиться: `no matches for kind "PodSecurityPolicy" in version "policy/v1beta1"` и `no matches for kind "CronJob" in version "batch/v1beta1"`. Работающие CronJob'ы продолжали выполняться.
 
 **Разбор.**
-1. В 1.25 удалены `batch/v1beta1` CronJob (замена — `batch/v1`, доступна с 1.21) и PodSecurityPolicy целиком (замена — Pod Security Admission, 06-2).
+1. В 1.25 удалены `batch/v1beta1` CronJob (замена — `batch/v1`, доступна с 1.21) и PodSecurityPolicy целиком (замена — Pod Security Admission, 06-3).
 2. Объекты в etcd apiserver хранит в актуальной версии — поэтому существующие CronJob работали; сломались **манифесты** в Git и Helm-шаблон чарта, отправляющие удалённую версию.
 3. Предупреждения о deprecated API были год (01-3: `Warning: … is deprecated`), но их никто не читал — CI скрывал вывод kubectl.
 

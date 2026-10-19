@@ -261,7 +261,7 @@ Termination message/`FallbackToLogsOnError`, код выхода и reason в `l
 - Ошибки PVC — в событиях PVC, а не пода.
 - `CreateContainerConfigError` исправляется созданием объекта — пересоздавать под не нужно.
 - `nodeName` в манифесте прячет ошибки scheduler'а (04-2).
-- Ошибки admission и квот у подов контроллеров — в событиях ReplicaSet/Job (05-1, 06-2, 09-2).
+- Ошибки admission и квот у подов контроллеров — в событиях ReplicaSet/Job (05-2, 06-3, 09-2).
 - Сообщение `FailedScheduling` надо читать целиком.
 
 ---
@@ -280,7 +280,7 @@ Termination message/`FallbackToLogsOnError`, код выхода и reason в `l
 
 Соберите свой «тренажёр для коллег»:
 
-1. Напишите 5 сломанных Deployment'ов (не подов!) с разными причинами: квота namespace, admission-политика (06-2), PDB при drain, неверный `targetPort` в Service (03-2), Secret без ключа.
+1. Напишите 5 сломанных Deployment'ов (не подов!) с разными причинами: квота namespace, admission-политика (06-3), PDB при drain, неверный `targetPort` в Service (03-2), Secret без ключа.
 2. Для каждого — спрятанная под спойлер (`<details>`) причина и исправление, как в 12-2.
 3. Дайте коллеге и засеките время: какие ошибки находят дольше всего? Почему (подсказка: те, где проблема видна не у пода)?
 
