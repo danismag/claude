@@ -1272,7 +1272,7 @@ k get pod no-token -o jsonpath='{.spec.volumes}{"\n"}'
 | `exec no-token -- ls …` | искать каталог токена |
 | `{.spec.volumes}` | список томов пода |
 
-Результат (первая ошибка — одна строка, здесь перенесена):
+Результат:
 
 ```
 ls: /var/run/secrets/kubernetes.io/serviceaccount: No such file or directory
