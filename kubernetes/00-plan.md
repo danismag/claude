@@ -193,6 +193,8 @@ A шпаргалки (kubectl, Helm, Kustomize, argocd, crictl, etcdctl, kubeadm
 ## 6. Отличия от плана
 
 - Ветка работы — `claude/youthful-babbage-p3ufp4`, а не `kubernetes`: так задано средой сессии.
+- 02-1: учтены изменения 1.35 — `restartPolicy` на уровне контейнера (`ContainerRestartRules`, beta), настраиваемый потолок back-off (`KubeletCrashLoopBackOffMax`, beta), resize ресурсов через подресурс (stable).
+- Строка вывода `iptables-save` в 03-2 (162 знака) оставлена целиком: разбор опирается на все её части.
 - Пробная лабораторная 03-2 лежит отдельным файлом `03-networking/03-2-sample-lab.md`; при переработке 03-2 она войдёт в часть как работа 1, файл удалится.
 
 ---
@@ -203,7 +205,7 @@ A шпаргалки (kubectl, Helm, Kustomize, argocd, crictl, etcdctl, kubeadm
 
 | Часть | Источник вывода | Версии | Что не проверено |
 |---|---|---|---|
-| 02-1 | прогон 2026-10-14, машина автора | kind 0.32.0, k8s 1.36.1 | места, перечисленные ревью пробной части |
+| 02-1 | прогон 2026-10-14; ревью по kubernetes/website и коду kubernetes | kind 0.32.0, k8s 1.36.1 | порядок строк `status.conditions` (работа 1, шаг 3); хвостовой `\n` в `message` (работа 2, шаг 2); коды 137/143 для PID 1 без обработчика; команды переноса busybox в реестр стенда; поле kubelet `crashLoopBackOff.maxContainerRestartPeriod` |
 | 03-2, работа 1 | прогон 2026-10-14 (шаги 3–7); ревью по kubernetes/website и коду kube-proxy | kind 0.32.0, k8s 1.36.1 | сообщения kubectl в шагах 1–2 и уборке; время второго отказа (шаг 7); вывод шага 8; вид `describe endpointslice` с `Ready: false`; удаление ns ~30 с |
 
 Непроверенное в старой версии (останется таким, пока способ проверки не согласован): установка на Ubuntu; kubectx, kubens, stern, k9s, krew; CronJob «too many missed start times»; LoadBalancer в kind; NodeLocal DNSCache; `ingress2gateway`; AdminNetworkPolicy; KMS v2; снапшоты CSI; Prometheus Adapter, Cluster Autoscaler, Karpenter; graceful node shutdown; MutatingAdmissionPolicy; `helm push` в OCI и `helm diff`; UI Argo CD, генератор `pullRequest`, ESO, SOPS, Sealed Secrets; pluto и kubent; managed-кластеры.
