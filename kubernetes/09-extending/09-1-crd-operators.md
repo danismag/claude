@@ -99,12 +99,12 @@ spec:
 Структурность нужна для трёх вещей. Первая — **pruning** (отсечение): API-сервер удаляет при записи поля, которых нет в схеме, поэтому опечатка в имени поля не сохранится молча. Вторая — **default**: значение по умолчанию подставляется при записи и при чтении из etcd. Третья — проверка CEL, о которой ниже. Исключения из pruning делают явно: `x-kubernetes-preserve-unknown-fields: true` оставляет неизвестные поля на этом узле, и тогда ошибки всплывают уже в контроллере, а не при `kubectl apply`.
 
 ```
-запрос с CR ─► разбор ─► pruning ─► default ─► … admission (09-2) … ─► схема ─► CEL ─► etcd
-                         убрать      подставить                         типы,     правила
-                         чужие поля  значения                           enum      x-k8s-validations
+запрос ─► pruning ─► default ─► mutating ─► схема ─► CEL ─► validating ─► etcd
+          убрать     подставить admission   типы,    правила admission
+          чужие поля значения   (09-2)      enum     x-k8s-… (09-2)
 ```
 
-Схема 3. Путь CR внутри API-сервера. Любой этап может отклонить запрос, и тогда в etcd ничего не попадает.
+Схема 3. Путь CR внутри API-сервера, слева направо. Проверки схемы и CEL идут после мутирующих вебхуков и до валидирующих; любой этап может отклонить запрос, и тогда в etcd ничего не попадает.
 
 ### Валидация: схема и CEL
 
@@ -126,12 +126,12 @@ keepDays:
 
 В CRD включают три добавки к основному адресу объекта. Подресурсы (01-3 §2) описывают так:
 
-- **status** — `subresources.status: {}` выделяет `status` в отдельный адрес. Обычная запись игнорирует `status`, а `metadata.generation` растёт только при изменении `spec`.
-- **scale** — `subresources.scale` указывает пути к полям реплик: `specReplicasPath`, `statusReplicasPath` и необязательный `labelSelectorPath`. Благодаря этому тип понимают `kubectl scale` и HPA (05-4).
+- **status** — `subresources.status: {}` выделяет `status` в отдельный адрес. Обычная запись игнорирует `status`, а `metadata.generation` растёт при любом изменении, кроме `metadata` и `status`.
+- **scale** — `subresources.scale` указывает пути к полям реплик: `specReplicasPath`, `statusReplicasPath` и необязательный `labelSelectorPath`. Первые два поля дают работать `kubectl scale`, а HPA (05-4) нужен ещё `labelSelectorPath`.
 
 **Printer columns** (колонки вывода) — поле `additionalPrinterColumns`: имя, тип и `jsonPath` каждой колонки для `kubectl get`. Поле `priority` выше нуля прячет колонку до `-o wide`. Если задать свои колонки, колонка Age не добавляется сама, её нужно описать явно.
 
-**selectableFields** (селектируемые поля, GA в 1.32) — список путей `jsonPath`, по которым сервер фильтрует выдачу: `kubectl get rp --field-selector spec.target=logs`. Без этого списка фильтр работает только по `metadata.name` и `metadata.namespace`. Допускается не больше 8 полей на версию, и каждое должно быть скаляром.
+**selectableFields** (селектируемые поля, GA в 1.32) — список путей `jsonPath`, по которым сервер фильтрует выдачу: `kubectl get rp --field-selector spec.target=logs`. Без этого списка фильтр работает только по `metadata.name` и `metadata.namespace`. Допускается не больше 8 полей на версию, а каждое поле должно иметь тип string, integer или boolean.
 
 ### Версии и конвертация
 
@@ -147,7 +147,7 @@ keepDays:
 
 Схема 4. Клиенты видят разные версии, а в etcd объект лежит в одной. Список `status.storedVersions` в CRD запоминает все версии, в которых объекты когда-либо записывались.
 
-Старую версию нельзя удалить из CRD, пока в etcd остаются объекты в ней. Порядок такой: сделать новую версию хранимой, перезаписать все объекты (прочитать и записать обратно), убрать старую версию из `storedVersions` и только потом из `spec.versions`. Перезапись берёт на себя ресурс **StorageVersionMigration** (миграция версии хранения): встроенный контроллер в beta с 1.35, GA в 1.37.
+Старую версию нельзя удалить из CRD, пока в etcd остаются объекты в ней. Порядок такой: сделать новую версию хранимой, перезаписать все объекты (прочитать и записать обратно), убрать старую версию из `storedVersions` и только потом из `spec.versions`. Перезапись берёт на себя ресурс **StorageVersionMigration** (миграция версии хранения): встроенный контроллер перезаписывает все объекты ресурса и затем обновляет `storedVersions`. В 1.35 и 1.36 он в beta и выключен по умолчанию: нужны feature gate `StorageVersionMigrator` и API `storagemigration.k8s.io/v1beta1`. В 1.37 он стал GA и включён по умолчанию.
 
 ### Контроллер: очередь и reconcile
 
@@ -201,7 +201,7 @@ kind: Cluster
 metadata: {name: orders-db}
 spec:
   instances: 3
-  imageName: ghcr.io/cloudnative-pg/postgresql:17.6
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.11-standard-trixie
   storage: {size: 1Gi}
   resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 512Mi}}
   bootstrap:
@@ -221,13 +221,13 @@ spec:
 - **Поды** `orders-db-1`, `-2`, `-3`. CNPG управляет подами напрямую, без StatefulSet (02-3): ему нужно решать, какой экземпляр перезапускать и какой повысить до primary, а StatefulSet этого не умеет.
 - **Тома** — по одному PVC на экземпляр.
 - **Service'ы**: `orders-db-rw` ведёт на primary (запись), `orders-db-ro` — на реплики, `orders-db-r` — на любой экземпляр.
-- **Secret'ы**: `orders-db-app` с паролем и готовым `uri`, `orders-db-ca` с сертификатом центра, `orders-db-replication` и `orders-db-server` для TLS между экземплярами.
+- **Secret'ы**: `orders-db-app` с паролем и готовым `uri`, `orders-db-ca` с сертификатом центра, `orders-db-server` с сертификатом сервера и `orders-db-replication` с клиентским сертификатом для репликации.
 
 В каждом поде PID 1 — **instance manager** (менеджер экземпляра) оператора: он запускает PostgreSQL и сообщает оператору о состоянии. Реплика получает данные по **потоковой репликации** (streaming replication): primary отправляет ей **WAL** (write-ahead log, журнал упреждающей записи), а реплика применяет записи. Репликация по умолчанию асинхронная, поэтому при аварийном переключении последние транзакции могут потеряться; синхронный режим включается отдельной настройкой.
 
 ### Бэкапы CNPG в объектное хранилище
 
-Бэкап в CNPG — тоже CR, а не внешний скрипт. Базовую копию описывает `Backup`, расписание — `ScheduledBackup`. Хранилище и непрерывную отправку WAL берёт на себя плагин **Barman Cloud**: место хранения задаёт его CR `ObjectStore`, а `Cluster` подключает плагин. Для обмена плагина с оператором нужен cert-manager (03-5).
+Бэкап в CNPG — тоже CR, а не внешний скрипт. Базовую копию описывает `Backup`, расписание — `ScheduledBackup`. Хранилище и непрерывную отправку WAL берёт на себя плагин **Barman Cloud**: место хранения задаёт его CR `ObjectStore`, а `Cluster` подключает плагин. Встроенное поле `barmanObjectStore` устарело с CNPG 1.26, плагин требует CNPG 1.26 или новее и cert-manager (03-5).
 
 Хранилищем может быть любое S3-совместимое: в 04-3 для этого поднимается шлюз VersityGW, а облачные S3 подходят так же. Непрерывный архив WAL даёт RPO в секунды и **PITR** (point-in-time recovery, восстановление на момент времени): новый `Cluster` загружается из архива с `bootstrap.recovery` и целевым временем. Обычный дамп `pg_dump` (04-3) такого не умеет. Работа 2 бэкапов не включает: им нужны хранилище и cert-manager, то есть отдельный стенд.
 
@@ -352,19 +352,27 @@ kubectl -n lab-09-1 get pods -L cnpg.io/instanceRole -o wide
 
 ### Стоимость правил CEL
 
-API-сервер оценивает стоимость каждого правила CEL и отклоняет CRD, если оценка выше лимита. Стоимость растёт с размером строк и списков, поэтому правилам помогают `maxLength`, `maxItems` и `maxProperties` в схеме. Ошибка превышения видна сразу при создании CRD, а не при записи CR.
+API-сервер оценивает стоимость каждого правила CEL и отклоняет CRD, если оценка выше лимита. Стоимость считается в условных единицах, а лимиты заданы в коде API-сервера:
+
+- одно правило при создании CRD — не больше 10 млн единиц по оценке;
+- все правила одного CRD — не больше 100 млн единиц;
+- одно правило при выполнении — не больше 1 млн единиц;
+- все правила одного запроса при выполнении — не больше 10 млн единиц.
+
+Без ограничений размера оценка считает худший случай, поэтому правилам помогают `maxLength`, `maxItems` и `maxProperties` в схеме. Ошибка оценки видна сразу при создании CRD, а не при записи CR.
 
 ### Версии и стадии
 
 - `selectableFields` — GA в 1.32.
 - Validation ratcheting — GA в 1.33.
-- StorageVersionMigration встроен в beta с 1.35; в 1.37 он станет GA.
+- StorageVersionMigration — beta с 1.35, выключен по умолчанию; GA и включён в 1.37.
 - Защита встроенных контроллеров от устаревшего кэша (staleness mitigation) — beta в 1.36. Контроллер не действует по данным informer, пока кэш не догнал его собственные записи.
-- Перечисленное относится к стенду 1.36.1; для 1.37 меняется только стадия StorageVersionMigration.
+- Перечисленное относится к стенду 1.36.1; для 1.37 меняется только StorageVersionMigration.
 
 ### Значения CloudNativePG
 
-- Версия оператора на стенде — 1.30.1, образ PostgreSQL — 17.6, версии закреплены.
+- Версия оператора — 1.30.1 (сентябрь 2026, исправляет CVE в gRPC-Go). Линия 1.30 поддерживает Kubernetes 1.34–1.36, конец поддержки — около декабря 2026.
+- Образ PostgreSQL — `17.11-standard-trixie`. Вывод работы 2 снят с прежним тегом `17.6`: такие теги без типа образа устарели и больше не выпускаются. Самое надёжное закрепление — по digest.
 - Число экземпляров `instances` по умолчанию равно 1; для failover нужны не меньше двух.
 - Репликация по умолчанию асинхронная.
 - Экземпляры оператор раскладывает по узлам правилом мягкой anti-affinity (05-3): на стенде все три лежат на разных worker.
@@ -499,10 +507,16 @@ customresourcedefinition.apiextensions.k8s.io/retentionpolicies.ops.lab.local co
 GROUP:      ops.lab.local
 KIND:       RetentionPolicy
 VERSION:    v1
+
+FIELD: spec <Object>
+…
 FIELDS:
+  archive	<boolean>
+…
   keepDays	<integer> -required-
+…
   target	<string> -required-
-    Enum: orders-db, logs, backups
+  enum: orders-db, logs, backups
 …
 ```
 
@@ -511,7 +525,7 @@ FIELDS:
 1. `created` — CRD принят: схема структурная, правило CEL допустимо по стоимости.
 2. `condition met` — тип зарегистрирован, API-сервер отдаёт `/apis/ops.lab.local/v1`.
 3. `KIND` и `VERSION` в выводе `explain` взяты из CRD, а не из справочника kubectl.
-4. `-required-` и `Enum` пришли из `required` и `enum` схемы.
+4. `-required-` и строка `enum` пришли из `required` и `enum` схемы; поля идут по алфавиту.
 
 #### Шаг 2. Проверить валидацию
 
@@ -619,7 +633,8 @@ k get rp --field-selector spec.keepDays=30
 retentionpolicy.ops.lab.local/logs created
 NAME   KEEP   TARGET   PHASE
 logs   14     logs
-Error from server (BadRequest): Unable to list "ops.lab.local/v1, Resource=retentionpolicies":
+Error from server (BadRequest): Unable to find "ops.lab.local/v1, Resource=retentionpolicies"
+  that match label selector "", field selector "spec.keepDays=30":
   field label not supported: spec.keepDays
 ```
 
@@ -737,7 +752,7 @@ curl -fL --retry 3 -o cnpg.yaml \
   https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v1.30.1/cnpg-1.30.1.yaml
 wc -c cnpg.yaml
 for img in ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1 \
-           ghcr.io/cloudnative-pg/postgresql:17.6; do
+           ghcr.io/cloudnative-pg/postgresql:17.11-standard-trixie; do
   docker pull $img && kind load docker-image $img --name lab
 done
 ```
@@ -749,7 +764,7 @@ done
 | `docker pull $img` | скачать образ на хост |
 | `kind load docker-image --name lab` | скопировать образ в containerd каждого узла кластера `lab` |
 
-Результат: `wc -c` печатает размер около 1,29 млн байт. Меньше значит, что файл недокачан, и применять его нельзя (§5). Образ PostgreSQL на стенде автора скачивался 181 с. После `kind load` для каждого узла kind печатает строку вида `Image: "…" with ID "sha256:…" not yet present on node "lab-worker", loading...` (ожидаемый вид).
+Результат: `wc -c` печатает размер около 1,29 млн байт. Меньше значит, что файл недокачан, и применять его нельзя (§5). Образ PostgreSQL с прежним тегом `17.6` на стенде автора скачивался 181 с. После `kind load` для каждого узла kind печатает строку вида `Image: "…" with ID "sha256:…" not yet present on node "lab-worker", loading...` (ожидаемый вид).
 
 Разбор:
 
@@ -804,7 +819,7 @@ kind: Cluster
 metadata: {name: orders-db}
 spec:
   instances: 3
-  imageName: ghcr.io/cloudnative-pg/postgresql:17.6
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.11-standard-trixie
   storage: {size: 1Gi}
   resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 512Mi}}
   bootstrap:
@@ -858,7 +873,7 @@ spec:
   restartPolicy: Never
   containers:
   - name: writer
-    image: ghcr.io/cloudnative-pg/postgresql:17.6
+    image: ghcr.io/cloudnative-pg/postgresql:17.11-standard-trixie
     env:
     - name: URI
       valueFrom: {secretKeyRef: {name: orders-db-app, key: uri}}
@@ -951,7 +966,7 @@ orders-db-2 Running replica
 
 1. 11 успешных записей на адрес старого primary, затем 2 ошибки, затем 77 записей на адрес нового. Адрес изменился, а имя `-rw` осталось прежним.
 2. Первая ошибка в 15:02:42.161, последняя в 15:02:44.692: окно записи около 2,5 с при удалении пода в 15:02:41.
-3. `101|3` — в таблице 101 строка, запись приняли три разных адреса. Число строк в журнале и в таблице у вас будет разным, потому что журнал читается раньше таблицы.
+3. `101|3` — в таблице 101 строка от трёх адресов, а в журнале 88 удачных записей от двух. Таблица `ticks` пережила первый прогон автора: тогда primary был `orders-db-1` со старым адресом, поэтому в шаге 3 primary — `orders-db-1`, а здесь — `orders-db-2`. В чистом прогоне вы увидите два адреса и примерно столько строк, сколько `ok` в журнале.
 4. `orders-db-2` вернулся репликой: оператор не вернул ему роль primary.
 5. Если убрать из манифеста `PGCONNECT_TIMEOUT` и `timeout 3`, писатель при первом прогоне автора повис навсегда на первой попытке после удаления primary.
 
@@ -975,10 +990,10 @@ kubectl delete ns lab-09-1
 kubectl delete -f ~/lab/k8s/09-1/cnpg.yaml
 for n in $(kind get nodes --name lab); do
   docker exec $n crictl rmi ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1 \
-    ghcr.io/cloudnative-pg/postgresql:17.6
+    ghcr.io/cloudnative-pg/postgresql:17.11-standard-trixie
 done
 docker rmi ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1 \
-  ghcr.io/cloudnative-pg/postgresql:17.6
+  ghcr.io/cloudnative-pg/postgresql:17.11-standard-trixie
 rm -rf ~/lab/k8s/09-1
 unset -f k cur
 ```
