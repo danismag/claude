@@ -42,7 +42,7 @@ kubelet запускает контейнеры через рантайм, мо�
 - **runc** — **OCI runtime**: программа, которая создаёт процесс в нужных namespaces и cgroups. **OCI** (Open Container Initiative) — стандарт формата образа и запуска контейнера.
 - **CNI-плагины** — бинарники в `/opt/cni/bin` с конфигом в `/etc/cni/net.d`. Они дают поду интерфейс, IP и маршруты (§2).
 - **kube-proxy** — агент, который пишет на узле правила iptables, nftables или ipvs для Service (03-2). Работает как DaemonSet.
-- **CNI-агент** (kindnet на стенде, Calico, Cilium) — тоже DaemonSet: раздаёт подсети, строит маршруты и применяет NetworkPolicy (03-5).
+- **CNI-агент** (kindnet на стенде, Calico, Cilium) — тоже DaemonSet: раздаёт подсети, строит маршруты и применяет NetworkPolicy (03-6).
 
 **DaemonSet** — контроллер, который держит ровно один под на каждом узле (02-4). Поэтому kube-proxy и CNI-агент видны как обычные поды в `kube-system`, хотя работают на уровне узла.
 
@@ -170,7 +170,7 @@ default via 172.20.0.1 dev eth0
 
 **cgroup** (control group) — механизм ядра, который объединяет процессы в группу и ограничивает её ресурсы: память, CPU, число процессов. kubelet создаёт cgroup для каждого пода и каждого контейнера. Лимиты из манифеста превращаются в значения файлов этой иерархии (05-1).
 
-**QoS-класс** (quality of service) — категория пода по его requests и limits: Guaranteed, Burstable, BestEffort. Поды раскладываются в ветки по классу, чтобы при нехватке памяти ядро и kubelet выбирали жертву предсказуемо (05-4).
+**QoS-класс** (quality of service) — категория пода по его requests и limits: Guaranteed, Burstable, BestEffort. Поды раскладываются в ветки по классу, чтобы при нехватке памяти ядро и kubelet выбирали жертву предсказуемо (05-5).
 
 **Драйвер cgroups** определяет, кто создаёт эти группы: сам kubelet (`cgroupfs`) или systemd (`systemd`). Драйвер kubelet и рантайма обязан совпадать. На дистрибутивах с systemd (Ubuntu, Manjaro) выбирают `systemd`: в kubelet это `cgroupDriver: systemd`, в containerd — `SystemdCgroup = true`. Иначе два менеджера работают с одной иерархией, и под нагрузкой узел ведёт себя непредсказуемо.
 
@@ -198,7 +198,7 @@ kubelet через containerd пишет stdout и stderr контейнера �
 
 ### Узел глазами API
 
-Команда `kubectl get nodes` показывает статус и версию. Подробности даёт `kubectl describe node <имя>`: блок Conditions со статусами Ready, MemoryPressure, DiskPressure, PIDPressure, блок Capacity и Allocatable и список подов узла. **Capacity** — все ресурсы машины, **Allocatable** — то, что остаётся подам после резервов системы и порога вытеснения (05-1, 05-4). В kind они совпадают.
+Команда `kubectl get nodes` показывает статус и версию. Подробности даёт `kubectl describe node <имя>`: блок Conditions со статусами Ready, MemoryPressure, DiskPressure, PIDPressure, блок Capacity и Allocatable и список подов узла. **Capacity** — все ресурсы машины, **Allocatable** — то, что остаётся подам после резервов системы и порога вытеснения (05-1, 05-5). В kind они совпадают.
 
 Heartbeat читают из Lease: `kubectl -n kube-node-lease get lease <узел>`. Если `renewTime` старше минуты, kubelet молчит, и причину ищут на узле, а не в API.
 
@@ -283,7 +283,7 @@ kubelet.slice
 
 ### Замена зависла в Pending
 
-Замена пода `web` осталась в Pending до возврата узла. Причина в `topologySpreadConstraints` с `maxSkew: 1` по `kubernetes.io/hostname` (05-2). Узел с taint'ом по умолчанию остаётся доменом распределения (`nodeTaintsPolicy: Ignore`). Новый под не может встать на узел, где уже есть `web`, а на мёртвый узел его не пускает taint. Событие `FailedScheduling` говорит об этом:
+Замена пода `web` осталась в Pending до возврата узла. Причина в `topologySpreadConstraints` с `maxSkew: 1` по `kubernetes.io/hostname` (05-3). Узел с taint'ом по умолчанию остаётся доменом распределения (`nodeTaintsPolicy: Ignore`). Новый под не может встать на узел, где уже есть `web`, а на мёртвый узел его не пускает taint. Событие `FailedScheduling` говорит об этом:
 
 ```
 0/4 nodes are available: 2 node(s) didn't match pod topology spread constraints,
@@ -300,7 +300,7 @@ kubelet.slice
 - `CreateContainerConfigError` — шаг 6, нет ключа в Secret или ConfigMap.
 - `CrashLoopBackOff` — процесс падает, kubelet ждёт перед повтором (02-1).
 
-Методика разбора каждой ошибки — 11-1.
+Методика разбора каждой ошибки — 11-2.
 
 Отдельный случай — узел NotReady из-за рантайма. **PLEG** (Pod Lifecycle Event Generator) — часть kubelet, которая раз в секунду сверяет состояние контейнеров с рантаймом и узнаёт, что контейнер умер. Сообщение `PLEG is not healthy` в журнале kubelet значит, что рантайм не отвечает слишком долго (порог — 3 минуты). Причины: перегруженный или зависший containerd, тысячи остановленных контейнеров, медленный диск. Смотрят `journalctl -u kubelet -u containerd` и число контейнеров в `crictl ps -a`. Перезапуск containerd лечит симптом, а не причину.
 
@@ -326,7 +326,7 @@ kubelet.slice
 - `maxPods` — 110 на узел. Предел накладывает и подсеть узла: `/24` даёт 254 адреса.
 - `serializeImagePulls` — `true`.
 - `fileCheckFrequency` для static pods — 20 с.
-- Allocatable равен capacity минус `kube-reserved`, `system-reserved` и порог вытеснения (05-1, 05-4).
+- Allocatable равен capacity минус `kube-reserved`, `system-reserved` и порог вытеснения (05-1, 05-5).
 
 ### Логи и образы
 
