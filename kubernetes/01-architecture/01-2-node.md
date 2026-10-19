@@ -4,7 +4,7 @@
 
 ## Где мы на карте
 
-В 01-1 мы разобрали control plane: apiserver принимает объекты, scheduler выбирает узел, controller manager держит желаемое состояние. Все они только читают и пишут записи в API. Эта часть показывает, кто превращает запись «под P на узле N» в работающий процесс: компоненты узла kubelet, containerd, CNI-плагины и kube-proxy.
+В 01-1 мы разобрали control plane: API-сервер принимает объекты, scheduler выбирает узел, controller-manager держит желаемое состояние. Все они только читают и пишут записи в API. Эта часть показывает, кто превращает запись «под P на узле N» в работающий процесс: компоненты узла kubelet, containerd, CNI-плагины и kube-proxy.
 
 Следующая часть, 01-3, вернётся к API и разберёт сами объекты: метки, владельцев, apply и finalizers. А всё, что запускают в кластере, упирается в узел: под (02-1), Service (03-2), тома (04-2) и лимиты (05-1) работают через механизмы, которые описаны здесь.
 
@@ -146,13 +146,13 @@ default via 172.20.0.1 dev eth0
 
 ### Heartbeat: Lease и статус узла
 
-Узел сообщает о себе двумя способами, и оба идут от kubelet к apiserver.
+Узел сообщает о себе двумя способами, и оба идут от kubelet к API-сервер.
 
 **Lease** (аренда) — маленький объект в namespace `kube-node-lease`, по одному на узел. kubelet продлевает его примерно каждые 10 с (четверть срока аренды 40 с), меняя только поле `renewTime`. Объект крошечный, поэтому heartbeat почти ничего не стоит.
 
 **Статус узла** (`node.status`) — крупный объект с условиями (Ready, MemoryPressure, DiskPressure, PIDPressure), ресурсами и списком образов. kubelet проверяет его каждые 10 с, а полную запись отправляет при изменении или раз в 5 минут.
 
-Роль судьи играет **node lifecycle controller** в controller manager. Если Lease не обновлялся дольше `node-monitor-grace-period` (50 с), он ставит условию Ready значение Unknown; что происходит дальше, разбирает §5.
+Роль судьи играет **node lifecycle controller** в controller-manager. Если Lease не обновлялся дольше `node-monitor-grace-period` (50 с), он ставит условию Ready значение Unknown; что происходит дальше, разбирает §5.
 
 ---
 
@@ -180,11 +180,11 @@ default via 172.20.0.1 dev eth0
 
 ### Static pods
 
-**Static pod** (статический под) — под, который kubelet запускает из файла, без scheduler и без apiserver. Каталог указывает параметр `staticPodPath`; на стенде это `/etc/kubernetes/manifests` на всех узлах. kubelet перечитывает каталог раз в 20 с (`fileCheckFrequency`): появился файл — запускается под, исчез — останавливается.
+**Static pod** (статический под) — под, который kubelet запускает из файла, без scheduler и без API-сервер. Каталог указывает параметр `staticPodPath`; на стенде это `/etc/kubernetes/manifests` на всех узлах. kubelet перечитывает каталог раз в 20 с (`fileCheckFrequency`): появился файл — запускается под, исчез — останавливается.
 
 Чтобы под был виден в кластере, kubelet создаёт в API его копию — **mirror pod** (зеркальный под). У зеркального пода к имени добавлен суффикс узла, а владелец в `ownerReferences` — объект Node. Зеркало только отражает файл: `kubectl delete` удалит его, но kubelet создаст зеркало заново, а контейнер останется прежним. Остановить static pod можно только удалением файла на узле.
 
-Так запущен control plane в kubeadm: apiserver, scheduler и controller manager — static pods. Это удобно для компонентов, которые должны работать до того, как кластер начнёт принимать объекты.
+Так запущен control plane в kubeadm: API-сервер, scheduler и controller-manager — static pods. Это удобно для компонентов, которые должны работать до того, как кластер начнёт принимать объекты.
 
 Это же и риск: файл в каталоге манифестов на любом узле запускает под в обход RBAC и admission-проверок. Admission-плагин `NodeRestriction` запрещает зеркальным подам ссылаться на Secret, ConfigMap и ServiceAccount, а в 1.37 такие static pods отклоняет и сам kubelet. Но под с `hostPath` это не остановит, поэтому права на запись в `/etc/kubernetes/manifests` приравнивают к правам root на узле.
 
@@ -208,7 +208,7 @@ Heartbeat читают из Lease: `kubectl -n kube-node-lease get lease <узе
 
 ### Конфигурация, которую применяет kubelet
 
-kubelet отдаёт свою эффективную конфигурацию через эндпоинт `configz`. Запрос идёт через apiserver как через прокси: `kubectl get --raw /api/v1/nodes/<узел>/proxy/configz`. Ответ содержит все параметры с умолчаниями. Право на такой запрос с 1.36 выдают узким подресурсом `nodes/configz`, а не широким `nodes/proxy` (06-1). Работа 2 показывает, как выбрать нужные поля через `jq`.
+kubelet отдаёт свою эффективную конфигурацию через эндпоинт `configz`. Запрос идёт через API-сервер как через прокси: `kubectl get --raw /api/v1/nodes/<узел>/proxy/configz`. Ответ содержит все параметры с умолчаниями. Право на такой запрос с 1.36 выдают узким подресурсом `nodes/configz`, а не широким `nodes/proxy` (06-1). Работа 2 показывает, как выбрать нужные поля через `jq`.
 
 ### Контейнеры и sandbox на узле
 
@@ -579,7 +579,7 @@ docker exec $N systemd-cgls --no-pager -u kubelet.slice | head -25
 
 #### Шаг 2. Конфигурация kubelet
 
-Команда запрашивает `configz` у kubelet через apiserver и выбирает нужные поля.
+Команда запрашивает `configz` у kubelet через API-сервер и выбирает нужные поля.
 
 ```bash
 kubectl get --raw /api/v1/nodes/$N/proxy/configz | jq '.kubeletconfig | {
@@ -591,7 +591,7 @@ kubectl get --raw /api/v1/nodes/$N/proxy/configz | jq '.kubeletconfig | {
 
 | Часть команды | Значение |
 |---|---|
-| `get --raw …/proxy/configz` | запрос к kubelet узла через apiserver |
+| `get --raw …/proxy/configz` | запрос к kubelet узла через API-сервер |
 | `jq '.kubeletconfig'` | войти в объект с настройками |
 | `{ cgroupDriver, … }` | оставить перечисленные поля |
 
