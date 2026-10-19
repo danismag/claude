@@ -32,7 +32,7 @@ RBAC отвечает на вопрос «кто может создать об�
 
 RBAC смотрит на глагол, ресурс и namespace, но не заглядывает в содержимое объекта. Право `create pods` одинаково для пода с `securityContext` и для привилегированного пода. Поэтому ограничения на поля объекта живут отдельно — в admission.
 
-**Admission** (допуск) — этап обработки запроса, на котором API-сервер проверяет объект и при необходимости меняет его. Этап идёт после аутентификации и авторизации и касается только запросов на запись: создание, обновление, удаление.
+**Admission** (допуск) — этап обработки запроса, на котором API-сервер проверяет объект и при необходимости меняет его. Этап идёт после аутентификации и авторизации и касается только запросов на запись: создание, обновление, удаление и подключение (connect, например `kubectl exec`). Чтение (get, list, watch) admission не проверяет.
 
 ### Цепочка admission
 
@@ -80,7 +80,9 @@ Admission состоит из двух фаз, и порядок фаз важе
 | baseline | privileged-контейнеры, host-пространства имён, hostPath, лишние capabilities | обычные приложения |
 | restricted | non-root, seccomp, drop ALL, запрет повышения привилегий | чувствительные нагрузки |
 
-Список в baseline включает ещё порты хоста, профили AppArmor и SELinux вне разрешённых, смонтированный `/proc` и ограниченный набор sysctl. С Kubernetes 1.34 baseline запрещает и поле `host` в `httpGet` и `tcpSocket` проб и хуков. Через это поле проба или хук бьёт в произвольный адрес, а не в под. Restricted требует `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` и `seccompProfile` типа `RuntimeDefault` или `Localhost`. Смысл этих полей объяснён в 06-2.
+Список в baseline включает ещё порты хоста, профили AppArmor и SELinux вне разрешённых, тип монтирования `/proc` и seccomp `Unconfined`. Sysctl разрешены только из безопасного набора, и он растёт с версиями: в 1.32 добавлены `tcp_rmem` и `tcp_wmem`. С Kubernetes 1.34 baseline запрещает и поле `host` в `httpGet` и `tcpSocket` проб и хуков. Через это поле проба или хук бьёт в произвольный адрес, а не в под.
+
+Restricted требует `runAsNonRoot: true` без `runAsUser: 0`, `allowPrivilegeEscalation: false` и `seccompProfile` типа `RuntimeDefault` или `Localhost`. Capabilities сбрасывают целиком (`drop: [ALL]`), а добавить можно только `NET_BIND_SERVICE`. Типы томов ограничены списком: `configMap`, `secret`, `emptyDir`, `projected`, `persistentVolumeClaim` и ещё несколько, но не `hostPath`. Смысл этих полей объяснён в 06-2.
 
 ### Pod Security Admission: метки namespace
 
@@ -137,14 +139,19 @@ ValidatingAdmissionPolicy        ValidatingAdmissionPolicyBinding
 
 ### MutatingAdmissionPolicy: мутация без вебхука
 
-**MutatingAdmissionPolicy** (MAP) — аналог VAP для изменений: CEL-выражение возвращает патч, и API-сервер применяет его к объекту. Функция прошла путь alpha 1.32, beta 1.34 и стала GA в 1.36, так что на стенде она включена по умолчанию. Объекты те же две: политика и привязка (`MutatingAdmissionPolicyBinding`), с теми же `matchConstraints`, `paramKind` и `matchConditions`.
+**MutatingAdmissionPolicy** (MAP) — аналог VAP для изменений: CEL-выражение возвращает патч, и API-сервер применяет его к объекту. Функция прошла путь alpha 1.32, beta 1.34 и стала GA в 1.36, так что на стенде она включена по умолчанию. Объектов тоже два: политика и привязка (`MutatingAdmissionPolicyBinding`), с теми же `matchConstraints`, `paramKind` и `matchConditions`. У привязки нет `validationActions`: мутация либо применяется, либо нет.
+
+Два поля политики MAP отвечают за сбои и повторы:
+
+- **failurePolicy** — что делать при ошибке выражения или патча: `Fail` (по умолчанию) отклоняет запрос, `Ignore` пропускает его без мутации.
+- **reinvocationPolicy** — обязательное поле: `Never` применяет мутацию один раз, `IfNeeded` повторяет её, если объект изменили более поздние мутации. Значения по умолчанию у поля нет, и политика без него не создаётся.
 
 Патч задаёт список `mutations`, и у каждой мутации один из двух типов (`patchType`).
 
 - **ApplyConfiguration** — выражение возвращает объект, построенный через `Object{...}`; он сливается с исходным по правилам server-side apply (01-3). Подходит для «добавить поле» и «задать значение по умолчанию».
 - **JSONPatch** — выражение возвращает список операций `JSONPatch{op, path, value}` по RFC 6902. Подходит для точечных правок и операции `test`.
 
-Ключи с символами `/` и `~` в пути экранирует функция `jsonpatch.escapeKey()`; без неё метка `example.com/team` сломает путь.
+Ключи с символами `/` и `~` в пути экранирует функция `jsonpatch.escapeKey()`; без неё метка `example.com/team` сломает путь. Операция `add` по RFC 6902 требует, чтобы родитель пути уже существовал. Поэтому `add` в `/metadata/labels/<ключ>` падает у объекта без единой метки, и тогда сначала добавляют сам словарь `/metadata/labels`.
 
 Условия `matchConditions` отбирают запросы, которым патч нужен: например, мутация применяется, только если поле ещё не задано. Это защищает от перезаписи значений, которые указал автор манифеста.
 
@@ -195,7 +202,9 @@ kubectl label ns lab-06-3 \
 
 **Исключение** (exemption) — запрос, который PSA не проверяет вообще: ни enforce, ни warn, ни audit. Исключения задают статически в конфигурации admission-контроллера API-сервера (`AdmissionConfiguration`, плагин `PodSecurity`) по трём признакам: имя пользователя, класс рантайма (RuntimeClass) или namespace.
 
-Меняется эта конфигурация перезапуском API-сервера, поэтому в кластере kind её правят на уровне kubeadm-конфигурации при создании кластера; эту работу мы не делаем. Исключение пользователя действует только на прямое создание пода, но не на создание Deployment. Сервисные учётные записи контроллеров (например, ReplicaSet) исключать нельзя: тогда любой, кто может создать Deployment, обойдёт проверку.
+Файл конфигурации API-сервер получает флагом `--admission-control-config-file` и читает при старте. В kind его задают при создании кластера: файл монтируют на узел через `extraMounts`, а флаг передают через `kubeadmConfigPatches`. Эту работу мы не делаем. В том же файле секция `defaults` задаёт уровни для namespace без меток.
+
+Исключение пользователя действует только на прямое создание пода, но не на создание Deployment. Сервисные учётные записи контроллеров (например, ReplicaSet) исключать нельзя: тогда любой, кто может создать Deployment, обойдёт проверку.
 
 ### Включить VAP: от Warn к Deny
 
@@ -208,7 +217,7 @@ kubectl patch validatingadmissionpolicybinding no-latest-tag --type=merge \
   -p '{"spec":{"validationActions":["Deny"]}}'
 ```
 
-Команда заменяет список действий в привязке `no-latest-tag`. Политика остаётся прежней, меняется только реакция на нарушение. Вступает в силу изменение не мгновенно: после патча даём API-серверу около 3 секунд.
+Команда заменяет список действий в привязке `no-latest-tag`. Политика остаётся прежней, меняется только реакция на нарушение. Изменение вступает в силу не мгновенно, потому что API-сервер подхватывает объекты политик через свой кэш, поэтому в лабораторной после патча стоит пауза в 3 секунды.
 
 ### Включить MAP
 
@@ -286,13 +295,13 @@ Enforce не трогает уже работающие поды, поэтому
 | MutatingAdmissionPolicy | GA | 1.36 |
 | Контроль `host` в пробах и хуках (baseline) | в PSS | 1.34 |
 
-MAP в 1.32 была alpha, в 1.34 — beta. Если кластер старше 1.36, проверьте, включена ли функция и какая версия API у политики.
+MAP в 1.32 была alpha, в 1.34 — beta, но и в beta оставалась выключенной по умолчанию. Если кластер старше 1.36, проверьте, включена ли функция и какая версия API у политики. Политики из файлов, которые API-сервер загружает с диска при старте, называют manifest-based admission control. Эта функция появилась в 1.36 как alpha, а в 1.37 стала beta и включена по умолчанию.
 
 ### Значения по умолчанию
 
 - Namespace без меток PSA — уровень privileged, проверок нет.
 - Версия правил без метки версии — `latest`.
-- `failurePolicy` у VAP — `Fail`.
+- `failurePolicy` у VAP и MAP — `Fail`; `reinvocationPolicy` у MAP умолчания не имеет.
 - Режимы PSA независимы: каждый настраивается отдельной меткой.
 - Исключений PSA по умолчанию нет.
 - Ответ на нарушение VAP без `reason` — код `Invalid` (422); значение `reason` можно задать: `Unauthorized`, `Forbidden`, `Invalid`, `RequestEntityTooLarge`.
@@ -301,13 +310,13 @@ MAP в 1.32 была alpha, в 1.34 — beta. Если кластер старш
 
 PSA проверяет поля пода и больше ничего: не теги образов, не реестры, не метки и не ресурсы. Исключения у PSA грубые: на пользователя, RuntimeClass или namespace целиком, а не на образ. Исключить под по отдельному полю нельзя.
 
-VAP и MAP видят один объект и параметры. Они не обращаются к внешним сервисам, не создают другие объекты и не проверяют подпись образа. PSA не заменяет seccomp-профиль: она проверяет, что поле задано, а применяет его рантайм. Подробности про профили — в 06-2.
+VAP и MAP видят один объект и параметры. Они не обращаются к внешним сервисам, не создают другие объекты и не проверяют подпись образа. ApplyConfiguration в MAP не меняет атомарные структуры, словари и списки, иначе слияние стёрло бы чужие значения; для них остаётся JSONPatch. PSA не заменяет seccomp-профиль: она проверяет, что поле задано, а применяет его рантайм. Подробности про профили — в 06-2.
 
 ---
 
 ## Лабораторные работы
 
-Работы идут на стенде 00-1 в namespace `lab-06-3` и `lab-06-3b`; последний нужен для мягкого внедрения, а MAP использует отдельный `lab-06-3c`. Команды везде с явным `-n`: контекст kubectl и текущий namespace не меняются. Хост работы не меняют; политики и привязки — объекты кластера, их удаляет уборка. Образ `busybox:1.37` узлы тянут из Docker Hub, а при недоступности используйте копию в реестре стенда (02-1).
+Работы идут на стенде 00-1 в namespace `lab-06-3` и `lab-06-3b`; последний нужен для мягкого внедрения, а MAP использует отдельный `lab-06-3c`. Команды везде с явным `-n`: контекст kubectl и текущий namespace не меняются. Хост работы не меняют; политики и привязки — объекты кластера, их удаляет уборка. Образ `busybox:1.37` узлы тянут из Docker Hub, а при недоступности используйте копию `localhost:5001/busybox:1.37` в реестре стенда (02-1).
 
 Подготовку делают один раз: выбирают контекст стенда и создают два namespace.
 
@@ -378,7 +387,7 @@ set securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost")
 
 1. `Forbidden` — запрос отклонён на admission, под не создан.
 2. `restricted:latest` — применён уровень restricted с версией правил `latest`.
-3. Четыре нарушения — по одному на каждое требование restricted (§2).
+3. Четыре нарушения — по одному на каждое требование restricted (§2), которое этот под не выполняет.
 4. В скобках названо поле, которое нужно добавить: сообщение — готовый список правок.
 
 #### Шаг 2. Создать под, который проходит restricted
@@ -560,8 +569,8 @@ kubectl -n lab-06-3b run hostnet --image=busybox:1.37 \
 ```
 Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false …
 pod/plain created
-Error from server (Forbidden): … violates PodSecurity "baseline:latest":
-host namespaces (hostNetwork=true)
+Error from server (Forbidden): pods "hostnet" is forbidden: violates PodSecurity
+"baseline:latest": host namespaces (hostNetwork=true)
 ```
 
 Разбор:
@@ -613,7 +622,7 @@ namespace/orders labeled (server dry run)
 | Enforce отклоняет, warn только предупреждает | шаг 2 |
 | Пробная метка показывает нарушения без изменений | шаг 3 |
 
-**Уборка.** Пробная метка ничего не сохранила. Под `plain` удаляется вместе с namespace в общей уборке последней работы.
+**Уборка.** Пробная метка ничего не сохранила, поэтому удаляем только под `plain`. Namespace `lab-06-3b` с метками PSA остаётся для работы 3.
 
 ```bash
 kubectl -n lab-06-3b delete pod plain
@@ -849,6 +858,7 @@ kind: MutatingAdmissionPolicy
 metadata: {name: lab-06-3-default-seccomp}
 spec:
   failurePolicy: Fail
+  reinvocationPolicy: Never
   matchConstraints:
     resourceRules:
     - {apiGroups: [""], apiVersions: [v1], operations: [CREATE], resources: [pods]}
@@ -889,10 +899,11 @@ EOF
 | Часть команды | Значение |
 |---|---|
 | `warn=restricted` | PSA предупреждает о нарушениях restricted |
+| `reinvocationPolicy: Never` | обязательное поле: мутировать один раз |
 | `matchConditions … no-seccomp` | мутировать, только если seccomp не задан |
 | `patchType: ApplyConfiguration` | слить указанные поля с объектом |
 | `Object.spec.securityContext{…}` | построить вложенный объект по схеме пода |
-| `patchType: JSONPatch` | выполнить операцию `add` |
+| `patchType: JSONPatch` | выполнить операцию `add`; метка `run` уже есть |
 | `jsonpatch.escapeKey(…)` | экранировать `/` в имени метки |
 | `namespaceSelector` | область: только namespace с меткой |
 
@@ -950,13 +961,16 @@ EOF
 kubectl -n lab-06-3c get pod m2 -o jsonpath='{.spec.securityContext.seccompProfile.type}{"\n"}'
 ```
 
-Ожидаемый результат:
+Ожидаемый результат (строка предупреждения сокращена):
 
 ```
+Warning: would violate PodSecurity "restricted:latest": … seccompProfile (pod must not set
+securityContext.seccompProfile.type to "Unconfined") …
+pod/m2 created
 Unconfined
 ```
 
-Разбор: условие `matchConditions` не пропустило этот под, потому что `seccompProfile` уже задан. Значение автора осталось, и нарушение попало в предупреждение PSA. Без такого условия `ApplyConfiguration` перезаписал бы выбор автора.
+Разбор: условие `matchConditions` не пропустило этот под, потому что `seccompProfile` уже задан. Значение автора осталось, и нарушение попало в предупреждение PSA. Под создан, потому что у namespace нет метки enforce, а `Unconfined` запрещён уже на baseline. Без такого условия `ApplyConfiguration` перезаписал бы выбор автора.
 
 **Итог.**
 
