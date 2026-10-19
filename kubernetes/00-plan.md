@@ -110,7 +110,7 @@
 | Часть | Лабораторные работы |
 |---|---|
 | 04-1 ConfigMap и Secret | 1. Обновление: env, том, subPath. 2. Secret в etcd. 3. Шифрование в etcd (KMS v2 — теория) |
-| 04-2 Хранилище: PV, PVC, CSI | 1. WaitForFirstConsumer. 2. RWO, RWOP. 3. Delete, Retain, расширение. Теория: VolumeAttributesClass |
+| 04-2 Хранилище: PV, PVC, CSI | 1. WaitForFirstConsumer. 2. RWO, RWOP. 3. Delete, Retain, расширение. Теория: VolumeAttributesClass, том из образа (image volume) |
 | 04-3 Бэкап и восстановление | 1. Бэкап CronJob'ом. 2. Авария и восстановление. 3. Velero: бэкап namespace, сравнение со снапшотом etcd |
 
 ### Модуль 05. Ресурсы и планирование
