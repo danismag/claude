@@ -1,289 +1,747 @@
-# 11-1. Под не работает
+# 11-2. Под не работает
 
-> Модуль 11 «Диагностика» · часть 1 из 3 · 🟢🟡🔴 · ~45 мин чтения + ~1 ч тренажёров · Нужно: стенд 00-1. Опирается на 02-1 (состояния пода), 05-1 (ресурсы), 05-2 (планирование), 04-2 (тома), 02-5 (probes).
+> Модуль 11 «Наблюдаемость и диагностика» · часть 2 из 4 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд 00-1 (контекст `kind-lab`), kubectl из 00-2, образы `orders-api:2.0` и `busybox:1.37` в реестре стенда · Опирается на: 02-1, 02-5, 04-2, 05-1, 05-3, 00-2 (§5), 11-1
+
+## Где мы на карте
+
+Эта часть собирает в одну методику то, что модули 02–05 объясняли по отдельности. Там каждый механизм описан изнутри: как работает scheduler, kubelet, проба, том. Здесь мы идём от симптома: под в плохом статусе, и нужно понять, на каком шаге жизни он остановился. Для этого часть опирается на состояния и коды выхода (02-1), пробы (02-5), requests и OOM (05-1), планировщик (05-3), тома (04-2) и команды kubectl из 00-2.
+
+Сроки хранения событий разобраны в 11-1, а поломки сети и узла — в 11-3 и 11-4. Большой набор сломанных подов для тренировки собран в 12-2.
+
+```
+шаг жизни пода      кто отвечает        STATUS при поломке                        где механизм
+1 планирование      scheduler           Pending, SchedulingGated                  05-3
+2 образ             kubelet, реестр     ErrImagePull, ImagePullBackOff            02-1 §5
+3 конфигурация,     kubelet, CSI, CNI   CreateContainerConfigError,               04-1, 04-2, 03-1
+  тома, сеть                            ContainerCreating (долго)
+4 запуск процесса   containerd, runc    RunContainerError, StartError             02-1 §4
+5 работа            приложение          CrashLoopBackOff, Error, OOMKilled        02-1 §2, 05-1
+6 готовность        kubelet, пробы      Running, READY 0/1                        02-5
+7 остановка         kubelet, API        Terminating                               02-5, 09-2
+```
+
+Схема 1. Семь шагов жизни пода сверху вниз: у каждого шага свой ответственный компонент, свои значения STATUS и своя часть курса.
 
 ---
 
-## Зачем это DevOps-у
+## 1. Какую задачу решает методика
 
-«Под не стартует» — самая частая жалоба разработчиков и самый частый вопрос live-собеседования: дают кластер со сломанным подом и смотрят, как вы ищете причину. Важна не память на все ошибки, а **методика**: за 2–3 команды понять, на каком шаге жизни пода он застрял — планирование, образ, конфигурация, запуск процесса, работа приложения, готовность — и чья это проблема: платформы или приложения.
+Методика отвечает на вопрос «почему под не работает» за две-три команды, не угадывая. Разберём, чем мешает один общий статус и как шаги жизни пода превращают поиск в последовательность проверок.
 
-В этой части — методика и десять тренажёров на стенде; в 11-2 — тот же подход для сети, в 11-3 — для узлов и control plane.
+### Один статус, много причин
+
+Колонка STATUS показывает симптом, а не причину. Под в `Pending` ждёт узел, и причин может быть шесть: не хватает ресурсов, мешает taint, не совпал селектор, нет тома, стоит шлюз планирования или остановлен scheduler. Под в `CrashLoopBackOff` падает, но статус не говорит почему.
+
+Поэтому диагностика идёт не от слова в STATUS к «рецепту», а от слова к шагу и от шага к источнику сведений. Цель такая: за две-три команды назвать шаг, причину и ответственного — платформу, манифест или приложение.
+
+### Шаг жизни пода
+
+**Шаг жизни пода** (pod lifecycle step) — этап между созданием пода и его готовностью, на котором под может остановиться; схема 1 показывает семь таких шагов. Шаги идут строго по порядку: под без узла не может ошибаться с образом, а контейнер без образа не может падать с кодом 137.
+
+Из этого следует главное правило: ищите первый шаг, на котором под застрял. Если под `Pending`, то ошибки образа и проб пока не существуют, и читать нужно только решение scheduler. Ошибка раннего шага скрывает все поздние, поэтому после исправления под может застрять на следующем шаге, и это нормально.
+
+### Что вне этой части
+
+Часть описывает поды, у которых есть объект и понятная причина в самом поде. Если сломана сеть между подами, DNS или Service, метод тот же, но источники другие (11-3). Если плохо многим подам одного узла или не отвечает control plane, причина лежит выше пода (11-4). А тренажёры с десятками сломанных подов — в 12-2.
 
 ---
 
-## 1. Методика 🟢
+## 2. Как устроена диагностика
 
-```
-kubectl get pod <p> -o wide            1. STATUS, READY, RESTARTS, NODE — на каком шаге?
-kubectl describe pod <p>               2. Events (внизу) и Last State контейнеров — почему?
-kubectl logs <p> [-c c] [--previous]   3. что говорит приложение (если процесс запускался)
-kubectl get events --sort-by=.lastTimestamp   (контекст: узел, PVC, ReplicaSet)
-kubectl debug <p> --copy-to=… / -it --target  4. руками внутри (00-2 §6)
-```
+Диагностика читает четыре источника сведений и сверяет их между собой. Каждый источник отвечает на свой вопрос, а условия пода подсказывают, в какой из них смотреть.
 
-По STATUS сразу понятен шаг:
+### Четыре источника
 
-| STATUS | Шаг | Чья проблема | Где смотреть |
+Первые два источника хранит API, третий — узел, четвёртый создаёт сам инженер. Таблица показывает, на какой вопрос отвечает каждый и сколько живёт.
+
+| Источник | Вопрос | Где лежит | Срок жизни |
 |---|---|---|---|
-| `Pending` (NODE пусто) | планирование | платформа/манифест | событие `FailedScheduling` |
-| `Pending` / `ContainerCreating` (NODE есть) | тома, сеть, образ | платформа | события пода: `FailedMount`, `FailedCreatePodSandBox` |
-| `ErrImagePull` / `ImagePullBackOff` | образ | манифест/реестр | `state.waiting.message` |
-| `CreateContainerConfigError` | конфигурация | манифест | `state.waiting.message` |
-| `RunContainerError`, `StartError` (exit 128) | запуск процесса | образ/команда | `lastState.terminated.message` |
-| `CrashLoopBackOff`, `Error` | процесс падает | приложение | `logs`, `lastState.exitCode` |
-| `OOMKilled` (137) | память | приложение/лимиты | `lastState`, 05-1 |
-| `Running`, READY `0/1` | готовность | приложение/проба | событие `Unhealthy` |
-| `Terminating` долго | остановка | grace/finalizer | 02-5, 09-2 |
+| Статус | что решила система | поля status объекта | пока есть под |
+| События | что делали компоненты | API-сервер | 1 час |
+| Логи | что говорит приложение | файлы на узле | до удаления пода |
+| Изнутри | что видит процесс | exec, debug | пока открыт сеанс |
 
-## 2. Десять тренажёров 🟡
+**Статус** (status) — поля `phase`, `conditions` и `containerStatuses` в объекте пода (02-1 §2). **События** (events) — записи компонентов о действиях с подом; API-сервер хранит их 1 час (02-1 §4, 11-1). Логи kubelet пишет в файлы `/var/log/pods` на узле и ротирует по 10 МиБ, а после удаления пода каталог исчезает (00-2 §6). Поэтому события и логи упавшего пода надо читать сразу, пока они не пропали.
 
-Проверено на стенде — сводка `kubectl get pods` через 50 секунд после `apply`:
+### Условия как указатель
 
-```
-t01-bad-tag      0/1   ImagePullBackOff             0
-t02-no-registry  0/1   ImagePullBackOff             0
-t03-crash        0/1   Error                        3
-t04-no-cm        0/1   CreateContainerConfigError   0
-t05-oom          0/1   OOMKilled                    2
-t06-too-big      0/1   Pending                      0
-t07-selector     0/1   Pending                      0
-t08-pvc          0/1   Pending                      0
-t09-not-ready    0/1   Running                      0
-t10-bad-cmd      0/1   RunContainerError            3
-```
+Первое условие со статусом `False` называет шаг, на котором под застрял. Условия идут в порядке схемы 5 из 02-1, и каждое связано с шагом жизни.
 
-Разбор (сообщения — проверено):
+- `PodScheduled=False` — шаг 1, причина `Unschedulable` или `SchedulingGated`.
+- `PodReadyToStartContainers=False` — шаги 2–3: песочница, сеть или том не готовы.
+- `Initialized=False` — init-контейнер не завершился (02-1 §3).
+- `ContainersReady=False` — шаг 6, проба не проходит или контейнер не работает.
+- `Ready=False` при `ContainersReady=True` — не выполнен `readinessGate`; встречается редко.
 
-**t01 — тега нет в реестре.** `state.waiting.message`: `… failed to resolve reference "localhost:5001/orders-api:9.9": localhost:5001/orders-api:9.9: not found`. Проверить теги в реестре, ошибку в CI, где тег должен был появиться.
+На стенде 1.36 условие `PodReadyToStartContainers` уже есть, а стабильным оно становится в 1.37. Условия отвечают на вопрос «где», но не «почему»: причину называет событие или `message` контейнера.
 
-**t02 — реестр недоступен.** `failed to do request: Head "https://registry.invalid.lab/v2/app/manifests/1.0…`: DNS/сеть/TLS до реестра. Отличие от t01 — ошибка **до** реестра, а не «не найдено». Сюда же — `401/403` (нет или неверный `imagePullSecrets`) и `429` (лимиты Docker Hub, ECR Public — 08-1).
+### Где искать, если пода нет
 
-**t03 — приложение падает.** STATUS `Error`/`CrashLoopBackOff`, `lastState: Error/1`. Логи (проверено): `kubectl logs t03-crash` → `db config missing`. В период back-off **`kubectl logs` без `--previous`** показывает вывод последнего упавшего экземпляра; `--previous` на стенде отвечал `unable to retrieve container logs` (то же было в 05-1). Если логов нет вовсе — termination message (02-1 §7).
+Иногда пода нет вовсе, и `kubectl get pods` пуст при созданном Deployment. Тогда ошибку пишет не под, а его владелец: контроллер получил отказ от API и записал его в события своего ReplicaSet или Job.
 
-**t04 — нет ConfigMap.** `configmap "app-config" not found`. Создать объект или исправить имя; под оживёт сам без пересоздания (02-1), но не мгновенно: kubelet повторяет попытку с back-off, и через 6 с после создания ConfigMap на стенде под ещё был в `CreateContainerConfigError` (проверено) — ждите до следующей попытки (десятки секунд) или пересоздайте под.
+Типичные отказы такие: квота namespace (05-2 §5), политика admission (06-3 §5), недоступный вебхук (09-2 §5), несуществующий ServiceAccount. Команда `kubectl describe replicaset` и `kubectl get events` в том же namespace показывают текст отказа.
 
-**t05 — OOM.** `lastState: OOMKilled/137`. Событий про OOM нет — смотрите `describe` → Last State и журнал ядра узла (05-1 §4).
+---
 
-**t06 — не хватает ресурсов.** `0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 Insufficient cpu.` — request больше любого узла (здесь 64 CPU). Снизить request или добавить узлы; проверить, не «съели» ли allocatable requests других подов (05-1 §2).
+## 3. Как управлять диагностикой
 
-**t07 — нет подходящих узлов.** `3 node(s) didn't match Pod's node affinity/selector` — `nodeSelector: {disktype: nvme}`, а такой метки нет ни у одного узла. Метки узлов: `kubectl get nodes --show-labels` (05-2).
+Управление здесь значит порядок действий и выбор инструмента. Сначала берём пять команд в фиксированном порядке, затем решаем, как читать логи, как зайти в контейнер и что можно поправить на живом поде.
 
-**t08 — PVC не создан.** У пода — `pod has unbound immediate PersistentVolumeClaims`; у PVC — `storageclass.storage.k8s.io "fast-ssd" not found`. Причина в PVC, а не в поде: смотрите события PVC (04-2).
+### Порядок из пяти команд
 
-**t09 — работает, но не готов.** `Running`, `0/1`, событие `Readiness probe failed: HTTP probe failed with statuscode: 404` — проба на `/healthz`, а приложение отдаёт `/ready`. Под не получает трафик (03-2), рестартов нет (02-5).
-
-**t10 — нечего запускать.** `RunContainerError`, `lastState: StartError/128`, `exec: "/app/server": stat /app/server: no such file or directory`. Проверка копией пода с другой командой (проверено):
+Команды идут от дешёвой и широкой к дорогой и точной. Первая показывает шаг, вторая и четвёртая — причину, третья — слова приложения, пятая — состояние изнутри.
 
 ```bash
-kubectl debug t10-bad-cmd --copy-to=t10-debug --container=app -- sh -c 'ls -la /app; which server; sleep 3600'
-kubectl logs t10-debug          # ls: /app: No such file or directory
+kubectl get pod ИМЯ -o wide
+kubectl describe pod ИМЯ
+kubectl logs ИМЯ -c КОНТЕЙНЕР --previous
+kubectl get events --sort-by=.lastTimestamp
+kubectl debug -it ИМЯ --image=busybox:1.37 --target=КОНТЕЙНЕР
 ```
 
-Каталога в образе нет — не тот образ или неверный `command`. Отличие от `127` (02-1 §3): там shell запустился и не нашёл команду, здесь не запустился сам процесс.
+| Команда | Что даёт |
+|---|---|
+| `get pod -o wide` | STATUS, READY, RESTARTS и узел: шаг жизни |
+| `describe pod` | условия, State и Last State, события внизу |
+| `logs --previous` | вывод предыдущего запуска контейнера |
+| `get events --sort-by` | события namespace по времени |
+| `debug -it --target` | отладочный контейнер рядом с процессом |
 
-## 3. Приложение или платформа 🟡
+Что смотреть в выводе: не переходите к следующей команде, пока предыдущая не назвала причину. Чаще всего хватает первых двух, а логи нужны, только если процесс хотя бы раз стартовал.
 
-| Признак | Скорее платформа | Скорее приложение |
-|---|---|---|
-| несколько разных сервисов на одном узле сломаны одновременно | ✓ (узел, CNI, диск — 11-3) | |
-| ошибки до старта процесса (Pending, ImagePull, ContainerCreating) | ✓ (или манифест) | |
-| процесс стартует и падает с понятным сообщением в логах | | ✓ |
-| работало вчера, сегодня новый образ | | ✓ (сравнить `imageID`, 02-2) |
-| работало вчера, образ тот же, сломалось у всех | ✓ (зависимость, DNS, сеть, секрет) | |
-| `OOMKilled` | лимит занижен (обсуждается) | утечка/рост (обсуждается) |
+### Логи упавшего контейнера
 
-Привычка, которая экономит часы: первым делом `kubectl get pods -A --field-selector=status.phase!=Running -o wide` — один это под или все поды узла/namespace.
+`kubectl logs` читает файл лога на узле. Флаг `--previous` берёт предыдущий запуск, флаг `-c` выбирает контейнер (для init-контейнера его имя тоже указывают через `-c`), а `--all-containers` печатает все контейнеры пода.
 
-## 4. Под без shell и «внутри» 🟡
+В период back-off обычный `kubectl logs` на стенде показывал вывод последнего упавшего экземпляра, а `--previous` один раз ответил `unable to retrieve container logs`. Поэтому пробуйте обе формы, а не останавливайтесь на первой ошибке. Если логов нет вовсе, причину ищут в `message` завершения (02-1 §4) или в копии пода.
 
-- `kubectl debug -it <pod> --image=busybox:1.37 --target=<c>` — инструменты рядом с живым контейнером (00-2 §6).
-- `kubectl debug <pod> --copy-to=<new> --container=<c> -- <команда>` — копия падающего пода с другой командой (`sleep`), чтобы зайти и запустить приложение руками.
-- `kubectl debug node/<узел>` — узел: `crictl logs`, `journalctl -u kubelet`, файловая система (11-3).
-- `kubectl exec <pod> -- env`, `cat /etc/resolv.conf`, проверка доступа к зависимостям изнутри (11-2).
+### Зайти внутрь: exec, debug, copy-to
+
+Способ зависит от того, жив ли контейнер и есть ли в образе shell. Ключи и профили разобраны в 00-2 §5, здесь выбираем способ по ситуации.
+
+- **Контейнер работает, shell есть** — `kubectl exec -it`: команды из образа.
+- **Работает, shell или `ps` нет** — `kubectl debug -it --target`: ephemeral-контейнер с инструментами.
+- **Падает сразу после старта** — `kubectl debug --copy-to`: копия с другой командой.
+- **Нужен образ с отладчиком** — `--copy-to` вместе с `--set-image`: копия с другим образом.
+- **Причина, возможно, на узле** — `kubectl debug node/…`: под на узле с корнем в `/host`.
+
+Копия создаёт отдельный под: оригинал остаётся нетронутым, а профиль `general` убирает у копии метки и пробы, чтобы Service не слал в неё трафик (00-2 §5). В копии с `--copy-to` общее пространство PID включается флагом `--share-processes`. Отладку узла применяйте осторожно: под получает права root на узле (11-4, 06-3), а после работы его удаляют вручную.
+
+### Что поправить на живом поде
+
+Спецификация пода почти неизменяема (02-1 §3), поэтому сначала решите, чинить объект рядом с подом или пересоздавать сам под. Правка вокруг пода часто лечит его без пересоздания.
+
+- Создать недостающие ConfigMap, Secret, StorageClass или PVC: kubelet и scheduler повторят попытку сами.
+- Заменить `image` у основного контейнера: это разрешённая правка, перезапустится только он.
+- Добавить `tolerations` или снять `schedulingGates`: обе правки допустимы на живом поде.
+- Остальное (ресурсы, `nodeSelector`, пробы, `command`) требует пересоздания пода.
+
+Под из контроллера правят не напрямую, а в шаблоне Deployment (02-2): прямая правка исчезнет вместе с подом при следующей замене.
 
 ---
 
-## 🔧 Лаба
+## 4. Как увидеть состояние
 
-### Шаг 0. Тренажёры
+Состояние пода видно на четырёх уровнях подробности: сводка в списке, `describe`, точные поля и события namespace. Идём от краткого к подробному и останавливаемся, когда причина названа.
+
+### Список: get
+
+Команда `kubectl get pod -o wide` показывает четыре колонки, которые читают подряд.
+
+- **READY** — готовые контейнеры из всех, например `0/1`.
+- **STATUS** — симптом, а не причина.
+- **RESTARTS** — число перезапусков, а рядом kubectl пишет, как давно был последний.
+- **NODE** — узел; пустое значение значит, что под не назначен и застрял шаг 1.
+
+Фазу и STATUS читают вместе (02-1 §4): под в фазе `Running` может показывать `CrashLoopBackOff`, потому что STATUS берёт `reason` контейнера. Обзор всего кластера даёт команда ниже: она показывает, один это под или много и на каких узлах они стоят.
+
+```bash
+kubectl get pods -A --field-selector=status.phase!=Running -o wide
+```
+
+Что в выводе: поды из разных namespace на одном узле указывают на платформу (11-4), а один под — на его манифест или приложение. Завершённые задачи в фазе `Succeeded` тоже попадут в список, их пропускайте.
+
+### Подробности: describe
+
+Команда `kubectl describe pod ИМЯ` собирает три блока, которые читают снизу вверх. Внизу идут события: `Scheduled`, `Pulling`, `Failed`, `BackOff`, `Unhealthy`. Выше стоят блоки контейнеров: `State` показывает текущее состояние, `Last State` — предыдущее, с `Exit Code`, `Reason` и `Message`. Ещё выше лежат условия пода.
+
+Если вывод длинный, ограничьте его событиями:
+
+```bash
+kubectl describe pod ИМЯ | sed -n '/^Events:/,$p'
+```
+
+Команда печатает всё от строки `Events:` до конца. В выводе ищите строки с типом `Warning`: их причина (`FailedScheduling`, `Failed`, `BackOff`, `Unhealthy`) называет шаг, а сообщение — деталь.
+
+### Точные поля: jsonpath
+
+Когда `describe` режет длинное сообщение, нужное поле берут из объекта. JSONPath (00-2 §3) выбирает из объекта нужные места. Три выборки покрывают почти все случаи.
+
+```bash
+kubectl get pod ИМЯ -o jsonpath='{.status.containerStatuses[0].state.waiting.message}{"\n"}'
+kubectl get pod ИМЯ \
+  -o jsonpath='{.status.containerStatuses[0].lastState.terminated.exitCode}{"\n"}'
+kubectl get pod ИМЯ -o jsonpath='{range .status.conditions[*]}{.type}={.status}{"\n"}{end}'
+```
+
+| Выборка | Что даёт |
+|---|---|
+| `state.waiting.message` | полный текст ошибки образа или конфигурации |
+| `lastState.terminated.exitCode` | код выхода предыдущего запуска |
+| `range .status.conditions[*]` | все условия по порядку списка |
+
+Что в выводе: первая строка нужна при `ErrImagePull` и `CreateContainerConfigError`, вторая — при перезапусках, третья показывает, какое условие `False` первым. Замените `containerStatuses` на `initContainerStatuses`, чтобы прочитать init-контейнеры.
+
+### События по условиям
+
+Команда `kubectl get events` показывает события всего namespace, а фильтры оставляют нужные. Два фильтра закрывают почти все задачи: по объекту и по причине.
+
+```bash
+kubectl get events --field-selector involvedObject.name=ИМЯ,reason=FailedScheduling
+kubectl get events --field-selector type=Warning --sort-by=.lastTimestamp
+kubectl events --for pod/ИМЯ
+```
+
+Первая команда выбирает события одного пода и одной причины, вторая — все предупреждения namespace по времени. Третья — короткая форма kubectl для событий одного объекта (00-2 §3). Если события пода пусты, а под `Pending`, ищите причину у соседних объектов: PVC, ReplicaSet, узла.
+
+---
+
+## 5. Что ломается и как найти причину
+
+Поломки делятся по шагам жизни. Для каждого шага ниже дан признак, место поиска причины и ссылка на часть, где объяснён механизм. Реальные сообщения взяты из стенда.
+
+### Pending: под не назначен
+
+Под в `Pending` с пустым `NODE` ждёт решения scheduler, и причину называет событие `FailedScheduling` (05-3 §5). Читайте его целиком: оно перечисляет все узлы группами.
+
+```
+0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 Insufficient cpu.
+```
+
+Разбор: control-plane отпал из-за taint, а три worker'а не вместили request в 64 CPU. Тут платформа ни при чём: манифест просит больше, чем есть на любом узле.
+
+Остальные причины Pending выглядят так:
+
+- нехватка ресурсов — `Insufficient cpu` или `memory`; проверьте requests других подов (05-1 §2);
+- селектор или affinity — `didn't match Pod's node affinity/selector`; сверьте метки узлов (05-3 §3);
+- том — у пода `pod has unbound immediate PersistentVolumeClaims`, а причина в событиях PVC, например `storageclass … "fast-ssd" not found` (04-2 §5);
+- шлюз планирования — STATUS `SchedulingGated`, события нет, смотрите `spec.schedulingGates` (05-3 §2);
+- scheduler не работает — событий нет совсем, под не назначен (01-1).
+
+Если NODE заполнен, а под всё ещё `Pending` или `ContainerCreating`, шаг 1 пройден. Причину тогда ищут в событиях пода: `FailedMount` (04-2 §5) или `FailedCreatePodSandBox` (03-1 §5).
+
+### Контейнер не создан: образ и конфигурация
+
+Пока контейнер не создан, логов нет, и всё лежит в `state.waiting` и событиях. Первое слово в `reason` показывает шаг: `ErrImagePull` и `ImagePullBackOff` — шаг 2, `CreateContainerConfigError` — шаг 3.
+
+Образ читается по тексту ошибки, потому что одно и то же состояние скрывает разные причины:
+
+- `not found` — реестр ответил, но тега нет; на стенде `failed to resolve reference "localhost:5001/orders-api:9.9" … not found`. Проверьте тег и сборку в CI;
+- `failed to do request: Head "https://registry.invalid.lab/v2/…` — ошибка до реестра: DNS, сеть или TLS;
+- `401` или `403` — нет или неверен `imagePullSecrets` (04-1);
+- `429` — лимит запросов к реестру (08-1).
+
+Для `CreateContainerConfigError` текст называет объект: `configmap "app-config" not found`. Создайте объект, и kubelet сам повторит создание контейнера. Пауза между попытками растёт, поэтому на стенде через 6 с после создания ConfigMap под ещё показывал ошибку. Пересоздавать под не нужно. Эта же ошибка возникает, если `runAsNonRoot` противоречит пользователю образа (06-2).
+
+### Процесс запустился и упал
+
+Контейнер, который стартовал и вышел, оставляет код выхода, и по нему выбирают ветку. Таблицу кодов не повторяем (02-1 §4), а порядок из пяти шагов поиска описан в 02-1 §5.
+
+- Код 1 и другие коды приложения — читайте логи. На стенде `kubectl logs` показал `db config missing`, а `lastState` был `Error` с кодом 1.
+- Код 137 с `OOMKilled` — память (05-1 §5). Событий об OOM нет, смотрите `Last State` и журнал ядра узла.
+- Код 137 без `OOMKilled` — liveness-проба или SIGKILL после grace period (02-5 §5).
+- Коды 126, 127 и 128 — команда или файл. Код 128 с `StartError` значит, что процесс не запустился вовсе.
+
+Пример для кода 128: STATUS `RunContainerError`, а в `lastState.terminated.message` стоит `exec: "/app/server": stat /app/server: no such file or directory`. Запуск копии с другой командой подтвердил, что каталога `/app` в образе нет: либо образ не тот, либо неверен `command`.
+
+Когда логов нет, а причина неясна, остаются три приёма. Первый — сообщение о завершении с `FallbackToLogsOnError` (02-1 §4). Второй — копия пода с командой `sleep` для ручного запуска. Третий — отладочный контейнер с общим PID для образов без shell. Очередного перезапуска не ждите: пауза растёт до 300 с (02-1 §2).
+
+### Работает, но не готов или не уходит
+
+Под `Running` с `READY 0/1` значит, что процесс жив, а проба готовности не проходит, поэтому под вне Service (03-2). Рестартов при этом нет, потому что readiness контейнер не перезапускает (02-5).
+
+Причину называет событие `Unhealthy`. На стенде это `Readiness probe failed: HTTP probe failed with statuscode: 404`: проба стояла на `/healthz`, а приложение отдаёт `/ready`. Другие причины — таймаут, отказ соединения, зависимость, которую проверяет проба, незавершённая `startupProbe` и неготовый второй контейнер: Ready требует готовности всех контейнеров.
+
+Под в `Terminating` дольше grace period (по умолчанию 30 с) застрял на одном из пяти шагов остановки. Посмотрите, кто держит его:
+
+```bash
+kubectl get pod ИМЯ -o jsonpath='{.metadata.deletionTimestamp}{"\n"}{.metadata.finalizers}{"\n"}'
+```
+
+Команда печатает время начала удаления и список финализаторов. **Финализатор** (finalizer) — строка в `metadata.finalizers`, которая не даёт удалить объект, пока её владелец не завершит очистку (09-2). Причины по частоте:
+
+- PID 1 игнорирует SIGTERM, и под ждёт 30 с до SIGKILL (02-5 §5);
+- хук `preStop` зависает (02-5);
+- финализатор остался без владельца (09-2 §5);
+- том не отмонтируется (04-2 §5);
+- узел `NotReady`, и kubelet не подтверждает остановку (01-2 §5, 05-5).
+
+Принудительное удаление `--grace-period=0 --force` убирает объект из API, не дожидаясь узла. Применяйте его, только когда уверены, что процесс остановлен: иначе у StatefulSet (02-3) появится второй под с тем же томом.
+
+### Приложение или платформа: дерево решений
+
+**Дерево решений** (decision tree) — последовательность вопросов, каждый из которых отсекает половину причин. Начинайте с масштаба, потом идите по шагам жизни.
+
+```
+сломан один под или много?
+├─ много (один узел, один namespace) ─► платформа: 11-3, 11-4
+└─ один
+   ├─ NODE пуст ───────────► шаг 1: FailedScheduling (05-3)
+   ├─ ErrImagePull ────────► шаг 2: образ, реестр, секрет
+   ├─ ConfigError, Mount ──► шаг 3: объект, том, сеть пода
+   ├─ StartError, 126-128 ─► шаг 4: command и образ
+   ├─ процесс падает
+   │   ├─ OOMKilled ───────► память (05-1); лимит или утечка
+   │   └─ код приложения ──► логи, конфигурация, зависимость
+   ├─ Running, READY 0/1 ──► шаг 6: проба, зависимость
+   └─ Terminating ─────────► шаг 7: SIGTERM, финализатор, узел
+```
+
+Схема 2. Дерево решений: верхний вопрос о масштабе, дальше STATUS ведёт к шагу и части курса.
+
+Ответ на вопрос «приложение или платформа» опирается на несколько признаков. Таблица сводит три: что видно, к чему это склоняет и чем проверить.
+
+| Признак | Скорее | Чем проверить |
+|---|---|---|
+| Ошибка до старта процесса | манифест или платформа | событие, state.waiting |
+| Процесс падает с понятным логом | приложение | логи, код выхода |
+| Работало вчера, образ новый | приложение | imageID (02-2 §4) |
+| Работало вчера, образ тот же | зависимость или платформа | события, DNS, сеть |
+| Сломаны разные сервисы на узле | платформа | get pods -o wide, 11-4 |
+| OOMKilled | нужно решить: лимит или утечка | kubectl top, рост памяти (05-1) |
+
+Строка про OOM спорная намеренно: лимит может быть занижен, а может быть утечка, и ответ зависит от графика памяти, а не от статуса.
+
+---
+
+## 6. Пределы и значения по умолчанию
+
+Числа ниже взяты из частей, на которые ссылается методика, и из документации Kubernetes для версии стенда 1.36.
+
+### Сроки
+
+- События живут 1 час (`--event-ttl`, значение по умолчанию API-сервера).
+- Пауза перезапуска контейнера — от 10 до 300 с, сброс после 10 минут без падений (02-1 §2); потолок настраивается с 1.35 (beta).
+- Пауза между попытками загрузить образ тоже растёт до 300 с (документация Kubernetes, Images).
+- Grace period при остановке — 30 с (02-5).
+
+### Размеры
+
+- Лог контейнера на узле — до 5 файлов по 10 МиБ (00-2 §6).
+- Сообщение о завершении — до 4096 байт у контейнера, сумма в поде до 12 КиБ (02-1 §6).
+- `kubectl logs -l` печатает по 10 строк каждого пода, если не задан `--tail`.
+
+### Ограничения отладки
+
+- Ephemeral-контейнер нельзя удалить: он живёт до пересоздания пода.
+- Копия `--copy-to` и под отладки узла остаются, пока вы не удалите их вручную.
+- Профиль `kubectl debug` по умолчанию в 1.36 — `general`.
+- Из `spec` живого пода можно менять только образ, `tolerations` (добавлять), `schedulingGates` (снимать) и ещё несколько полей (02-1 §3).
+
+---
+
+## Лабораторные работы
+
+Работа идёт на стенде 00-1 в namespace `lab-11-2`, файлы лежат в `~/lab/k8s/11-2/`. Хост и узлы работа не меняет: всё происходит внутри кластера kind. Образы `busybox:1.37` и `orders-api:2.0` берутся из реестра стенда `localhost:5001`; если busybox там нет, выполните три команды `docker` из подготовки 02-1.
+
+Подготовка: выбираем контекст стенда, создаём namespace и каталог, задаём функцию `k`, которая подставляет namespace в каждую команду.
 
 ```bash
 kubectl config use-context kind-lab
-kubectl create ns lab-11-1
-kubectl config set-context --current --namespace=lab-11-1
-kubectl apply -f - <<'EOF'
+kubectl create ns lab-11-2
+mkdir -p ~/lab/k8s/11-2
+k() { kubectl -n lab-11-2 "$@"; }
+```
+
+| Часть команды | Значение |
+|---|---|
+| `use-context kind-lab` | выбрать кластер стенда |
+| `create ns lab-11-2` | создать namespace работы |
+| `mkdir -p ~/lab/k8s/11-2` | каталог для манифестов |
+| `k() { … }` | короткая команда для `kubectl -n lab-11-2` |
+
+Результат: `namespace/lab-11-2 created`. Функцию `k` снимает уборка.
+
+### Лабораторная работа 1. Методика на четырёх опорных поломках
+
+**Цель.** Применить порядок «get, describe, logs, debug» к четырём подам из разных классов и назвать шаг, причину и исправление.
+
+**Что понадобится.**
+
+- стенд 00-1 и namespace `lab-11-2`;
+- образы `localhost:5001/busybox:1.37` и `localhost:5001/orders-api:2.0`;
+- таблица шагов (схема 1) и дерево решений (схема 2) под рукой.
+
+**Схема опыта.**
+
+```
+pod-a  busybox,  request 64 CPU           ─► какой шаг?
+pod-b  orders-api, тег 9.9                ─► какой шаг?
+pod-c  busybox,  command /app/server      ─► какой шаг?
+pod-d  orders-api:2.0, проба /healthz     ─► какой шаг?
+```
+
+Схема 3. Четыре пода с нейтральными именами: имя не подсказывает причину, шаг определяете вы.
+
+#### Шаг 1. Создать четыре поломки
+
+Команда записывает манифест в файл, применяет его и через 50 секунд показывает список.
+
+```bash
+cat > ~/lab/k8s/11-2/broken.yaml <<'EOF'
 apiVersion: v1
 kind: Pod
-metadata: {name: t01-bad-tag}
-spec: {containers: [{name: app, image: "localhost:5001/orders-api:9.9"}]}
+metadata: {name: pod-a}
+spec:
+  containers:
+  - name: app
+    image: localhost:5001/busybox:1.37
+    command: ["sleep", "3600"]
+    resources:
+      requests: {cpu: "64"}
 ---
 apiVersion: v1
 kind: Pod
-metadata: {name: t02-no-registry}
-spec: {containers: [{name: app, image: "registry.invalid.lab/app:1.0"}]}
+metadata: {name: pod-b}
+spec:
+  containers:
+  - {name: app, image: "localhost:5001/orders-api:9.9"}
 ---
 apiVersion: v1
 kind: Pod
-metadata: {name: t03-crash}
-spec: {containers: [{name: app, image: "python:3.12-slim", command: ["python", "-c", "import sys; print('db config missing', file=sys.stderr); sys.exit(1)"]}]}
+metadata: {name: pod-c}
+spec:
+  containers:
+  - name: app
+    image: localhost:5001/busybox:1.37
+    command: ["/app/server"]
 ---
 apiVersion: v1
 kind: Pod
-metadata: {name: t04-no-cm}
-spec: {containers: [{name: app, image: "busybox:1.37", command: ["sleep","3600"], envFrom: [{configMapRef: {name: app-config}}]}]}
----
-apiVersion: v1
-kind: Pod
-metadata: {name: t05-oom}
-spec: {containers: [{name: app, image: "python:3.12-slim", command: ["python","-c","b=b'x'*(300*2**20)"], resources: {limits: {memory: 128Mi}}}]}
----
-apiVersion: v1
-kind: Pod
-metadata: {name: t06-too-big}
-spec: {containers: [{name: app, image: "busybox:1.37", command: ["sleep","3600"], resources: {requests: {cpu: "64"}}}]}
----
-apiVersion: v1
-kind: Pod
-metadata: {name: t07-selector}
-spec: {nodeSelector: {disktype: nvme}, containers: [{name: app, image: "busybox:1.37", command: ["sleep","3600"]}]}
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata: {name: t08-pvc}
-spec: {storageClassName: fast-ssd, accessModes: [ReadWriteOnce], resources: {requests: {storage: 1Gi}}}
----
-apiVersion: v1
-kind: Pod
-metadata: {name: t08-pvc}
-spec: {containers: [{name: app, image: "busybox:1.37", command: ["sleep","3600"], volumeMounts: [{name: d, mountPath: /d}]}], volumes: [{name: d, persistentVolumeClaim: {claimName: t08-pvc}}]}
----
-apiVersion: v1
-kind: Pod
-metadata: {name: t09-not-ready}
-spec: {containers: [{name: app, image: "localhost:5001/orders-api:2.0", readinessProbe: {httpGet: {path: /healthz, port: 8000}, periodSeconds: 3}}]}
----
-apiVersion: v1
-kind: Pod
-metadata: {name: t10-bad-cmd}
-spec: {containers: [{name: app, image: "busybox:1.37", command: ["/app/server"]}]}
+metadata: {name: pod-d}
+spec:
+  containers:
+  - name: app
+    image: localhost:5001/orders-api:2.0
+    readinessProbe:
+      httpGet: {path: /healthz, port: 8000}
+      periodSeconds: 3
 EOF
-sleep 50; kubectl get pods -o wide
+k apply -f ~/lab/k8s/11-2/broken.yaml
+sleep 50
+k get pods
 ```
 
-### Шаг 1. Разбор без подсказок
+| Часть команды | Значение |
+|---|---|
+| `cat > файл <<'EOF'` | записать манифест в файл без подстановок |
+| `requests: {cpu: "64"}` | запросить 64 ядра |
+| `orders-api:9.9` | тег, которого нет в реестре |
+| `command: ["/app/server"]` | запустить файл, которого нет в образе |
+| `path: /healthz` | путь пробы готовности |
+| `sleep 50` | дать kubelet время пройти несколько попыток |
 
-Для каждого пода, **не читая §2**: определите шаг по STATUS (таблица §1), найдите сообщение (`describe`, `get … -o jsonpath='{.status.containerStatuses[0].state.waiting.message}'`, события) и сформулируйте исправление одной фразой. Затем сверьтесь с §2.
+Результат (колонка AGE опущена):
 
-Подсказки-команды:
+```
+NAME    READY   STATUS             RESTARTS
+pod-a   0/1     Pending            0
+pod-b   0/1     ImagePullBackOff   0
+pod-c   0/1     RunContainerError  3
+pod-d   0/1     Running            0
+```
+
+Разбор:
+
+1. `pod-a` — `Pending`, рестартов нет: до узла дело не дошло.
+2. `pod-b` — `ImagePullBackOff`: контейнер не создан.
+3. `pod-c` — `RunContainerError` и три перезапуска: процесс пытались запустить несколько раз.
+4. `pod-d` — `Running`, но `READY 0/1`: процесс жив, готовности нет.
+
+#### Шаг 2. Разобрать pod-a
+
+Задача: определить шаг, причину, ответственного и исправление одной фразой. Не открывайте решение, пока не прошли команды методики.
 
 ```bash
-for p in t01-bad-tag t02-no-registry t04-no-cm t10-bad-cmd; do echo "$p: $(kubectl get pod $p -o jsonpath='{.status.containerStatuses[0].state.waiting.message}')"; done
-for p in t03-crash t05-oom t10-bad-cmd; do echo "$p: $(kubectl get pod $p -o jsonpath='{.status.containerStatuses[0].lastState.terminated.reason}/{.status.containerStatuses[0].lastState.terminated.exitCode}')"; done
-for p in t06-too-big t07-selector t08-pvc; do kubectl get events --field-selector involvedObject.name=$p,reason=FailedScheduling -o jsonpath='{.items[-1:].message}{"\n"}'; done
-kubectl get events --field-selector involvedObject.kind=PersistentVolumeClaim
-kubectl logs t03-crash
-kubectl get events --field-selector involvedObject.name=t09-not-ready,reason=Unhealthy
+k get pod pod-a -o wide
+k describe pod pod-a
 ```
 
-### Шаг 2. Исправить
+| Часть команды | Значение |
+|---|---|
+| `get pod -o wide` | STATUS, READY и NODE пода |
+| `describe pod` | условия и события пода |
+
+<details>
+<summary>Решение: pod-a</summary>
+
+Узла нет, поэтому смотрим решение scheduler:
 
 ```bash
-kubectl create configmap app-config --from-literal=MODE=prod; kubectl get pod t04-no-cm -w   # Running без пересоздания, но не сразу (см. ниже)
-kubectl debug t10-bad-cmd --copy-to=t10-debug --container=app -- sh -c 'ls -la /app; which server; sleep 3600'
-kubectl logs t10-debug
+k get events --field-selector involvedObject.name=pod-a,reason=FailedScheduling \
+  -o jsonpath='{.items[-1:].message}{"\n"}'
 ```
 
-Остальные — пересоздайте с исправленным манифестом (тег `2.0`, request `100m`, без `nodeSelector`, StorageClass `standard`, проба `/ready`, лимит памяти 512Mi) и убедитесь, что все `Running 1/1`.
+Результат:
 
-### Уборка
+```
+0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 Insufficient cpu.
+```
+
+Разбор:
+
+1. Шаг 1, планирование: NODE пуст, STATUS `Pending`.
+2. `1 node(s) had untolerated taint(s)` — control-plane закрыт taint'ом (05-3 §3).
+3. `3 Insufficient cpu` — три worker'а не вмещают request в 64 CPU.
+4. Ответственный — манифест: request больше любого узла.
+5. Исправление: снизить request до разумного, например `100m`. Поле неизменяемо, поэтому под пересоздают.
+
+</details>
+
+#### Шаг 3. Разобрать pod-b
+
+Те же команды, другой под: какой шаг, где сообщение, чья проблема.
 
 ```bash
-kubectl config set-context --current --namespace=default
-kubectl delete ns lab-11-1
+k get pod pod-b -o wide
+k describe pod pod-b
 ```
 
+| Часть команды | Значение |
+|---|---|
+| `get pod -o wide` | STATUS, READY и NODE пода |
+| `describe pod` | State контейнера и события |
+
+<details>
+<summary>Решение: pod-b</summary>
+
+Контейнер не создан, поэтому логов нет. Полный текст ошибки лежит в `state.waiting`:
+
+```bash
+k get pod pod-b -o jsonpath='{.status.containerStatuses[0].state.waiting.message}{"\n"}'
+```
+
+Результат (начало строки сокращено):
+
+```
+… failed to resolve reference "localhost:5001/orders-api:9.9": localhost:5001/orders-api:9.9: not found
+```
+
+Разбор:
+
+1. Шаг 2, образ: `ImagePullBackOff` без событий планирования, узел назначен.
+2. `not found` — реестр ответил, тега `9.9` в нём нет. Сеть и DNS в порядке: иначе была бы ошибка соединения.
+3. Ответственный — манифест или сборка: тег указан неверно или не был опубликован.
+4. Исправление: тег `2.0`. Образ основного контейнера меняется на живом поде (02-1 §3), но в работе мы пересоздаём все поды разом на шаге 6.
+
+</details>
+
+#### Шаг 4. Разобрать pod-c
+
+Здесь нет ни логов, ни понятного статуса. Прочитайте `Last State`, а затем зайдите в копию пода.
+
+```bash
+k get pod pod-c -o wide
+k describe pod pod-c
+k logs pod-c
+```
+
+| Часть команды | Значение |
+|---|---|
+| `describe pod` | Last State, Exit Code, Message |
+| `logs pod-c` | лог контейнера, которого, возможно, нет |
+
+<details>
+<summary>Решение: pod-c</summary>
+
+Сообщение runtime лежит в `lastState.terminated`:
+
+```bash
+k get pod pod-c \
+  -o jsonpath='{.status.containerStatuses[0].lastState.terminated.message}{"\n"}'
+```
+
+Результат (начало строки сокращено):
+
+```
+… exec: "/app/server": stat /app/server: no such file or directory
+```
+
+Чтобы убедиться, что файла нет в образе, запускаем копию пода с другой командой:
+
+```bash
+k debug pod-c --copy-to=pod-c-debug --container=app -- \
+  sh -c 'ls -la /app; which server; sleep 3600'
+k logs pod-c-debug
+```
+
+Результат:
+
+```
+ls: /app: No such file or directory
+```
+
+Разбор:
+
+1. Шаг 4, запуск процесса: `RunContainerError`, `lastState` — `StartError` с кодом 128 (02-1 §4).
+2. Логов у `pod-c` нет, потому что процесс не стартовал; поэтому `kubectl logs` пуст.
+3. Копия запустила тот же образ с `sleep`, и `ls` подтвердил: каталога `/app` в образе нет. `which server` ничего не напечатал.
+4. Ответственный — манифест или образ: неверный `command` или не тот образ.
+5. Исправление: указать существующую команду или правильный образ. В работе подставим `sleep 3600`.
+
+</details>
+
+#### Шаг 5. Разобрать pod-d
+
+Процесс работает, ошибок нет, но под не готов. Выясните, кто решает, что он не готов, и почему.
+
+```bash
+k get pod pod-d -o wide
+k describe pod pod-d
+```
+
+| Часть команды | Значение |
+|---|---|
+| `get pod -o wide` | READY и STATUS пода |
+| `describe pod` | условия и события `Unhealthy` |
+
+<details>
+<summary>Решение: pod-d</summary>
+
+Причина лежит в событиях пода:
+
+```bash
+k get events --field-selector involvedObject.name=pod-d,reason=Unhealthy
+```
+
+В колонке сообщения стоит такая строка:
+
+```
+Readiness probe failed: HTTP probe failed with statuscode: 404
+```
+
+Разбор:
+
+1. Шаг 6, готовность: `Running` и `READY 0/1`, рестартов нет.
+2. Код 404 значит, что приложение отвечает, но пути `/healthz` у него нет.
+3. Под вне Service (03-2), пока проба не проходит; контейнер при этом не перезапускается (02-5).
+4. Ответственный — манифест: проба смотрит не туда, а у orders-api путь называется `/ready`.
+5. Исправление: проба на `/ready`. Поле неизменяемо, поэтому под пересоздают. Без переменной `DATABASE_URL` приложение не проверяет базу, и `/ready` вернёт 200.
+
+</details>
+
+#### Шаг 6. Исправить и проверить
+
+Команда удаляет поломанные поды, применяет исправленный манифест и ждёт готовности. Удаление занимает до 30 секунд.
+
+```bash
+k delete -f ~/lab/k8s/11-2/broken.yaml
+k delete pod pod-c-debug
+cat > ~/lab/k8s/11-2/fixed.yaml <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata: {name: pod-a}
+spec:
+  containers:
+  - name: app
+    image: localhost:5001/busybox:1.37
+    command: ["sleep", "3600"]
+    resources:
+      requests: {cpu: 100m}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: pod-b}
+spec:
+  containers:
+  - {name: app, image: "localhost:5001/orders-api:2.0"}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: pod-c}
+spec:
+  containers:
+  - name: app
+    image: localhost:5001/busybox:1.37
+    command: ["sleep", "3600"]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: pod-d}
+spec:
+  containers:
+  - name: app
+    image: localhost:5001/orders-api:2.0
+    readinessProbe:
+      httpGet: {path: /ready, port: 8000}
+      periodSeconds: 3
+EOF
+k apply -f ~/lab/k8s/11-2/fixed.yaml
+k wait --for=condition=Ready pod --all --timeout=120s
+k get pods
+```
+
+| Часть команды | Значение |
+|---|---|
+| `delete -f broken.yaml` | удалить четыре поломанных пода |
+| `delete pod pod-c-debug` | удалить копию для отладки |
+| `request 100m` | разумный запрос CPU для pod-a |
+| `orders-api:2.0` | существующий тег для pod-b |
+| `sleep 3600` | живая команда вместо несуществующей |
+| `path: /ready` | путь, который отдаёт приложение |
+| `wait --for=condition=Ready` | дождаться готовности всех подов |
+
+Ожидаемый результат (на стенде эту команду не снимали):
+
+```
+NAME    READY   STATUS    RESTARTS
+pod-a   1/1     Running   0
+pod-b   1/1     Running   0
+pod-c   1/1     Running   0
+pod-d   1/1     Running   0
+```
+
+Разбор: все четыре пода дошли до шага 6 без ошибок. Если какой-то под снова застрял, повторите методику: исправление раннего шага могло открыть поломку следующего.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Шаг жизни определяет STATUS, причину называет событие или `message` | шаги 2–5 |
+| Текст `FailedScheduling` называет причину по каждому узлу | pod-a |
+| `not found` и ошибка соединения с реестром — разные поломки | pod-b |
+| Без логов помогают `lastState` и копия пода | pod-c |
+| `Running` не значит «работает»: смотрите READY и `Unhealthy` | pod-d |
+
+**Уборка.**
+
+```bash
+kubectl delete ns lab-11-2
+rm -rf ~/lab/k8s/11-2
+unset -f k
+```
+
+Первая команда удаляет namespace со всеми подами, вторая — каталог с манифестами, третья — функцию `k`. Общие образы стенда не удаляются.
+
+**Вопросы для самопроверки.**
+
+1. Почему у `pod-b` нет логов, а у `pod-d` они есть?
+2. Чем `Insufficient cpu` в событии отличается от `untolerated taint`?
+3. Почему `pod-d` не перезапускается, хотя проба падает?
+4. Как отличить `StartError` от кода 127?
+
+<details>
+<summary>Ответы</summary>
+
+1. У `pod-b` контейнер не создан: образ не загрузился, и лог писать некому. У `pod-d` процесс работает и пишет в stdout.
+2. `Insufficient cpu` значит, что на узле нет свободного места под request. `untolerated taint` значит, что узел закрыт для пода правилом, а ресурсы тут ни при чём.
+3. Провал readiness только исключает под из Service. Перезапуск делает liveness-проба, а её у `pod-d` нет (02-5).
+4. При `StartError` (код 128) runtime не смог запустить процесс, а причина лежит в `state.terminated.message`. Код 127 даёт shell, который запустился, но не нашёл команду (02-1 §4).
+
+</details>
+
 ---
 
-## 🔥 Кейс из прода: «Pending два часа — а дело в зоне диска»
+## → Дальше
 
-**Контекст.** После планового обновления узлов StatefulSet поиска (3 реплики) — одна реплика `Pending` два часа. Дежурный добавил узлы (Cluster Autoscaler тоже добавил) — не помогло.
-
-**Разбор.**
-1. `describe pod` → `FailedScheduling`: `0/12 nodes are available: 4 Insufficient memory, 8 node(s) had volume node affinity conflict.`
-2. PVC реплики — облачный диск в зоне `b`. В зоне `b` четыре узла, и на всех не хватает памяти; новые узлы автоскейлер создал в зонах `a` и `c` (там дешевле/был запас квоты).
-3. Сообщение scheduler'а прямо говорило обе причины, но читали только первую часть.
-
-**Фикс.**
-- Добавили ёмкость именно в зону `b` (отдельная группа узлов на зону; CA с `balance-similar-node-groups`).
-- Для StatefulSet с зональными дисками — topology spread по зонам и запас ёмкости в каждой зоне (05-2, 04-2).
-- В runbook «Pending»: читать сообщение `FailedScheduling` целиком — каждая группа узлов и её причина.
-
-**Что запомнить.**
-- `FailedScheduling` перечисляет причины по всем узлам — читать полностью.
-- Под с PVC зонального диска может планироваться только в зону диска.
-- Добавить узлы «куда-нибудь» не помогает подам с привязкой к зоне.
-
----
-
-## 💼 Вопросы с собеседования
-
-### 🟢 Junior
-
-**1. Под в CrashLoopBackOff — ваши действия?**
-`describe pod` (Last State: код выхода, reason, message; события), `kubectl logs` (в период back-off — вывод последнего упавшего экземпляра) и `--previous`. По коду: 1 и прочие — ошибка приложения (логи), 137 — OOM или kill, 127/128 — нет команды/бинарника. Затем `kubectl debug --copy-to` с `sleep`.
-
-**2. Под в ImagePullBackOff?**
-`state.waiting.message`: `not found` — нет тега; `401/403` — секреты реестра; `429` — лимиты; ошибка DNS/TLS — недоступен реестр. Проверить имя образа, тег, `imagePullSecrets`, доступ узла к реестру.
-
-### 🟡 Middle
-
-**3. Под Pending. Где смотреть?**
-Событие `FailedScheduling`: ресурсы (`Insufficient`), taints, affinity/selector, тома (`unbound PVC`, `volume node affinity conflict`), spread. Нет событий — scheduler не работает или чужой `schedulerName` (01-1). Причины PVC — в событиях самого PVC.
-
-**4. Под Running, но не Ready. Что это значит?**
-Процесс работает, readiness не проходит — под исключён из Service. Событие `Unhealthy` с причиной (код, таймаут), проверка пути/порта пробы и зависимостей, которые проверяет readiness (02-5).
-
-**5. Как отличить проблему приложения от проблемы платформы?**
-Масштаб (один под или все поды узла/namespace), шаг жизни пода (до старта процесса — чаще платформа/манифест, после — приложение), что изменилось (новый образ — приложение; ничего — зависимости/платформа), `imageID` и события узлов.
-
-### 🔴 Senior
-
-**6. Под падает без логов и без shell в образе. Как найдёте причину?**
-Termination message/`FallbackToLogsOnError`, код выхода и reason в `lastState`; `kubectl debug --copy-to` с заменой команды на `sleep` и тем же образом; при distroless — копия с образом-отладчиком и общим PID-namespace (`--share-processes`), запуск бинарника руками; журнал ядра узла (OOM, seccomp), `crictl inspect` на узле.
-
----
-
-## ⚠️ Подводные камни
-
-- `kubectl logs --previous` в момент перезапуска может быть недоступен — пробуйте без `--previous` и повторно.
-- OOM не создаёт событий — смотрите `lastState`.
-- Ошибки PVC — в событиях PVC, а не пода.
-- `CreateContainerConfigError` исправляется созданием объекта — пересоздавать под не нужно.
-- `nodeName` в манифесте прячет ошибки scheduler'а (04-2).
-- Ошибки admission и квот у подов контроллеров — в событиях ReplicaSet/Job (05-2, 06-3, 09-2).
-- Сообщение `FailedScheduling` надо читать целиком.
-
----
-
-## Чеклист
-
-- [ ] По STATUS назову шаг жизни пода и где смотреть причину.
-- [ ] Разберу все десять тренажёров без подсказок.
-- [ ] Найду логи упавшего контейнера и причину без логов.
-- [ ] Отлажу под без shell через `kubectl debug`.
-- [ ] Отличу проблему приложения от проблемы платформы.
-
----
-
-## Задание со звёздочкой
-
-Соберите свой «тренажёр для коллег»:
-
-1. Напишите 5 сломанных Deployment'ов (не подов!) с разными причинами: квота namespace, admission-политика (06-3), PDB при drain, неверный `targetPort` в Service (03-2), Secret без ключа.
-2. Для каждого — спрятанная под спойлер (`<details>`) причина и исправление, как в 12-2.
-3. Дайте коллеге и засеките время: какие ошибки находят дольше всего? Почему (подсказка: те, где проблема видна не у пода)?
-
----
-
-→ Следующая часть: **11-2. Сеть и DNS: пошагово** — методика по слоям для сквозного запроса `orders.localhost → Gateway → HTTPRoute → Service → EndpointSlice → под → DNS → БД` и восемь сетевых поломок на стенде.
+Вы научились находить шаг жизни пода, на котором тот застрял, и читать причину в статусе, событиях и логах. Но у многих поломок причина лежит не в самом поде, а между подами: Service без адресов, DNS, который не отвечает, политика, закрывшая трафик. Эти поломки не видны в `describe pod`, и для них нужна та же методика, но по слоям сети. Поэтому следующая часть, 11-3, ведёт тот же порядок от клиента до адреса по пути запроса.

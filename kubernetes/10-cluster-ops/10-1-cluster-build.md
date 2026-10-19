@@ -12,7 +12,7 @@
 хост / ВМ ─► ОС, containerd, kubelet, kubeadm         ставит администратор (не эта часть)
                 │
                 ▼
-          kubeadm init / join                         10-1 (эта часть): ключи, конфиги, static pods, токены
+          kubeadm init / join                         10-1 (эта часть): ключи, конфиги, static pods
                 │
                 ▼
      работающий кластер ─► etcd (10-2) ─► обновление (10-3) ─► сертификаты (10-4)
@@ -42,7 +42,7 @@
 
 **kubeadm** — консольная утилита проекта Kubernetes, которая создаёт и обновляет кластер на подготовленных узлах. Она выполняет `init` на первом узле control plane и `join` на остальных. Слово «подготовленных» важно: kubeadm не ставит операционную систему, containerd и kubelet, не выбирает CNI-плагин (03-1) и не создаёт балансировщик перед API-сервером.
 
-Поэтому перед `kubeadm init` администратор делает пять вещей: ставит containerd, kubelet и kubeadm, выключает swap, включает пересылку пакетов в ядре, открывает порты между узлами и выбирает адрес, по которому клиенты будут ходить в кластер. Остальное делает kubeadm.
+Поэтому перед `kubeadm init` администратор готовит узел сам. Он ставит containerd, kubelet и kubeadm, выключает swap, включает пересылку пакетов в ядре и открывает порты между узлами. Ещё он выбирает адрес, по которому клиенты будут ходить в кластер. Остальное делает kubeadm.
 
 ### Где kubeadm в kind
 
@@ -105,8 +105,8 @@ preflight ─► certs ─► kubeconfig ─► etcd ─► control-plane ─►
 ```
 kubeadm.yaml  (--config)
  ├─ InitConfiguration      токены, nodeRegistration, localAPIEndpoint     только для init
- ├─ ClusterConfiguration   controlPlaneEndpoint, networking, apiServer…   ─► ConfigMap kubeadm-config
- ├─ KubeletConfiguration   cgroupDriver, rotateCertificates…              ─► ConfigMap kubelet-config
+ ├─ ClusterConfiguration   controlPlaneEndpoint, networking, apiServer…  ─► ConfigMap kubeadm-config
+ ├─ KubeletConfiguration   cgroupDriver, rotateCertificates…             ─► ConfigMap kubelet-config
  └─ KubeProxyConfiguration mode, conntrack…                               ─► ConfigMap kube-proxy
 ```
 
@@ -171,7 +171,7 @@ kubeadm создаёт три независимых CA в каталоге `/et
 
 ```
 узел (kubelet)                                      кластер
-   │ 1. GET cluster-info (без входа) ───────────────► kube-public/cluster-info (CA + подпись токеном)
+   │ 1. GET cluster-info (без входа) ───────────────► kube-public/cluster-info (CA, подпись)
    │ 2. CSR с токеном (группа bootstrappers) ───────► CertificateSigningRequest
    │                                                    │ 3. kubeadm:node-autoapprove-bootstrap
    │                                                    │    csrapproving: Approved
@@ -228,7 +228,9 @@ kubeadm join k8s-api.example.com:6443 --token abcdef.0123456789abcdef \
 
 ### Присоединение узла control plane
 
-Узел control plane присоединяет та же команда `kubeadm join` с флагом `--control-plane`. Ему нужны ключи CA, и kubeadm передаёт их через кластер. **upload-certs** — фаза и флаг `--upload-certs` у `kubeadm init`: kubeadm шифрует `ca.key`, `sa.key`, `front-proxy-ca.key` и CA etcd, кладёт их в Secret `kubeadm-certs` и печатает **certificate key** — 32-байтный ключ шифрования. Новый узел скачивает Secret, расшифровывает его этим ключом и выпускает собственные сертификаты API-сервера и etcd со своим адресом в SAN. Secret удаляется через 2 часа.
+Узел control plane присоединяет та же команда `kubeadm join` с флагом `--control-plane`. Ему нужны ключи CA, и kubeadm передаёт их через кластер. Для этого служит **upload-certs** — фаза и флаг `--upload-certs` у `kubeadm init`. kubeadm шифрует ключи CA и пару `sa.key`, кладёт их в Secret `kubeadm-certs` и печатает **certificate key** — 32-байтный ключ шифрования. 
+
+Новый узел скачивает Secret, расшифровывает его и выпускает собственные сертификаты API-сервера и etcd со своим адресом в SAN. Secret удаляется через 2 часа.
 
 ```bash
 kubeadm init --config kubeadm.yaml --upload-certs
@@ -236,7 +238,7 @@ kubeadm join k8s-api.example.com:6443 --token <токен> --control-plane \
   --discovery-token-ca-cert-hash sha256:<хеш> --certificate-key <ключ>
 ```
 
-Если два часа прошли, ключ выпускают заново командой `kubeadm init phase upload-certs --upload-certs`. При присоединении kubeadm добавляет в кластер нового члена etcd и перед этим ставит его в режим learner (член без права голоса, который догоняет данные), чтобы не потерять кворум. Узлы control plane присоединяют по одному, потому что одновременное добавление нескольких членов etcd небезопасно.
+Если два часа прошли, ключ выпускают заново командой `kubeadm init phase upload-certs --upload-certs`. При присоединении kubeadm добавляет нового члена etcd сначала в режиме learner: член без права голоса сперва догоняет данные, и кворум не страдает. Узлы control plane присоединяют по одному, потому что добавлять сразу нескольких членов etcd небезопасно.
 
 kind не использует upload-certs. Он копирует нужные файлы из каталога `pki` первого узла на остальные командой копирования между контейнерами и затем запускает на них `kubeadm join` (§4).
 
@@ -252,7 +254,7 @@ kind не использует upload-certs. Он копирует нужные 
 
 **Назначение:** kubeadm собирает кластер из подготовленных узлов и обслуживает его жизненный цикл: `init`, `join`, токены, сертификаты, `upgrade` (10-3) и `reset`. В курсе он нужен, чтобы читать то, что создал kind, и разобраться с сертификатами и обновлением.
 
-**Как работает:** kubeadm читает конфигурацию (файл или значения по умолчанию), по фазам пишет файлы на диск и затем через kubelet и API-сервер создаёт объекты в кластере.
+**Как работает:** kubeadm читает конфигурацию, по фазам пишет файлы на диск и создаёт объекты в кластере через API-сервер.
 
 ```
 kubeadm init|join  ──► читает --config / значения по умолчанию
@@ -263,7 +265,7 @@ kubeadm init|join  ──► читает --config / значения по ум�
 
 Схема 7. kubeadm делает два вида изменений: файлы на самом узле и объекты в кластере. Смотрите, что относится к узлу, а что — ко всему кластеру: от этого зависит, на скольких узлах нужно повторять команду.
 
-**Откуда берёт данные:** на `init` из файла `--config`, флагов и значений по умолчанию; на `join` из токена и `cluster-info`; для уже работающего кластера из ConfigMap `kubeadm-config` и `kubelet-config` в `kube-system` и из файлов `/etc/kubernetes`.
+**Откуда берёт данные:** на `init` из файла `--config`, флагов и значений по умолчанию, на `join` из токена и `cluster-info`. Для работающего кластера он читает ConfigMap `kubeadm-config` и `kubelet-config` в `kube-system` и файлы в `/etc/kubernetes`.
 
 **Основные команды:**
 
@@ -284,7 +286,7 @@ kubeadm config images list                           # образы, котор�
 kubeadm reset                                        # убрать с узла всё, что создал kubeadm
 ```
 
-**Команды для скриптов:** `kubeadm token create --print-join-command` печатает одну строку, которую можно передать по SSH; `kubeadm init --dry-run` показывает, что будет сделано, и ничего не меняет в `/etc/kubernetes`; `--ignore-preflight-errors=<имя>` пропускает проверку, но использовать его на постоянной основе нельзя; ненулевой код возврата означает, что фаза не завершилась.
+**Команды для скриптов:** `kubeadm token create --print-join-command` печатает одну строку, которую можно передать по SSH. Команда `kubeadm init --dry-run` показывает, что будет сделано, и ничего не меняет в `/etc/kubernetes`. Флаг `--ignore-preflight-errors=<имя>` пропускает проверку, но постоянно им пользоваться нельзя. Ненулевой код возврата означает, что фаза не завершилась.
 
 **Частые ошибки:**
 
@@ -340,7 +342,7 @@ kubeadm reset                                        # убрать с узла 
 
 ## 5. Что ломается и как найти причину
 
-Сборка и вход узлов ломаются предсказуемо, и почти всегда причина видна в одном из трёх мест: в выводе фазы, в журнале kubelet или в состоянии CSR. Ниже симптомы сгруппированы по тому, где нужно искать.
+Сборка и вход узлов ломаются предсказуемо. Причина почти всегда видна в одном из трёх мест: в выводе фазы, в журнале kubelet или в состоянии CSR. Ниже симптомы сгруппированы по тому, где их искать.
 
 ### Узел не присоединяется
 
@@ -420,7 +422,7 @@ kubeadm 1.36 создаёт кластер версии не новее свое
 
 ## Лабораторные работы
 
-Работы 1 и 2 идут на стенде 00-1 и только читают: файлы на узлах, объекты в `kube-system` и `kube-public`, сертификаты. Работа 3 создаёт отдельный кластер kind `lab-10-1` из трёх узлов control plane и одного рабочего, потому что остановка узла control plane и потеря кворума не должны задевать стенд. Namespace `lab-10-1` существует только в этом новом кластере.
+Работы 1 и 2 идут на стенде 00-1 и только читают: файлы на узлах, объекты в `kube-system` и `kube-public`, сертификаты. Работа 3 создаёт отдельный кластер kind `lab-10-1` из трёх узлов control plane и одного рабочего. Остановка узла control plane и потеря кворума не должны задевать стенд. Namespace `lab-10-1` существует только в этом новом кластере.
 
 Подготовка задаёт две функции и каталог. Функция `ks` обращается к стенду по имени контекста и не меняет текущий контекст в `~/.kube/config`. Функция `kh` обращается к кластеру `lab-10-1` по отдельному kubeconfig и подставляет его namespace; для объектов `kube-system` в ней задают `-n kube-system`. Обе функции снимает уборка работы 3.
 
@@ -436,7 +438,7 @@ kh() { kubectl --kubeconfig ~/lab/k8s/10-1/kubeconfig -n lab-10-1 "$@"; }
 
 Эту работу вы выполняете сами, результаты в ней — ожидаемые.
 
-**Цель.** Найти на узле стенда файл конфигурации, из которого kind запустил `kubeadm init`, сравнить его со значениями по умолчанию и увидеть в кластере и на узле следы каждой фазы.
+**Цель.** Найти на узле стенда файл, из которого kind запустил `kubeadm init`, и сравнить его со значениями по умолчанию. Затем увидеть в кластере и на узле следы каждой фазы.
 
 **Что понадобится.**
 
@@ -501,7 +503,8 @@ kind: KubeProxyConfiguration
 
 ```bash
 docker exec lab-control-plane grep -E \
-  '^(kubernetesVersion|clusterName|controlPlaneEndpoint):|podSubnet|serviceSubnet|criSocket|unsafeSkip' \
+  -e '^(kubernetesVersion|clusterName|controlPlaneEndpoint):' \
+  -e podSubnet -e serviceSubnet -e criSocket -e unsafeSkip \
   /kind/kubeadm.conf
 docker exec lab-control-plane grep -A4 certSANs /kind/kubeadm.conf
 ```
@@ -510,7 +513,7 @@ docker exec lab-control-plane grep -A4 certSANs /kind/kubeadm.conf
 
 | Часть команды | Значение |
 |---|---|
-| `-E '…\|…'` | расширенное регулярное выражение с несколькими вариантами |
+| `-E -e '…'` | расширенное регулярное выражение; каждый `-e` добавляет шаблон |
 | `controlPlaneEndpoint` | адрес, по которому клиенты ходят в кластер |
 | `podSubnet`, `serviceSubnet` | подсети подов и Service |
 | `criSocket` | сокет containerd на узле |
@@ -546,7 +549,7 @@ controlPlaneEndpoint: lab-control-plane:6443
 
 ```bash
 docker exec lab-control-plane kubeadm config print init-defaults | \
-  grep -E 'ttl|controlPlaneComponentHealthCheck|tlsBootstrap|ValidityPeriod|encryptionAlgorithm|certificatesDir'
+  grep -E 'ttl|ComponentHealth|tlsBootstrap|ValidityPeriod|encryptionAlg|certificatesDir'
 ```
 
 Разбор команды:
@@ -582,7 +585,7 @@ encryptionAlgorithm: RSA-2048
 
 ```bash
 docker exec lab-control-plane sh -c \
-  "kubeadm init --help | sed -n '/executes the following phases/,/^Usage/p' | awk '/^[a-z]/ {print \$1}'"
+  "kubeadm init --help | sed -n '/following phases/,/^Usage/p' | awk '/^[a-z]/ {print \$1}'"
 ```
 
 Разбор команды:
@@ -1114,7 +1117,7 @@ controller-manager подписывает ею токены ServiceAccount, а A
 - **Влияние на систему:** кластер добавляет около 4–5 ГиБ памяти к стенду (около 2,5 ГиБ). Перед началом проверьте `free -h`: если свободно меньше 8 ГиБ, остановите стенд командой `bash kubernetes/lab/lab-down.sh` (данные сохраняются), а после работы запустите `lab-up.sh`. Восемь узлов kind (четыре стенда и четыре нового кластера) требуют лимитов inotify из 00-1 (работа 1). Сеть Docker `kind` общая со стендом, адреса разные.
 - **Откат:** `kind delete cluster --name lab-10-1` и блок «Уборка». Если после остановки узел при запуске получил другой IP-адрес и член etcd не вернулся, не чините его: удалите кластер и создайте заново.
 
-**Цель.** Собрать кластер с тремя узлами control plane и балансировщиком, найти, как узлы присоединились, остановить один узел и убедиться, что API продолжает отвечать, а потеря второго узла останавливает запись.
+**Цель.** Собрать кластер с тремя узлами control plane и балансировщиком и найти, как узлы присоединились. Затем остановить один узел и убедиться, что API отвечает, а потеря второго узла останавливает запись.
 
 **Что понадобится.**
 
@@ -1210,7 +1213,9 @@ namespace/lab-10-1 created
 Журнал содержит вывод kubeadm. Найдём в нём метки фаз в порядке первого появления, а затем строки, по которым видно, как присоединялись остальные узлы control plane.
 
 ```bash
-grep -oE '\[(certs|kubeconfig|etcd|control-plane|kubelet-start|wait-control-plane|upload-config|mark-control-plane|bootstrap-token|kubelet-finalize|addons)\]' \
+L='certs|kubeconfig|etcd|control-plane|kubelet-start|wait-control-plane|upload-config'
+L+='|mark-control-plane|bootstrap-token|kubelet-finalize|addons'
+grep -oE "\[($L)\]" \
   ~/lab/k8s/10-1/create.log | awk '!seen[$0]++'
 grep -E 'Announced new etcd member|Marking the node' ~/lab/k8s/10-1/create.log | cut -c1-110
 ```
@@ -1581,4 +1586,4 @@ kind копирует файлы CA из `/etc/kubernetes/pki` первого у
 
 ## → Дальше
 
-В этой части мы собрали кластер и увидели, что в стековой топологии каждый узел control plane несёт собственный член etcd, а кворум решает, пишет ли кластер. Часть 10-2 открывает этот член: как посмотреть его состояние, снять снимок, восстановить базу и что делать, когда она разрастается до квоты. Она идёт следующей, потому что отказ из работы 3 вылечился возвратом узлов, а если данные членов потеряны, спасает только снимок etcd.
+В этой части мы собрали кластер и увидели, что в стековой топологии каждый узел control plane несёт собственный член etcd, а кворум решает, пишет ли кластер. Часть 10-2 открывает этот член: как посмотреть его состояние, снять снимок, восстановить базу и что делать, когда она разрастается до квоты. Она идёт следующей: отказ из работы 3 вылечился возвратом узлов, а при потере данных спасает только снимок etcd.
