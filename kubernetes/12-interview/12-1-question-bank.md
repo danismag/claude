@@ -292,7 +292,7 @@ DaemonSet держит по одному поду на подходящий уз
 </details>
 
 <details>
-<summary>28. Что случится при rollout Deployment с одной репликой и PVC в режиме RWO? (02-3 §1, 04-2 §3)</summary>
+<summary>28. Что случится при rollout Deployment с одной репликой и PVC в режиме RWO? (02-3 §1, 04-2 §2)</summary>
 
 При RollingUpdate новый под часто попадает на другой узел и не может подключить RWO-том, пока старый его держит. Rollout зависает. Выходы: `strategy: Recreate` с осознанным простоем, StatefulSet или режим ReadWriteOncePod. Для базы правильный вариант — StatefulSet или оператор.
 
