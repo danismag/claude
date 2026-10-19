@@ -1,299 +1,1124 @@
 # 09-2. Admission webhooks и finalizers
 
-> Модуль 9 «Расширение API» · часть 2 из 2 · 🟡🔴 · ~1 ч чтения + ~40 мин лабы · Нужно: стенд 00-1. В лабе на минуту выключается metrics-server.
+> Модуль 09 «Расширение API» · часть 2 из 2 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд 00-1 (контекст `kind-lab`), образ `busybox:1.37` (или копия `localhost:5001/busybox:1.37`); работа 4 на пару минут выключает metrics-server · Опирается на: 01-3 (finalizers), 06-3 (цепочка admission, политики на CEL), 03-4 (cert-manager), 09-1 (операторы)
+
+## Где мы на карте
+
+Эта часть разбирает два механизма, которыми чужой код встраивается в жизнь объекта: вебхук стоит на пути записи, а finalizer стоит на пути удаления. Оба нужны операторам и политикам, и оба при поломке останавливают работу всего кластера или целого namespace. Часть опирается на цепочку admission и CEL-политики из 06-3, на определение finalizer из 01-3 и на операторов из 09-1.
+
+```
+kubectl / контроллер ─► authn ─► authz ─► mutating ─► схема ─► validating ─► etcd
+                                           вебхуки             вебхуки
+                                           (09-2 §2)           (09-2 §2)
+
+delete ─► deletionTimestamp ─► finalizers != [] ─► ждём владельца ─► объект удалён
+                                (09-2 §3, §5)
+```
+
+Схема 1. Вебхуки вмешиваются в запись (верхняя строка), finalizers — в удаление (нижняя). В обоих случаях решает чужой процесс, а не API-сервер.
+
+Следующая часть, 10-1, переходит к сборке кластера. Там вы увидите компоненты control plane изнутри, и вопрос «что будет, если вебхук недоступен» превратится в вопрос «что будет, если недоступен сам API-сервер».
 
 ---
 
-## Зачем это DevOps-у
+## 1. Какую задачу решают вебхуки и finalizers
 
-Webhook'и и finalizer'ы — два механизма, которыми операторы и политики «встраиваются» в жизненный цикл объектов. И два классических способа сломать кластер так, что на первый взгляд непонятно, что происходит: «никто не может задеплоить — `failed calling webhook`», «namespace неделю висит в Terminating». На собеседовании: «чем опасен `failurePolicy: Fail`», «почему namespace не удаляется», «что такое finalizer» (01-3 §5).
+Оба механизма дают внешнему коду право вмешаться в операцию над объектом: вебхук — в создание и изменение, finalizer — в удаление. Разберём, зачем это нужно и чем опасно.
 
-Сквозной сценарий: в кластере уже есть webhook'и — Envoy Gateway, cert-manager (03-4), CNPG (09-1), Kyverno/Gatekeeper в проде. Разберём, как один из них может остановить деплой orders-api.
+### Вебхук: правило, которое не напишешь на CEL
+
+**Admission webhook** (вебхук допуска) — HTTPS-сервис, который API-сервер вызывает во время admission; он отвечает «разрешить» или «запретить», а иногда ещё и меняет объект. Политики на CEL (06-3) работают внутри API-сервера и видят только сам запрос. Вебхук работает снаружи, поэтому умеет обращаться к другим системам, проверять подписи образов и вставлять в под контейнер-прокси.
+
+Так устроены инжекторы sidecar-контейнеров, Kyverno, OPA Gatekeeper, cert-manager и операторы из 09-1. Если правило помещается в выражение CEL, берите политику: у неё нет сети, сертификатов и отдельного пода, который может упасть.
+
+### Finalizer: очистка перед удалением
+
+Finalizer (01-3) — запись в `metadata.finalizers`, обещание, что перед удалением объекта кто-то выполнит очистку. Оператор вешает finalizer на свой объект, чтобы сначала удалить диск, базу или облачный балансировщик, а потом позволить API-серверу убрать запись. Без finalizer объект исчез бы раньше, чем оператор узнал о нём.
+
+### Общая опасность
+
+Оба механизма ставят на критический путь процесс, которого API-сервер не контролирует. Недоступный вебхук с политикой отказа `Fail` останавливает все запросы, которые под него попадают, а finalizer без живого владельца навсегда задерживает объект и его namespace. Дальше разберём, как это устроено и как это чинить.
 
 ---
 
-## 1. Admission webhooks 🟡
+## 2. Как устроены вебхуки и удаление
 
-Webhook — внешний HTTPS-сервис, который apiserver вызывает на этапе admission (06-3 §1): **mutating** (может изменить объект — инжекция sidecar'ов, дефолты) и **validating** (может только разрешить или запретить — политики). Описание — `MutatingWebhookConfiguration` / `ValidatingWebhookConfiguration`:
+Вебхук — это запись в API, которая говорит серверу, когда и куда звонить. Удаление namespace — это цикл контроллера, который ждёт, пока в namespace не останется объектов.
+
+### Место вебхука в цепочке admission
+
+Цепочку admission мы разбирали в 06-3, здесь нужны только фазы вебхуков. Сначала работает **MutatingAdmissionWebhook** (mutating webhook) — вебхук, который может менять объект. Затем API-сервер проверяет схему изменённого объекта, и после этого работает **ValidatingAdmissionWebhook** (validating webhook) — вебхук, который только разрешает или запрещает.
+
+Mutating-вебхуки вызываются по очереди, потому что каждый получает объект после предыдущего. Validating-вебхуки вызываются параллельно, потому что объект уже окончательный. Порядок между mutating-вебхуками не гарантирован, поэтому на него нельзя опираться.
+
+Объекты самих конфигураций вебхуков через вебхуки не проходят: так API-сервер исключает ситуацию, когда сломанный вебхук запрещает собственное удаление. Это свойство и даёт аварийный выход (§5).
+
+### Запрос и ответ AdmissionReview
+
+API-сервер отправляет вебхуку HTTP POST с телом **AdmissionReview** — JSON-объектом с полем `request`. Вебхук отвечает объектом того же вида, но с полем `response`.
+
+```json
+{ "request":  { "uid": "7a1…", "operation": "CREATE", "namespace": "lab-09-2",
+                "object": { "kind": "Pod", … }, "oldObject": null, "dryRun": false } }
+
+{ "response": { "uid": "7a1…", "allowed": false,
+                "status": { "message": "под без метки team" } } }
+```
+
+Разбор:
+
+1. `uid` — номер запроса; в ответе он должен совпасть, иначе API-сервер отвергнет ответ.
+2. `operation` — `CREATE`, `UPDATE`, `DELETE` или `CONNECT`; для обновления и удаления в `oldObject` лежит прежняя версия.
+3. `dryRun` — признак пробного запуска; вебхук с побочными эффектами обязан его учитывать (§3).
+4. `allowed: false` с текстом в `status.message` — запрет; текст увидит пользователь в ответе `kubectl`.
+
+Mutating-вебхук добавляет в ответ поля `patchType: JSONPatch` и `patch` — список операций RFC 6902 в base64. API-сервер применяет патч к объекту и передаёт результат следующему вебхуку.
+
+### Конфигурация вебхука
+
+Правило вызова описывает объект `ValidatingWebhookConfiguration` или `MutatingWebhookConfiguration`; оба объекта относятся ко всему кластеру, а не к namespace. Ниже полный пример с полями, которые разбираются в этой части.
 
 ```yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata: {name: team-label-policy}
 webhooks:
-- name: pods.policy.lab.local
+- name: team-label.policy.example.com
   admissionReviewVersions: [v1]
   sideEffects: None
-  failurePolicy: Fail                     # если вебхук недоступен: Fail — отказать, Ignore — пропустить
-  timeoutSeconds: 5                       # дефолт 10, максимум 30
-  namespaceSelector: {matchLabels: {webhook.lab/policy: "on"}}   # где действует
-  rules: [{apiGroups: [""], apiVersions: [v1], operations: [CREATE], resources: [pods]}]
+  failurePolicy: Fail
+  timeoutSeconds: 5
+  matchPolicy: Equivalent
+  namespaceSelector:
+    matchExpressions:
+    - {key: kubernetes.io/metadata.name, operator: NotIn, values: [kube-system, policy]}
+  matchConditions:
+  - name: not-from-nodes
+    expression: '!("system:nodes" in request.userInfo.groups)'
+  rules:
+  - {apiGroups: [""], apiVersions: [v1], operations: [CREATE], resources: [pods]}
   clientConfig:
-    service: {name: policy-webhook, namespace: lab-09-2, path: /validate, port: 443}
-    # caBundle: … — CA, которым подписан сертификат вебхука (обычно ставит cert-manager)
+    service: {name: team-webhook, namespace: policy, path: /validate, port: 443}
+    caBundle: LS0tLS1CRUdJTi…
 ```
 
-### Вебхук недоступен 🔴
+Что значат поля:
 
-Проверено (сервиса `policy-webhook` нет, `failurePolicy: Fail`):
-
-```
-Error from server (InternalError): Internal error occurred: failed calling webhook "pods.policy.lab.local": failed to call webhook: Post "https://policy-webhook.lab-09-2.svc:443/validate?timeout=5s": service "policy-webh…
-  took 226 ms
-pod/p-default created                                ← в namespace без метки — работает
-deploy d1 ready: 0/1
-Error creating: Internal error occurred: failed calling webhook …   ← у ReplicaSet, не у Deployment
-```
-
-Без `namespaceSelector` то же самое было бы **во всех namespace**, включая `kube-system`: не создадутся поды CoreDNS, CNI, самого вебхука (если его под упал — он не сможет подняться, потому что его создание тоже проходит через сломанный вебхук). Классическая взаимная блокировка.
-
-Сервис есть, но не отвечает (проверено, сервер принимает TCP и молчит):
-
-```
-failurePolicy=Fail:   … context deadline exceeded (5232 ms)
-failurePolicy=Ignore: pod/q-ignore-20753 created (235 ms)
-```
-
-С `Fail` каждый запрос к API, попадающий под правило, ждёт полный `timeoutSeconds` и падает: деплой, масштабирование, rollout'ы — всё в 5–30 раз медленнее и с ошибками. Метрики apiserver это видят (проверено):
-
-```
-apiserver_admission_webhook_rejection_count{error_type="calling_webhook_error",name="pods.policy.lab.local",...,rejection_code="503"} 15
-apiserver_admission_webhook_fail_open_count{name="pods.policy.lab.local",type="validating"} 2      ← пропущено при Ignore
-```
-
-### Как не убить кластер вебхуком
-
-| Мера | Зачем |
+| Поле | Значение |
 |---|---|
-| `namespaceSelector`/`objectSelector`, исключающие `kube-system`, namespace самого вебхука | вебхук не блокирует свой же подъём и систему |
-| `failurePolicy: Fail` только для политик безопасности, `Ignore` — для «желательных» | недоступность не останавливает всё |
-| `timeoutSeconds` 2–5 с | быстрый отказ вместо ожидания 10–30 с |
-| 2+ реплики вебхука, PDB, PriorityClass, anti-affinity | вебхук сам по себе — критичный компонент |
-| `matchConditions` (CEL) | не вызывать вебхук для запросов, которые ему не нужны |
-| алерты на `apiserver_admission_webhook_rejection_count{error_type="calling_webhook_error"}` и латентность вебхуков | узнать раньше пользователей |
-| простые правила — ValidatingAdmissionPolicy (06-3) | в apiserver, без сетевого вызова |
+| `rules` | какие операции над какими ресурсами вызывают вебхук |
+| `namespaceSelector` | в каких namespace вебхук действует |
+| `matchConditions` | дополнительный фильтр на CEL; все условия должны быть истинными |
+| `failurePolicy` | что делать, если вызов не удался: `Fail` или `Ignore` |
+| `timeoutSeconds` | сколько ждать ответ: от 1 до 30 с, по умолчанию 10 |
+| `sideEffects` | оставляет ли вебхук следы вне запроса: `None` или `NoneOnDryRun` |
+| `clientConfig` | куда звонить: `service` внутри кластера или внешний `url` |
+| `caBundle` | CA, которым проверяют сертификат вебхука |
 
-Аварийно: удалить или поправить `…WebhookConfiguration` (`kubectl delete validatingwebhookconfiguration <имя>`) — объект конфигурации cluster-scoped и сам через вебхуки не проходит. После — вернуть, починив причину. Это должно быть в runbook'е, потому что вспоминают об этом в 3 часа ночи.
+### TLS и caBundle
 
-## 2. Finalizers и namespace в Terminating 🟡
-
-Finalizer — обещание «перед удалением этого объекта кто-то выполнит очистку» (01-3 §5). Namespace удаляется, только когда в нём не осталось объектов; объект с finalizer'ом, который никто не снимет, держит весь namespace.
-
-Проверено (ConfigMap с finalizer'ом `example.com/external-cleanup`, которого никто не обрабатывает):
+Вебхук обязан отвечать по HTTPS, и API-сервер проверяет его сертификат. Сертификат должен быть выписан на имя `<сервис>.<namespace>.svc`, а подпись проверяется по CA из поля `caBundle` — это PEM-файл в base64. Если поле пусто, API-сервер использует системные корневые сертификаты, а для внутреннего вебхука с собственным CA это не подходит.
 
 ```
-lab-09-2-term   Terminating   9s
-NamespaceContentRemaining=True: Some resources are remaining: configmaps. has 1 resource instances
-NamespaceFinalizersRemaining=True: Some content in the namespace has finalizers remaining: example.com/external-cleanup in 1 resource instances
+API-сервер ──TLS──► Service policy-webhook.policy.svc:443 ──► под вебхука
+     │
+     ├ проверяет: имя в сертификате = policy-webhook.policy.svc
+     └ проверяет: подпись сертификата ∈ caBundle
 ```
 
-**Conditions namespace** — первое, что смотреть: они называют и тип объекта, и сам finalizer. Найти объекты — перебрать все listable-типы:
+Схема 2. Проверка TLS при вызове вебхука: имя и подпись проверяются независимо, и любая ошибка считается неудачным вызовом.
+
+Сертификаты вебхуков обычно выпускает cert-manager (03-4), а `caBundle` подставляет его компонент **cainjector** по аннотации `cert-manager.io/inject-ca-from: <namespace>/<Certificate>`. Когда сертификат истекает, вызов вебхука начинает падать с ошибкой `x509`, и снаружи это выглядит как недоступный вебхук.
+
+### Удаление namespace
+
+Namespace удаляет контроллер namespace внутри kube-controller-manager. Он ставит namespace фазу `Terminating`, получает от API-сервера список всех типов объектов, удаляет объекты каждого типа и только потом снимает со namespace собственный finalizer `kubernetes`.
+
+```
+delete ns ─► фаза Terminating ─► discovery: какие типы объектов есть?
+                                      │
+                      ┌───────────────┴────────────────┐
+                      ▼                                ▼
+          удалить поды (первыми)            затем остальные типы
+                      │                                │
+                      └─► остались объекты или ошибки? ┘
+                           да: условия в status, повтор цикла
+                           нет: снять finalizer ─► namespace исчез
+```
+
+Схема 3. Контроллер namespace повторяет цикл, пока не остаётся ни объектов, ни ошибок discovery; причины остановки записаны в `status.conditions`.
+
+**Discovery** (обнаружение API) — запрос списка всех групп и типов ресурсов, которые отдаёт API-сервер, включая сторонние API. Сторонние API подключает объект **APIService**: он регистрирует группу, например `metrics.k8s.io`, и указывает Service, который её обслуживает. Контроллер не знает заранее, какие типы есть в кластере, и удаляет всё, что нашёл.
+
+С версии 1.34 (GA, функция `OrderedNamespaceDeletion`) контроллер сначала удаляет поды и ждёт их полного завершения, и лишь затем берётся за остальное. Порядок нужен для безопасности: NetworkPolicy и другие объекты защиты остаются, пока работают поды. Между остальными типами порядка нет. Поэтому под с долгим `terminationGracePeriodSeconds` задерживает удаление всего namespace.
+
+---
+
+## 3. Как управлять вебхуками и finalizers
+
+Управление сводится к трём вопросам: где вебхук действует, что делать при сбое и как не испортить объект. Затем — как правильно обращаться с finalizers.
+
+### Селекторы: где вебхук действует
+
+Вебхук вызывается, когда совпали правило `rules` и оба селектора. **namespaceSelector** отбирает namespace по меткам; для объектов в namespace он смотрит на метки этого namespace, а для самих объектов Namespace — на их собственные метки. Для остальных объектов всего кластера селектор не действует.
+
+**objectSelector** отбирает сам объект по меткам и срабатывает, если подходит `object` или `oldObject`. Его используют для вебхуков по подписке: вебхук действует только на объекты с меткой, которую поставил автор.
+
+Каждый namespace получает метку `kubernetes.io/metadata.name` со своим именем автоматически, поэтому исключить системные namespace можно без ручной разметки. Документация рекомендует не трогать `kube-system`, `kube-node-lease` и namespace самого вебхука.
+
+```yaml
+namespaceSelector:
+  matchExpressions:
+  - key: kubernetes.io/metadata.name
+    operator: NotIn
+    values: [kube-system, kube-node-lease, policy]
+```
+
+Фрагмент исключает системные namespace и namespace `policy`, где работает сам вебхук. Без последнего исключения вебхук блокирует собственное восстановление (§5).
+
+### matchConditions и matchPolicy
+
+**matchConditions** — список условий на CEL (GA с 1.30), которые API-сервер проверяет до сетевого вызова. Вебхук вызывается, только если все условия истинны. В выражениях доступны `object`, `oldObject`, `request` и `authorizer`, а условий может быть до 64. Если условие завершилось ошибкой, вебхук не вызывается, а исход решает `failurePolicy`.
+
+Условия дешевле вызова: запрос, который вебхуку не нужен, вообще не уходит в сеть. Так отсекают запросы от kubelet, служебных учётных записей и собственных контроллеров вебхука.
+
+**matchPolicy** решает, как сопоставлять версии API. Значение `Equivalent` (по умолчанию) вызывает вебхук и для запроса к старой версии API, если правило написано для новой, а `Exact` ждёт точного совпадения.
+
+### failurePolicy и timeoutSeconds
+
+**failurePolicy** — что делать, если вызов вебхука не удался: `Fail` отклоняет запрос, `Ignore` пропускает его (fail open). Под «не удался» попадают сеть, таймаут, ошибка TLS, ответ не 2xx и непонятное тело ответа. Явный отказ вебхука (`allowed: false`) не сбой: он запрещает запрос при любой политике.
+
+**timeoutSeconds** — сколько API-сервер ждёт ответ: от 1 до 30 секунд, по умолчанию 10. При `Fail` и молчащем вебхуке каждый подходящий запрос ждёт всё это время, поэтому для вебхуков выбирают 2–5 секунд.
+
+Практическое правило: `Fail` ставят у правил безопасности, где пропустить запрос хуже, чем отказать. У «желательных» правил (метки, значения по умолчанию) ставят `Ignore`, чтобы сбой вебхука не останавливал работу.
+
+### sideEffects и reinvocationPolicy
+
+**sideEffects** — заявление вебхука о побочных эффектах вне запроса, например о записи во внешнюю систему. Поле обязательное, а допустимы только `None` и `NoneOnDryRun`. Запрос с `dryRun=true` — пробный запуск без сохранения — не отправляют вебхуку без такой заявки, и весь запрос завершается ошибкой.
+
+**reinvocationPolicy** — поле mutating-вебхука: `Never` (по умолчанию) вызывает его один раз, `IfNeeded` вызывает повторно, если позднейшие плагины изменили объект. Число повторов не гарантировано, поэтому mutating-вебхук обязан быть идемпотентным: повторный вызов на своём же результате ничего не меняет.
+
+Хороший пример: добавить контейнер-прокси, только если его ещё нет. Плохой пример: безусловно дописать элемент в список. После мутации объект должен ещё пройти все validating-проверки, поэтому мутацию проверяют validating-вебхуком или политикой (06-3 §5).
+
+### Порядок удаления: оператор и его объекты
+
+Объекты оператора удаляют раньше самого оператора. Оператор из 09-1 видит удаление объекта, чистит внешние ресурсы и снимает свой finalizer. Если сначала удалить оператор, снять finalizer некому, и объекты зависают.
+
+```
+правильно:   удалить CR ─► оператор чистит, снимает finalizer ─► CR исчез ─► удалить оператор
+неправильно: удалить оператор ─► CR получает deletionTimestamp ─► снять некому ─► зависание
+```
+
+Схема 4. Порядок удаления оператора: объекты первыми, сам оператор и CRD после них.
+
+Если оператор уже удалён, возвращают его (тот же Deployment и CRD) и только потом удаляют объекты. Снимать finalizer руками — последнее средство, потому что очистка не выполнится.
+
+---
+
+## 4. Как увидеть состояние
+
+Состояние вебхуков видно в конфигурациях, в тексте ошибок и в метриках API-сервера. Состояние удаления видно в условиях namespace и в полях `deletionTimestamp` объектов.
+
+### Какие вебхуки включены
+
+Сначала смотрят, какие конфигурации есть и на что они реагируют. Команды только читают состояние.
+
+```bash
+kubectl get validatingwebhookconfiguration,mutatingwebhookconfiguration
+kubectl get validatingwebhookconfiguration <имя> -o yaml
+```
+
+Первая команда перечисляет конфигурации обоих видов, вторая выводит выбранную целиком. В выводе смотрят `rules`, оба селектора, `failurePolicy`, `timeoutSeconds` и `clientConfig`: из них видно, на какие запросы вебхук влияет и куда он звонит.
+
+### Текст ошибки
+
+Сбой вебхука API-сервер возвращает вызвавшему как `InternalError` с текстом `failed calling webhook` и именем вебхука. Если под создаёт контроллер (Deployment, Job), ошибку видно не в Deployment, а в событиях ReplicaSet или Job: `kubectl describe rs` показывает строку `Error creating`.
+
+Текст после двоеточия называет причину: `service "…" not found` — нет Service, `context deadline exceeded` — вебхук не ответил за `timeoutSeconds`, `x509: …` — проблема сертификата, `connection refused` — никто не слушает порт.
+
+### Метрики API-сервера
+
+API-сервер считает вызовы вебхуков и отдаёт метрики на `/metrics`.
+
+- **apiserver_admission_webhook_rejection_count** — отказы с метками `name`, `type`, `error_type`; значение `calling_webhook_error` означает сбой вызова, а не отказ вебхука.
+- **apiserver_admission_webhook_fail_open_count** — запросы, пропущенные при `Ignore` после сбоя.
+- **apiserver_admission_webhook_admission_duration_seconds** — гистограмма времени ответа вебхуков.
+
+По первой метрике ставят алерт: рост `calling_webhook_error` означает, что вебхук недоступен или тормозит. По третьей видно вебхуки, которые отвечают медленнее положенного.
+
+### Условия namespace
+
+Причины зависания namespace записаны в `status.conditions`.
+
+- **NamespaceContentRemaining** — какие типы объектов остались и сколько их.
+- **NamespaceFinalizersRemaining** — какие finalizers ещё держат объекты.
+- **NamespaceDeletionContentFailure** — тип, который не удалось удалить.
+- **NamespaceDeletionDiscoveryFailure** — discovery не вернул часть групп API.
+
+Остальные условия показывают `False`, поэтому отбирают только `True`. Условия называют и тип объекта, и сам finalizer, что сразу указывает на владельца.
+
+### Перебор объектов namespace
+
+Условие называет тип, но не имя. Объекты находят перебором всех типов, которые поддерживают `list` внутри namespace.
 
 ```bash
 kubectl api-resources --verbs=list --namespaced -o name | xargs -n 30 | tr ' ' ',' \
-  | while read t; do kubectl -n <ns> get $t --ignore-not-found -o name; done
+  | while read t; do kubectl -n <namespace> get $t --ignore-not-found -o name; done
 ```
 
-Проверено: `configmap/stuck`. Снятие finalizer'а — namespace исчез за секунды.
-
-Откуда такие finalizer'ы в жизни и что делать **до** снятия руками:
-
-| Finalizer | Чей | Почему висит | Правильное действие |
-|---|---|---|---|
-| `kubernetes.io/pvc-protection` | kube-controller-manager | PVC использует под | удалить под |
-| `foregroundDeletion` | GC | ждёт удаления зависимых | смотреть зависимые |
-| `resources-finalizer.argocd.argoproj.io` | Argo CD | Argo CD удаляет ресурсы или его нет | вернуть Argo CD или снять осознанно (08-2) |
-| `*.cnpg.io/*`, `postgresql.cnpg.io/…` | оператор БД | оператор удалён раньше своих CR | вернуть оператор, удалить CR, затем оператор (09-1) |
-| `service.kubernetes.io/load-balancer-cleanup` | cloud-controller-manager | не может удалить облачный LB | права/квоты облака; иначе LB останется висеть и оплачиваться |
-| `kubernetes` у самого namespace | namespace-controller | контент не удаляется | разбирать контент (выше) |
-
-Порядок удаления «оператор + его объекты»: сначала CR (оператор выполнит очистку и снимет finalizer'ы), потом оператор и CRD. Обратный порядок — и все CR повиснут.
-
-### Недоступный APIService 🔴
-
-Классическая причина «namespace не удаляется, контента нет» — aggregated API (APIService), который не отвечает: namespace-controller не может перечислить ресурсы этой группы и не уверен, что namespace пуст. Проверено на стенде (metrics-server выключен, `APIService Available=False MissingEndpoints`): в Kubernetes 1.36 namespace **удалился** без ожидания — ресурсы `metrics.k8s.io` только для чтения, удалять в них нечего, и контроллер их пропускает. Зависание возникает с aggregated API, у которых есть удаляемые namespaced-ресурсы (кастомные API-серверы, сервисы каталогов). Симптом в conditions — `NamespaceDeletionDiscoveryFailure`; лечение — поднять APIService или удалить его объект (`kubectl get apiservice | grep False`). ⚠️ Зависание по этой причине на стенде не воспроизведено.
-
-Убирать finalizer у самого namespace через `/finalize` (известный «рецепт» с `kubectl replace --raw …/finalize`) — значит бросить объекты в etcd без очистки: они останутся «сиротами» и всплывут, если namespace с тем же именем создадут снова. Только когда понятно, что именно бросаете.
+Команда берёт имена всех типов ресурсов, склеивает по 30 в строку через запятую и для каждой строки выводит имена найденных объектов. Для найденного объекта смотрят `kubectl get <тип>/<имя> -o jsonpath='{.metadata.finalizers}'`: имя finalizer называет владельца.
 
 ---
 
-## 🔧 Лаба
+## 5. Что ломается и как найти причину
 
-### Шаг 0. Подготовка
+Три типичные поломки: недоступный вебхук, взаимная блокировка вебхука с самим собой и зависший namespace. Для каждой есть признак, проверка и безопасный выход.
 
-```bash
-kubectl config use-context kind-lab
-kubectl create ns lab-09-2
-kubectl label ns lab-09-2 webhook.lab/policy=on
+### Вебхук недоступен: кластер не принимает изменения
+
+Если вебхук с `failurePolicy: Fail` недоступен, все запросы, подходящие под его правило, получают отказ или ждут `timeoutSeconds`. Для вебхука на поды это значит, что не создаются новые поды, не масштабируются Deployment и не работают rollout и HPA. Существующие поды продолжают работать, потому что admission касается только записи.
+
+```
+kubectl / ReplicaSet / HPA ─► API-сервер ─► admission ─► вебхук (недоступен)
+                                                  │
+                                                  ├ Fail:   ответ 500, запрос отклонён
+                                                  └ Ignore: запрос проходит (fail open)
+                              ожидание ответа ограничено timeoutSeconds
 ```
 
-### Шаг 1. Вебхук без сервиса
+Схема 5. Путь запроса при недоступном вебхуке: при `Fail` запрос заканчивается ошибкой, при `Ignore` проходит.
+
+Контроллеры повторяют неудачные запросы с паузами, поэтому нагрузка на API-сервер растёт, а `kubectl` «подвисает» на каждой команде. Скорость отказа зависит от причины: если Service не существует, ошибка приходит за сотни миллисекунд, а если сервер принимает соединение и молчит — только после полного таймаута.
+
+### Взаимная блокировка
+
+Если правило вебхука охватывает namespace, где работает сам вебхук, то упавший под вебхука не может подняться: его создание тоже идёт через недоступный вебхук. То же происходит с системными подами в `kube-system` (CoreDNS, сетевой плагин), если вебхук на них не исключён.
+
+Профилактика — селекторы из §3, 2–3 реплики вебхука с PodDisruptionBudget и PriorityClass, `timeoutSeconds` 2–5 секунд и алерт на `calling_webhook_error`. У CEL-политик взаимной блокировки нет, потому что сети у них нет (06-3).
+
+### Аварийное отключение
+
+Выход один: удалить или исправить конфигурацию вебхука. Конфигурации через вебхуки не проходят (§2), поэтому удаление работает даже при полной блокировке.
 
 ```bash
-kubectl apply -f - <<'EOF'
+kubectl delete validatingwebhookconfiguration <имя>
+```
+
+После удаления запросы проходят без проверки, пока вы чините вебхук. Затем конфигурацию создают заново, уже с исправлением. Эту команду записывают в runbook заранее, потому что вспоминают о ней ночью, когда деплой не идёт. Право удалять такие конфигурации выдаёт RBAC (06-1), и оно же означает власть отключить любую политику кластера.
+
+### Namespace в Terminating: finalizer
+
+Самая частая причина зависания — объект с finalizer, чей владелец не работает. Условия namespace называют тип объекта и finalizer, а перебор из §4 находит сам объект.
+
+Типичные finalizers:
+
+- **`kubernetes.io/pvc-protection`** — PVC используется подом; удалите под (04-2).
+- **`foregroundDeletion`** — объект ждёт удаления зависимых; смотрите зависимые объекты (01-3).
+- **`resources-finalizer.argocd.argoproj.io`** — Argo CD удаляет ресурсы приложения; верните Argo CD (08-2).
+- **`service.kubernetes.io/load-balancer-cleanup`** — облачный контроллер не может удалить балансировщик; проверьте права и квоты облака.
+- **finalizers операторов** — оператор удалён раньше своих объектов; верните его (§3, 09-1).
+
+Порядок действий: прочитать условие namespace, найти объект, определить владельца finalizer, вернуть владельца или выполнить его очистку вручную, и лишь потом снять finalizer патчем объекта. Если снять finalizer, не очистив ресурс, внешний диск или балансировщик останется и будет оплачиваться.
+
+Есть известный «рецепт»: снять finalizer у самого namespace через подресурс `/finalize` командой `kubectl replace --raw`. Namespace исчезнет, но объекты с их finalizers останутся в хранилище без очистки, и при повторном создании namespace с тем же именем они могут вернуться. Используйте его, только если понимаете, что именно бросаете.
+
+### Недоступный APIService: код и стенд расходятся
+
+Литература и код контроллера namespace описывают такую причину зависания: APIService недоступен, и discovery не возвращает его группу. Контроллер не знает, что в этой группе лежит, поэтому не уверен, что namespace пуст. В коде ошибка discovery не фатальна: контроллер удаляет всё найденное, но возвращает ошибку, не снимает finalizer `kubernetes` и повторяет цикл. В условиях появляется `NamespaceDeletionDiscoveryFailure`, а лечение — вернуть сервис за APIService или удалить сам объект APIService.
+
+Стенд (kind 0.32.0, Kubernetes 1.36.1) показал другое. При выключенном metrics-server APIService `v1beta1.metrics.k8s.io` получил `Available=False` с причиной `MissingEndpoints`, но namespace с одним ConfigMap удалился за 15 секунд без зависания. Это расходится с описанием выше.
+
+Причину расхождения мы не установили. Прежнее объяснение гласило, что ресурсы `metrics.k8s.io` доступны только для чтения и контроллер их пропускает. Оно не подтверждается: контроллер не видит ресурсов недоступной группы и не знает, что они только для чтения. Возможные причины — кэш discovery на стороне API-сервера или особенность 1.36, но мы не проверяли ни то, ни другое. Зависание по этой причине на стенде не воспроизведено.
+
+Практический вывод: не рассчитывайте, что недоступный APIService не держит namespace. Когда namespace завис без видимых причин, выполните `kubectl get apiservice` и ищите `False` в столбце `AVAILABLE`.
+
+---
+
+## 6. Пределы и значения по умолчанию
+
+Ниже значения, которые чаще всего определяют поведение, и границы механизмов.
+
+### Значения по умолчанию
+
+- **timeoutSeconds** — 10 секунд; допустимо от 1 до 30.
+- **failurePolicy** — `Fail`.
+- **matchPolicy** — `Equivalent`.
+- **reinvocationPolicy** — `Never`.
+- **service** — порт 443, путь `/`.
+- **matchConditions** — до 64 условий на вебхук.
+- **sideEffects и admissionReviewVersions** — значения по умолчанию нет, поля обязательны.
+
+Имена конфигураций, оканчивающиеся на `.static.k8s.io`, зарезервированы. Предупреждения вебхука (`warnings`) длиннее 256 символов обрезаются, а при общей длине свыше 4096 символов отбрасываются.
+
+### Версии и стадии
+
+- **MutatingAdmissionPolicy** — GA в 1.36 (06-3); для простых мутаций заменяет mutating-вебхук.
+- **ValidatingAdmissionPolicy** — GA с 1.30.
+- **matchConditions для вебхуков** — GA с 1.30.
+- **Ordered namespace deletion** — GA с 1.34, поды удаляются первыми.
+
+В Kubernetes 1.37 (на стенд не берётся) вебхукам по умолчанию перестают отправлять виртуальные ресурсы вроде TokenReview и SubjectAccessReview, а вызовы балансируются между бэкендами. В 1.36 такие ресурсы исключайте сами: не пишите правила со звёздочкой для всех ресурсов.
+
+### Чего вебхуки не умеют
+
+Вебхук не видит чтение: `get`, `list` и `watch` через admission не идут. Для полей кастомных ресурсов вместо вебхука лучше использовать значения по умолчанию и валидацию в CRD (09-1). Вебхук не может быть единственной защитой: кто удалит его конфигурацию, тот отключит проверку. Наконец, вебхук добавляет сетевой вызов в каждый подходящий запрос, а это задержка и точка отказа, которых у политик на CEL нет.
+
+---
+
+## Лабораторные работы
+
+Работы идут на стенде 00-1 в namespace `lab-09-2` и `lab-09-2-hook`; работы 3 и 4 создают свои namespace. Команды работ 1 и 2 используют функцию `k` с явным namespace, поэтому контекст kubectl и текущий namespace не меняются. Работы 1 и 2 ставят вебхук, который действует только на namespace с меткой `lab-09-2/policy=on`: остальные namespace кластера не затрагиваются. Работа 4 выключает metrics-server стенда на пару минут.
+
+Подготовку выполняют один раз.
+
+```bash
+kubectl config current-context
+kubectl create ns lab-09-2
+kubectl label ns lab-09-2 lab-09-2/policy=on
+kubectl create ns lab-09-2-hook
+mkdir -p ~/lab/k8s/09-2
+k() { kubectl -n lab-09-2 "$@"; }
+t() { s=$(date +%s%N); "$@"; echo "$(( ($(date +%s%N) - s) / 1000000 )) ms"; }
+```
+
+| Часть команды | Значение |
+|---|---|
+| `current-context` | убедиться, что активен кластер стенда |
+| `label ns lab-09-2 lab-09-2/policy=on` | пометить namespace, на который будет действовать вебхук |
+| `create ns lab-09-2-hook` | namespace без метки: сюда вебхук не доходит |
+| `k() { … }` | сокращение для `kubectl -n lab-09-2` |
+| `t() { … }` | выполнить команду и напечатать время в миллисекундах |
+
+Первая команда должна напечатать `kind-lab`. Две функции живут только в текущем терминале; если вы его закрыли, объявите их снова. Уборка работы 2 их снимает.
+
+### Лабораторная работа 1. Вебхук без сервиса
+
+**Риски.** Работа создаёт вебхук, который отказывает во всех создаваемых подах помеченного namespace. Хост не меняется.
+
+- **Что меняется:** в кластере появляется `ValidatingWebhookConfiguration` `lab-09-2-policy`; пока она есть, в `lab-09-2` нельзя создать ни один под.
+- **Надолго ли:** до шага 4, где конфигурацию удаляют; уборка проверяет, что её нет.
+- **Безопасность:** привилегий не нужно; вебхук действует только на namespace с меткой `lab-09-2/policy=on`.
+- **Влияние на систему:** другие namespace, `orders` и системные поды не затронуты, пока метку не поставили на них. Если вы ошиблись в селекторе, вебхук охватит больше; откат ниже снимает любое влияние.
+- **Откат:** `kubectl delete validatingwebhookconfiguration lab-09-2-policy` — конфигурация относится ко всему кластеру и через вебхуки не проходит, поэтому удаление работает при любом сбое.
+
+**Цель.** Увидеть, как вебхук с `Fail` и несуществующим сервисом останавливает создание подов, как ошибка выглядит у пользователя и у контроллера и как выключить вебхук.
+
+**Что понадобится.**
+
+- Стенд 00-1 и подготовка выше.
+- Образ `busybox:1.37`.
+- Около 20 минут.
+
+**Схема опыта.** Вебхук указывает на сервис, которого нет. Запрос в помеченном namespace падает, а в namespace без метки проходит.
+
+```
+под в lab-09-2 (метка есть)     ─► API-сервер ─► вебхук: сервиса нет ─► отказ
+под в lab-09-2-hook (метки нет) ─► API-сервер ─► вебхук не вызывается ─► под создан
+```
+
+Схема показывает, что метка namespace решает, дойдёт ли запрос до вебхука; сбой есть только в первой строке.
+
+#### Шаг 1. Создать вебхук с несуществующим сервисом
+
+Записываем конфигурацию в файл и применяем. Правило ловит создание подов в namespace с меткой `lab-09-2/policy=on`, а сервис `policy-webhook` мы не создаём.
+
+```bash
+cat > ~/lab/k8s/09-2/webhook.yaml <<'EOF'
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration
-metadata: {name: lab-policy}
+metadata: {name: lab-09-2-policy}
 webhooks:
 - name: pods.policy.lab.local
   admissionReviewVersions: [v1]
   sideEffects: None
   failurePolicy: Fail
   timeoutSeconds: 5
-  namespaceSelector: {matchLabels: {webhook.lab/policy: "on"}}
-  rules: [{apiGroups: [""], apiVersions: [v1], operations: [CREATE], resources: [pods]}]
+  namespaceSelector:
+    matchLabels: {lab-09-2/policy: "on"}
+  rules:
+  - {apiGroups: [""], apiVersions: [v1], operations: [CREATE], resources: [pods]}
   clientConfig:
     service: {name: policy-webhook, namespace: lab-09-2, path: /validate, port: 443}
 EOF
-kubectl -n lab-09-2 run p1 --image=busybox:1.37 -- sleep 60
-kubectl -n default run p-default --image=busybox:1.37 --restart=Never -- sleep 5
-kubectl -n lab-09-2 create deploy d1 --image=busybox:1.37 -- sleep 3600; sleep 5
-kubectl -n lab-09-2 get deploy d1; kubectl -n lab-09-2 describe rs | grep -m1 'Error creating'
+kubectl apply -f ~/lab/k8s/09-2/webhook.yaml
 ```
 
-Проверено: вывод в §1.
+| Часть команды | Значение |
+|---|---|
+| `failurePolicy: Fail` | при сбое вызова запрос отклоняется |
+| `timeoutSeconds: 5` | ждать ответ не больше 5 секунд |
+| `namespaceSelector` | вебхук действует только на namespace с меткой `lab-09-2/policy=on` |
+| `service: {name: policy-webhook, …}` | адрес, по которому звонит API-сервер; такого сервиса нет |
 
-### Шаг 2. Вебхук, который молчит
+Результат:
+
+```
+validatingwebhookconfiguration.admissionregistration.k8s.io/lab-09-2-policy created
+```
+
+Конфигурация создана без проверки: API-сервер не требует, чтобы сервис существовал. Ошибка проявится только при вызове.
+
+#### Шаг 2. Создать под в помеченном и в свободном namespace
+
+Создаём под в `lab-09-2`, где вебхук действует, и в `lab-09-2-hook`, где его нет. Функция `t` печатает время выполнения.
 
 ```bash
-kubectl create ns lab-09-2-hook
-kubectl -n lab-09-2-hook run hang --image=busybox:1.37 --labels=app=hang -- sh -c 'while true; do sleep 3600 | nc -l -p 443 >/dev/null; done'
-kubectl -n lab-09-2-hook expose pod hang --name=policy-webhook --port=443
-kubectl -n lab-09-2-hook wait --for=condition=Ready pod/hang
-kubectl patch validatingwebhookconfiguration lab-policy --type=json -p '[{"op":"replace","path":"/webhooks/0/clientConfig/service/namespace","value":"lab-09-2-hook"}]'
-for fp in Fail Ignore; do
-  kubectl patch validatingwebhookconfiguration lab-policy --type=json -p "[{\"op\":\"replace\",\"path\":\"/webhooks/0/failurePolicy\",\"value\":\"$fp\"}]"; sleep 2
-  s=$(date +%s%N); kubectl -n lab-09-2 run q-$(echo $fp | tr A-Z a-z)-$RANDOM --image=busybox:1.37 -- sleep 60
-  echo "$fp: $(( ($(date +%s%N)-s)/1000000 )) ms"
-done
-kubectl get --raw /metrics | grep -E '^apiserver_admission_webhook_(rejection_count|fail_open_count)' | grep lab
-kubectl delete validatingwebhookconfiguration lab-policy          # аварийное «выключение» вебхука
+sleep 2
+t k run p1 --image=busybox:1.37 -- sleep 60
+kubectl -n lab-09-2-hook run p-free --image=busybox:1.37 -- sleep 60
 ```
 
-`sleep 3600 |` держит stdin `nc` открытым — без этого busybox-nc закрывает соединение сразу, и apiserver получает мгновенный `EOF` вместо таймаута (проверено). Проверено: вывод в §1.
+| Часть команды | Значение |
+|---|---|
+| `sleep 2` | дать API-серверу подхватить новую конфигурацию |
+| `t k run p1 …` | создать под p1 в `lab-09-2` и показать время |
+| `-n lab-09-2-hook run p-free` | создать под в namespace без метки |
 
-### Шаг 3. Namespace в Terminating
+Результат (текст ошибки сокращён):
+
+```
+Error from server (InternalError): Internal error occurred: failed calling webhook
+"pods.policy.lab.local": failed to call webhook: Post
+"https://policy-webhook.lab-09-2.svc:443/validate?timeout=5s": service "policy-webhook" not found
+226 ms
+pod/p-free created
+```
+
+Разбор вывода:
+
+1. `InternalError` — сбой вызова вебхука, а не отказ самого вебхука; пользователю возвращается ошибка 500.
+2. `failed calling webhook "pods.policy.lab.local"` называет вебхук: по этому имени ищут нужную конфигурацию.
+3. `service "policy-webhook" not found` — причина: Service не существует.
+4. 226 мс — отказ пришёл быстро, потому что до адреса даже не дошли; таймаут 5 секунд не понадобился.
+5. Под `p-free` создан: в namespace без метки вебхук не вызывается.
+
+#### Шаг 3. Увидеть ошибку у контроллера
+
+Deployment сам не создаёт поды, их создаёт ReplicaSet, поэтому ошибку надо искать в нём. Создаём Deployment и смотрим его состояние и события ReplicaSet.
+
+```bash
+k create deploy d1 --image=busybox:1.37 -- sleep 3600
+sleep 5
+k get deploy d1
+k describe rs | grep -m1 'Error creating'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `create deploy d1 … -- sleep 3600` | Deployment из одного пода |
+| `get deploy d1` | сколько реплик готово |
+| `describe rs \| grep -m1 'Error creating'` | первая строка ошибки в событиях ReplicaSet |
+
+Результат (столбцы и текст ошибки сокращены):
+
+```
+NAME   READY   UP-TO-DATE   AVAILABLE   AGE
+d1     0/1     0            0           5s
+```
+
+```
+  Warning  FailedCreate  …  Error creating: Internal error occurred: failed calling webhook …
+```
+
+Разбор вывода:
+
+1. `0/1` — Deployment создан, но под не появился: у `d1` нет ни одной готовой реплики.
+2. Объект Deployment выглядит нормально; ошибка записана только в событии `FailedCreate` у ReplicaSet.
+3. Это тот же текст, что у пользователя в шаге 2: поэтому при жалобе «под не создаётся» читают события ReplicaSet.
+
+#### Шаг 4. Выключить вебхук
+
+Удаляем конфигурацию и повторяем создание пода. Так выглядит аварийный выход из §5.
+
+```bash
+kubectl delete validatingwebhookconfiguration lab-09-2-policy
+sleep 2
+k run p1 --image=busybox:1.37 -- sleep 60
+```
+
+| Часть команды | Значение |
+|---|---|
+| `delete validatingwebhookconfiguration` | удалить конфигурацию вебхука; через вебхуки она не проходит |
+| `sleep 2` | дать API-серверу забыть вебхук |
+| `k run p1` | повторить создание пода из шага 2 |
+
+Результат:
+
+```
+validatingwebhookconfiguration.admissionregistration.k8s.io "lab-09-2-policy" deleted
+pod/p1 created
+```
+
+Под `p1` создан, потому что вызывать больше нечего.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| вебхук с `Fail` и недоступным сервисом отклоняет запросы | шаг 2 |
+| метка namespace решает, вызывается ли вебхук | шаг 2 |
+| ошибку контроллера ищут в событиях ReplicaSet | шаг 3 |
+| удаление конфигурации возвращает кластер к норме | шаг 4 |
+
+**Уборка.**
+
+```bash
+k delete deploy d1 --ignore-not-found
+k delete pod p1 --ignore-not-found
+kubectl -n lab-09-2-hook delete pod p-free --ignore-not-found
+kubectl get validatingwebhookconfiguration lab-09-2-policy
+```
+
+Последняя команда должна ответить `Error from server (NotFound)`. Namespace и функции остаются для работы 2.
+
+**Вопросы для самопроверки.**
+
+1. Почему под в `lab-09-2-hook` создался, а в `lab-09-2` нет?
+2. Где искать ошибку, если Deployment не создаёт поды?
+3. Почему удаление конфигурации вебхука работает, хотя вебхук блокирует все поды?
+
+<details><summary>Ответ</summary>
+
+1. Селектор вебхука требует метку `lab-09-2/policy=on`, а у `lab-09-2-hook` её нет, поэтому API-сервер вебхук не вызывает.
+2. В событиях ReplicaSet, например в `kubectl describe rs`: Deployment ошибку не показывает, поды создаёт ReplicaSet.
+3. Объекты конфигураций вебхуков через вебхуки не проходят, а правило вебхука касается только подов.
+
+</details>
+
+### Лабораторная работа 2. Вебхук, который молчит: Fail, Ignore и таймаут
+
+**Риски.** Как и в работе 1, вебхук отказывает в запросах помеченного namespace, но теперь сервер принимает соединение и не отвечает. Хост не меняется.
+
+- **Что меняется:** вебхук `lab-09-2-policy` снова создан; в `lab-09-2-hook` работает под-«молчун» и Service `policy-webhook`.
+- **Надолго ли:** до уборки; под-«молчун» живёт до удаления namespace `lab-09-2-hook`.
+- **Безопасность:** привилегий не нужно; под слушает порт 443 внутри кластера, наружу ничего не публикуется.
+- **Влияние на систему:** создание подов в `lab-09-2` ждёт по 5 секунд; остальные namespace не затронуты. Метрики API-сервера получают лишние счётчики.
+- **Откат:** `kubectl delete validatingwebhookconfiguration lab-09-2-policy`; он же выполняется в уборке.
+
+**Цель.** Сравнить поведение вебхука с `Fail` и `Ignore`, измерить цену ожидания таймаута и найти следы сбоев в метриках API-сервера.
+
+**Что понадобится.**
+
+- Стенд 00-1, подготовка и файл `~/lab/k8s/09-2/webhook.yaml` из работы 1.
+- Образ `busybox:1.37`.
+- Около 25 минут.
+
+**Схема опыта.** Вебхук указывает на существующий сервис, но сервер за ним принимает соединение и молчит. Исход запроса зависит от `failurePolicy`, а время ожидания ограничивает `timeoutSeconds`.
+
+```
+под в lab-09-2 ─► API-сервер ─► policy-webhook.lab-09-2-hook.svc:443 ─► под hang (молчит)
+                      │
+                      ├ Fail:   сбой ─► ошибка
+                      └ Ignore: сбой ─► запрос проходит (fail open)
+                  ожидание ответа ограничено timeoutSeconds
+```
+
+Схема показывает, что в обоих случаях вебхук не ответил; политика решает только, что делать с запросом.
+
+#### Шаг 1. Запустить сервер, который принимает соединение и молчит
+
+Сервер — под с busybox, где `nc` слушает порт 443. Команда `sleep 3600 |` держит ввод `nc` открытым: без неё busybox закрывает соединение сразу, и API-сервер получает мгновенный `EOF` вместо таймаута.
+
+```bash
+kubectl -n lab-09-2-hook run hang --image=busybox:1.37 --labels=app=hang -- \
+  sh -c 'while true; do sleep 3600 | nc -l -p 443 >/dev/null; done'
+kubectl -n lab-09-2-hook expose pod hang --name=policy-webhook --port=443
+kubectl -n lab-09-2-hook wait --for=condition=Ready pod/hang
+```
+
+| Часть команды | Значение |
+|---|---|
+| `nc -l -p 443` | слушать порт 443 |
+| `sleep 3600 \|` | держать ввод открытым, чтобы соединение не закрывалось |
+| `expose pod hang --name=policy-webhook` | Service с именем, которое ждёт вебхук |
+| `wait --for=condition=Ready` | дождаться готовности пода |
+
+Результат:
+
+```
+pod/hang created
+service/policy-webhook exposed
+pod/hang condition met
+```
+
+Все три объекта созданы, и под готов принять соединение.
+
+#### Шаг 2. Направить вебхук на «молчуна»
+
+Применяем конфигурацию из работы 1 заново и меняем namespace сервиса. Политика пока `Fail`.
+
+```bash
+kubectl apply -f ~/lab/k8s/09-2/webhook.yaml
+kubectl patch validatingwebhookconfiguration lab-09-2-policy --type=json -p \
+  '[{"op":"replace","path":"/webhooks/0/clientConfig/service/namespace","value":"lab-09-2-hook"}]'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `apply -f …/webhook.yaml` | создать конфигурацию заново |
+| `patch … --type=json` | точечная правка по RFC 6902 |
+| `"op":"replace","path":"…/service/namespace"` | заменить namespace сервиса на `lab-09-2-hook` |
+
+Результат:
+
+```
+validatingwebhookconfiguration.admissionregistration.k8s.io/lab-09-2-policy created
+validatingwebhookconfiguration.admissionregistration.k8s.io/lab-09-2-policy patched
+```
+
+Теперь сервис существует, и ошибки «not found» больше не будет.
+
+#### Шаг 3. Fail: ожидание и ошибка
+
+Создаём под и измеряем время до ответа.
+
+```bash
+sleep 2
+t k run q-fail --image=busybox:1.37 -- sleep 60
+```
+
+Результат (текст ошибки сокращён):
+
+```
+Error from server (InternalError): Internal error occurred: failed calling webhook
+"pods.policy.lab.local": failed to call webhook: Post
+"https://policy-webhook.lab-09-2-hook.svc:443/validate?timeout=5s": context deadline exceeded
+5232 ms
+```
+
+Разбор вывода:
+
+1. `context deadline exceeded` — сервер принял соединение, но не ответил за время `timeout=5s` из адреса вызова.
+2. 5232 мс — запрос ждал весь `timeoutSeconds` плюс накладные расходы. В работе 1 тот же отказ пришёл за 226 мс: сервис не нашёлся сразу.
+3. При `Fail` молчащий вебхук тормозит каждый подходящий запрос на 5 секунд, а при значении по умолчанию — на 10.
+
+#### Шаг 4. Ignore: пропуск запроса
+
+Меняем политику на `Ignore` и повторяем.
+
+```bash
+kubectl patch validatingwebhookconfiguration lab-09-2-policy --type=json -p \
+  '[{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Ignore"}]'
+sleep 2
+t k run q-ignore --image=busybox:1.37 -- sleep 60
+```
+
+Результат:
+
+```
+validatingwebhookconfiguration.admissionregistration.k8s.io/lab-09-2-policy patched
+pod/q-ignore created
+235 ms
+```
+
+Разбор вывода:
+
+1. Под создан: при `Ignore` сбой вызова не останавливает запрос.
+2. Время 235 мс получено на стенде, и оно заметно меньше таймаута. Почему запрос не ждал полные 5 секунд, мы не выяснили; верхняя граница ожидания — `timeoutSeconds`.
+3. Вебхук при этом не проверил под. Для правила безопасности это пропуск проверки, поэтому `Ignore` для таких правил не подходит.
+
+#### Шаг 5. Найти след сбоев в метриках
+
+Читаем счётчики вебхука из метрик API-сервера.
+
+```bash
+kubectl get --raw /metrics \
+  | grep -E '^apiserver_admission_webhook_(rejection_count|fail_open_count)' \
+  | grep policy.lab.local
+```
+
+| Часть команды | Значение |
+|---|---|
+| `get --raw /metrics` | запросить метрики API-сервера |
+| `grep -E '^apiserver_admission_webhook_(…)'` | оставить счётчики отказов и пропусков |
+| `grep policy.lab.local` | оставить строки нашего вебхука |
+
+Результат (числа у вас будут другими: счётчики растут с каждым вызовом):
+
+```
+apiserver_admission_webhook_rejection_count{error_type="calling_webhook_error",
+name="pods.policy.lab.local",…,rejection_code="503"} 15
+apiserver_admission_webhook_fail_open_count{name="pods.policy.lab.local",type="validating"} 2
+```
+
+Разбор вывода:
+
+1. Первая строка считает отказы из-за сбоя вызова (`calling_webhook_error`): это попытки при `Fail`, включая повторы контроллеров.
+2. Вторая строка считает запросы, пропущенные при `Ignore` после сбоя.
+3. На такие метрики настраивают алерты: рост первого счётчика означает, что вебхук недоступен.
+
+#### Шаг 6. Сократить таймаут
+
+Возвращаем `Fail` и уменьшаем `timeoutSeconds` до 2. Время отказа должно примерно совпасть с новым значением.
+
+```bash
+kubectl patch validatingwebhookconfiguration lab-09-2-policy --type=json -p \
+  '[{"op":"replace","path":"/webhooks/0/failurePolicy","value":"Fail"},
+    {"op":"replace","path":"/webhooks/0/timeoutSeconds","value":2}]'
+sleep 2
+t k run q-short --image=busybox:1.37 -- sleep 60
+```
+
+Ожидаемый результат (время — чуть больше двух секунд, текст ошибки сокращён):
+
+```
+validatingwebhookconfiguration.admissionregistration.k8s.io/lab-09-2-policy patched
+Error from server (InternalError): … context deadline exceeded
+2xxx ms
+```
+
+Разбор: в строке 2 ошибка та же, что в шаге 3, а время вместо пяти секунд — около двух. Короткий `timeoutSeconds` не уменьшает вероятность сбоя, но ограничивает вред от него.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| молчащий вебхук опаснее отсутствующего: отказ приходит после таймаута | шаг 3 |
+| `Ignore` не отклоняет запрос, но и не проверяет его | шаг 4 |
+| сбои видны в метриках `calling_webhook_error` и `fail_open_count` | шаг 5 |
+| `timeoutSeconds` задаёт цену сбоя | шаг 6 |
+
+**Уборка.**
+
+```bash
+kubectl delete validatingwebhookconfiguration lab-09-2-policy
+kubectl delete ns lab-09-2 lab-09-2-hook
+rm -rf ~/lab/k8s/09-2
+unset -f k t
+kubectl get validatingwebhookconfiguration lab-09-2-policy
+```
+
+Первая команда выключает вебхук, вторая удаляет оба namespace с подами и сервисом, третья — файлы работы, четвёртая — функции. Последняя команда должна ответить `NotFound`.
+
+**Вопросы для самопроверки.**
+
+1. Почему при `Fail` молчащий вебхук опаснее, чем вебхук без сервиса?
+2. Что пропускает `Ignore`, и когда это допустимо?
+3. Какую метрику вы поставите на алерт и почему?
+4. Что даёт сокращение `timeoutSeconds` до 2 секунд, а что нет?
+
+<details><summary>Ответ</summary>
+
+1. Без сервиса ошибка приходит сразу, а молчащий вебхук держит каждый запрос до конца таймаута, поэтому всё медленнее и с ошибками.
+2. Запросы, которые вебхук не проверил. Допустимо для желательных правил (метки, значения по умолчанию), недопустимо для правил безопасности.
+3. Рост `calling_webhook_error` в `apiserver_admission_webhook_rejection_count`: он означает сбой вызова, а не отказ вебхука.
+4. Вред от сбоя ограничен двумя секундами на запрос; сам сбой не исчезает, и при `Fail` запросы по-прежнему отклоняются.
+
+</details>
+
+### Лабораторная работа 3. Namespace в Terminating из-за finalizer
+
+**Риски.** Работа создаёт и удаляет объекты только в собственном namespace. Хост и другие namespace не затрагиваются.
+
+- **Что меняется:** namespace `lab-09-2-term` с одним ConfigMap, у которого свой finalizer.
+- **Надолго ли:** до шага 4, где finalizer снимают.
+- **Безопасность:** привилегий не нужно.
+- **Влияние на систему:** namespace висит в `Terminating`, пока не снят finalizer; на остальное это не влияет.
+- **Откат:** шаг 4 или `kubectl delete ns lab-09-2-term` после снятия finalizer.
+
+**Цель.** Воспроизвести зависший namespace, прочитать причину в его условиях, найти объект с finalizer и освободить namespace.
+
+**Что понадобится.**
+
+- Стенд 00-1.
+- Около 15 минут.
+
+**Схема опыта.** ConfigMap получает finalizer, которого никто не обрабатывает. Удаление namespace доходит до этого объекта и останавливается.
+
+```
+delete ns ─► контроллер удаляет ConfigMap stuck
+                  │ есть deletionTimestamp и finalizer example.com/external-cleanup,
+                  │ владельца нет, снять некому
+                  ▼
+        namespace Terminating, conditions: NamespaceFinalizersRemaining=True
+```
+
+Схема показывает, что зависший объект останавливает весь namespace, а условия называют и тип объекта, и finalizer.
+
+#### Шаг 1. Создать namespace и объект с finalizer
+
+Создаём namespace, ConfigMap и вешаем на него finalizer с доменным именем, которое никто не обрабатывает.
 
 ```bash
 kubectl create ns lab-09-2-term
 kubectl -n lab-09-2-term create cm stuck --from-literal=a=1
-kubectl -n lab-09-2-term patch cm stuck -p '{"metadata":{"finalizers":["example.com/external-cleanup"]}}'
-kubectl delete ns lab-09-2-term --wait=false; sleep 8
+kubectl -n lab-09-2-term patch cm stuck \
+  -p '{"metadata":{"finalizers":["example.com/external-cleanup"]}}'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `create cm stuck` | ConfigMap с одним ключом |
+| `patch cm stuck -p '{"metadata":{"finalizers":[…]}}'` | записать finalizer в метаданные |
+| `example.com/external-cleanup` | имя с доменом, как требует API |
+
+Результат:
+
+```
+namespace/lab-09-2-term created
+configmap/stuck created
+configmap/stuck patched
+```
+
+Объект и его finalizer созданы. Обработчика у `example.com/external-cleanup` нет.
+
+#### Шаг 2. Удалить namespace и прочитать условия
+
+Удаляем namespace без ожидания и смотрим его состояние и условия со значением `True`.
+
+```bash
+kubectl delete ns lab-09-2-term --wait=false
+sleep 8
 kubectl get ns lab-09-2-term
-kubectl get ns lab-09-2-term -o jsonpath='{range .status.conditions[*]}{.type}={.status}: {.message}{"\n"}{end}' | grep -v '=False'
+kubectl get ns lab-09-2-term \
+  -o jsonpath='{range .status.conditions[*]}{.type}={.status}: {.message}{"\n"}{end}' \
+  | grep -v '=False'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `--wait=false` | не ждать окончания удаления |
+| `get ns` | фаза и возраст namespace |
+| `jsonpath='{range .status.conditions[*]}…'` | вывести тип, статус и сообщение каждого условия |
+| `grep -v '=False'` | оставить только условия со статусом `True` |
+
+Результат:
+
+```
+lab-09-2-term   Terminating   9s
+NamespaceContentRemaining=True: Some resources are remaining: configmaps. has 1 resource instances
+NamespaceFinalizersRemaining=True: Some content in the namespace has finalizers remaining:
+example.com/external-cleanup in 1 resource instances
+```
+
+Разбор вывода:
+
+1. `Terminating` — namespace принят на удаление, но не удалён уже девять секунд.
+2. `NamespaceContentRemaining` — остались объекты типа `configmaps`, один экземпляр.
+3. `NamespaceFinalizersRemaining` называет finalizer `example.com/external-cleanup`: по домену видно владельца.
+
+#### Шаг 3. Найти объект
+
+Условие назвало тип, но не имя. Перебираем все типы и выводим найденные объекты.
+
+```bash
 kubectl api-resources --verbs=list --namespaced -o name | xargs -n 30 | tr ' ' ',' \
   | while read t; do kubectl -n lab-09-2-term get $t --ignore-not-found -o name; done
-kubectl -n lab-09-2-term patch cm stuck --type=json -p '[{"op":"remove","path":"/metadata/finalizers"}]'
-sleep 6; kubectl get ns lab-09-2-term
 ```
 
-Проверено: вывод в §2.
+| Часть команды | Значение |
+|---|---|
+| `api-resources --verbs=list --namespaced -o name` | имена типов внутри namespace, которые умеют `list` |
+| `xargs -n 30 \| tr ' ' ','` | склеить имена по 30 через запятую |
+| `get $t --ignore-not-found -o name` | вывести имена объектов этих типов |
 
-### Шаг 4. Namespace при недоступном APIService
+Результат:
+
+```
+configmap/stuck
+```
+
+Объект один, и это наш `stuck`. В реальной системе по имени finalizer определяют владельца и сначала возвращают его.
+
+#### Шаг 4. Снять finalizer и освободить namespace
+
+Здесь владельца нет, поэтому снимаем finalizer патчем. Настоящую очистку мы не выполняем: очищать нечего.
 
 ```bash
-kubectl create ns lab-09-2-disc && kubectl -n lab-09-2-disc create cm plain --from-literal=a=1
-kubectl -n kube-system scale deploy metrics-server --replicas=0; sleep 20
-kubectl get apiservice v1beta1.metrics.k8s.io -o jsonpath='{.status.conditions[0].status} {.status.conditions[0].reason}{"\n"}'
-kubectl delete ns lab-09-2-disc --wait=false; sleep 15
+kubectl -n lab-09-2-term patch cm stuck --type=json \
+  -p '[{"op":"remove","path":"/metadata/finalizers"}]'
+sleep 6
+kubectl get ns lab-09-2-term
+```
+
+| Часть команды | Значение |
+|---|---|
+| `patch cm stuck --type=json` | точечная правка объекта |
+| `"op":"remove","path":"/metadata/finalizers"` | удалить список finalizers целиком |
+| `sleep 6` | дать контроллеру завершить удаление |
+
+Результат:
+
+```
+configmap/stuck patched
+Error from server (NotFound): namespaces "lab-09-2-term" not found
+```
+
+Разбор вывода:
+
+1. Список finalizers пуст, поэтому ConfigMap с `deletionTimestamp` исчез.
+2. Контроллер увидел пустой namespace, снял свой finalizer `kubernetes`, и namespace пропал.
+3. Мы сняли finalizer у самого объекта, а не у namespace через `/finalize`: так владелец очистки известен.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| один объект с finalizer держит весь namespace | шаг 2 |
+| условия называют тип объекта и finalizer | шаг 2 |
+| объект находят перебором типов | шаг 3 |
+| снятие finalizer освобождает namespace за секунды | шаг 4 |
+
+**Уборка.**
+
+```bash
+kubectl get ns lab-09-2-term
+```
+
+Namespace уже удалён; команда должна ответить `NotFound`. Если он завис по другой причине, повторите шаги 2 и 3.
+
+**Вопросы для самопроверки.**
+
+1. Какое условие называет finalizer, и что по нему можно понять?
+2. Почему снятие finalizer у объекта лучше, чем у namespace через `/finalize`?
+3. Что нужно сделать до снятия finalizer на реальном объекте?
+
+<details><summary>Ответ</summary>
+
+1. `NamespaceFinalizersRemaining`; домен в имени finalizer показывает владельца (оператор, Argo CD, облачный контроллер).
+2. Объект исчезает вместе со своей записью, а через `/finalize` объекты остаются в хранилище без очистки.
+3. Определить владельца, вернуть его или выполнить очистку вручную, чтобы внешние ресурсы не остались.
+
+</details>
+
+### Лабораторная работа 4. Недоступный APIService и удаление namespace
+
+**Риски.** Работа выключает metrics-server стенда в `kube-system` на пару минут.
+
+- **Что меняется:** число реплик Deployment `metrics-server` падает до 0 и возвращается к 1; создаётся namespace `lab-09-2-disc`.
+- **Надолго ли:** на 1–2 минуты; пока metrics-server выключен, не работают `kubectl top` и HPA (05-4).
+- **Безопасность:** привилегий не нужно, кроме прав администратора стенда.
+- **Влияние на систему:** метрики узлов и подов недоступны; поды и сервисы работают как раньше.
+- **Откат:** `kubectl -n kube-system scale deploy metrics-server --replicas=1`; он же выполняется на шаге 3.
+
+**Цель.** Проверить на стенде, как недоступный APIService влияет на удаление namespace, и сравнить с описанием в литературе (§5).
+
+**Что понадобится.**
+
+- Стенд 00-1 с работающим metrics-server.
+- Около 10 минут.
+
+**Схема опыта.** Выключаем metrics-server, APIService метрик становится недоступным, и удаляем namespace.
+
+```
+metrics-server: 0 реплик ─► APIService v1beta1.metrics.k8s.io: Available=False
+                                    │
+        delete ns ─► discovery группы metrics.k8s.io не отвечает ─► зависнет ли namespace?
+```
+
+Схема показывает цепочку, которую описывает литература; результат шага 2 покажет, срабатывает ли она на стенде.
+
+#### Шаг 1. Выключить metrics-server
+
+Создаём namespace с ConfigMap, затем выключаем metrics-server и читаем состояние APIService.
+
+```bash
+kubectl create ns lab-09-2-disc
+kubectl -n lab-09-2-disc create cm plain --from-literal=a=1
+kubectl -n kube-system scale deploy metrics-server --replicas=0
+sleep 20
+kubectl get apiservice v1beta1.metrics.k8s.io \
+  -o jsonpath='{.status.conditions[0].status} {.status.conditions[0].reason}{"\n"}'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `scale deploy metrics-server --replicas=0` | остановить все поды metrics-server |
+| `get apiservice v1beta1.metrics.k8s.io` | APIService, который регистрирует API метрик |
+| `jsonpath='{.status.conditions[0]…}'` | статус и причина первого условия |
+
+Результат:
+
+```
+False MissingEndpoints
+```
+
+APIService недоступен (`False`), потому что у его сервиса нет подов (`MissingEndpoints`).
+
+#### Шаг 2. Удалить namespace
+
+Удаляем namespace и смотрим, исчез ли он.
+
+```bash
+kubectl delete ns lab-09-2-disc --wait=false
+sleep 15
 kubectl get ns lab-09-2-disc
-kubectl -n kube-system scale deploy metrics-server --replicas=1
-kubectl -n kube-system rollout status deploy/metrics-server; sleep 20; kubectl top nodes
 ```
 
-Проверено: `False MissingEndpoints`, namespace удалён без ожидания (§2), после возврата metrics-server `kubectl top` работает.
+Результат:
 
-### Уборка
+```
+Error from server (NotFound): namespaces "lab-09-2-disc" not found
+```
+
+Разбор вывода:
+
+1. Namespace исчез за 15 секунд, хотя APIService недоступен.
+2. По описанию в литературе и по коду контроллера namespace должен был остаться в `Terminating` с условием `NamespaceDeletionDiscoveryFailure` (§5). На стенде (Kubernetes 1.36.1) этого не произошло.
+3. Причину расхождения мы не выяснили, поэтому не рассчитывайте на такое поведение в другом кластере.
+
+#### Шаг 3. Вернуть metrics-server
+
+Включаем metrics-server обратно, дожидаемся готовности и проверяем метрики.
 
 ```bash
-kubectl delete ns lab-09-2 lab-09-2-hook
-kubectl get validatingwebhookconfiguration lab-policy 2>&1 | tail -1      # NotFound
+kubectl -n kube-system scale deploy metrics-server --replicas=1
+kubectl -n kube-system rollout status deploy/metrics-server
+sleep 20
+kubectl top nodes
 ```
 
----
+| Часть команды | Значение |
+|---|---|
+| `scale … --replicas=1` | вернуть одну реплику |
+| `rollout status` | дождаться готовности пода |
+| `sleep 20` | дать APIService стать доступным |
+| `top nodes` | проверить, что метрики узлов снова отдаются |
 
-## 🔥 Кейс из прода: «упал сервис вебхука — никто не может задеплоить»
+Ожидаемый результат (строки по узлам с числами вашего стенда):
 
-**Контекст.** В кластере стоял policy-engine (вебхук, одна реплика, `failurePolicy: Fail`, правила на все поды во всех namespace, `timeoutSeconds: 30`). Узел с его подом перезагрузился. Через минуту: CI получает `failed calling webhook` на каждом деплое, HPA не может создать поды, а сам под policy-engine не может подняться — его создание тоже идёт через собственный вебхук.
+```
+deployment "metrics-server" successfully rolled out
+NAME                CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)
+lab-control-plane   …
+```
 
-**Разбор.**
-1. События ReplicaSet'ов по всему кластеру: `Error creating: Internal error occurred: failed calling webhook …` (шаг 1 лабы — то же сообщение).
-2. Вебхук охватывал и свой namespace, и `kube-system` — взаимная блокировка.
-3. Каждый запрос ждал 30 с таймаута — apiserver под нагрузкой ретраев от контроллеров, `kubectl` «висит».
+Если `top nodes` сначала отвечает ошибкой, подождите ещё 20 секунд: APIService восстанавливается не мгновенно.
 
-**Фикс.**
-- Немедленно: `kubectl delete validatingwebhookconfiguration <policy>` → поды поднялись, затем конфигурацию вернули.
-- `namespaceSelector`, исключающий `kube-system` и namespace самого вебхука; `timeoutSeconds: 5`; 3 реплики, PDB, PriorityClass.
-- `failurePolicy: Fail` — только для правил безопасности; остальные правила — `Ignore` или перенос в ValidatingAdmissionPolicy (06-3).
-- Алерт на `calling_webhook_error` и runbook «вебхук блокирует кластер» в два шага.
+**Итог.**
 
-**Что запомнить.**
-- Вебхук с `Fail` на все поды — единая точка отказа всего кластера.
-- Вебхук не должен действовать на собственный namespace и системные.
-- Аварийный выход — удалить конфигурацию вебхука (cluster-scoped, через вебхуки не проходит).
+| Что узнали | Где видно |
+|---|---|
+| выключенный metrics-server делает APIService `Available=False` | шаг 1 |
+| на стенде 1.36.1 namespace удалился несмотря на недоступный APIService | шаг 2 |
+| этому нельзя доверять: код контроллера и литература говорят о зависании | шаг 2, §5 |
+| после возврата metrics-server метрики работают | шаг 3 |
 
----
+**Уборка.**
 
-## 💼 Вопросы с собеседования
+```bash
+kubectl get ns lab-09-2-disc
+kubectl -n kube-system get deploy metrics-server
+```
 
-### 🟢 Junior
+Первая команда должна ответить `NotFound`, во второй `READY` равно `1/1`. Если реплик 0, выполните `scale` из шага 3.
 
-**1. Что такое admission webhook?**
-HTTPS-сервис, который apiserver вызывает при создании/изменении объектов: mutating может изменить объект, validating — разрешить или запретить. Так работают инжекторы sidecar'ов и движки политик.
+**Вопросы для самопроверки.**
 
-**2. Что такое finalizer?**
-Строка в `metadata.finalizers`: объект не удалится, пока её не снимет контроллер после очистки (01-3).
+1. Как проверить, нет ли недоступных APIService, когда namespace завис без видимых объектов?
+2. Что показала работа и чего она не показала?
+3. Какое условие namespace указывает на проблему discovery?
 
-### 🟡 Middle
+<details><summary>Ответ</summary>
 
-**3. Чем опасен `failurePolicy: Fail`?**
-Если вебхук недоступен или тормозит, все попадающие под правило запросы к API отказываются (или ждут таймаут до 30 с). Без исключений для системных namespace и своего — взаимная блокировка кластера.
+1. Выполнить `kubectl get apiservice` и найти `False` в столбце `AVAILABLE`; затем чинить сервис за APIService или удалить его объект.
+2. Показала, что на стенде 1.36.1 с выключенным metrics-server namespace удаляется. Не показала, зависает ли namespace с другим недоступным APIService, и не объяснила причину расхождения.
+3. `NamespaceDeletionDiscoveryFailure` в `status.conditions`.
 
-**4. Namespace висит в Terminating. Ваши действия?**
-`kubectl get ns <ns> -o yaml` → `status.conditions`: какие объекты остались и какие finalizer'ы их держат (или ошибка discovery). Найти объекты перебором listable-типов, понять, чей finalizer, вернуть контроллер или выполнить очистку, и только потом снимать finalizer руками.
-
-**5. Как временно выключить сломанный вебхук?**
-Удалить или исправить `ValidatingWebhookConfiguration`/`MutatingWebhookConfiguration` — они cluster-scoped и не проходят через вебхуки. Затем вернуть с исправлением.
-
-### 🔴 Senior
-
-**6. Как спроектировать надёжный admission webhook?**
-2+ реплики с PDB и PriorityClass, anti-affinity; селекторы, исключающие системные namespace и свой; `matchConditions` для отсечения лишних вызовов; `timeoutSeconds` 2–5; `failurePolicy` по критичности правила; TLS и `caBundle` через cert-manager; метрики латентности и ошибок вызовов; для простых проверок — ValidatingAdmissionPolicy без сетевого вызова.
-
-**7. Почему нельзя «просто» снять finalizer с namespace через `/finalize`?**
-Namespace исчезнет из API, но объекты в нём останутся в etcd без очистки (внешние ресурсы — LB, диски — тоже). При повторном создании namespace с тем же именем они «оживут». Корректно — устранить причину: вернуть контроллер finalizer'а или APIService.
+</details>
 
 ---
 
-## ⚠️ Подводные камни
+## → Дальше
 
-- Вебхук на все поды без исключений блокирует собственный подъём и системные компоненты.
-- `timeoutSeconds` по умолчанию 10 с — каждый запрос ждёт столько при недоступном вебхуке.
-- Ошибки вебхуков у подов контроллеров — в событиях ReplicaSet/Job.
-- Удаление оператора раньше его CR оставляет finalizer'ы, которые некому снять.
-- Снятие finalizer'а оставляет внешние ресурсы (диски, LB), за которые платят.
-- `/finalize` для namespace бросает объекты в etcd.
-- busybox-`nc` для имитации зависшего сервиса закрывает соединение без открытого stdin.
-- Mutating webhook может сделать объект несовместимым с последующими validating-проверками (06-3 §5).
-
----
-
-## Чеклист
-
-- [ ] Опишу вебхук с селекторами, таймаутом и политикой отказа и объясню выбор.
-- [ ] Найду, какой вебхук блокирует запросы, по ошибке и метрикам.
-- [ ] Аварийно отключу вебхук и верну его.
-- [ ] Разберу namespace в Terminating по его conditions.
-- [ ] Объясню правильный порядок удаления оператора и его объектов.
-
----
-
-## Задание со звёздочкой
-
-Напишите работающий validating webhook без кода на компилируемом языке:
-
-1. Сервер на Python (`http.server` + `ssl`) в поде: принимает `AdmissionReview`, запрещает поды без метки `team`, отвечает `allowed: false` с понятным `status.message`.
-2. Сертификат для `policy-webhook.<ns>.svc` выпустите cert-manager'ом (03-4) и подставьте `caBundle` аннотацией `cert-manager.io/inject-ca-from`.
-3. Включите вебхук с `failurePolicy: Fail` для namespace с меткой, проверьте отказ и пропуск.
-4. Перепишите то же правило как ValidatingAdmissionPolicy (06-3) и сравните: строки кода, задержка, что будет при падении пода.
-
----
-
-→ Следующая часть: **10-2. Обновление кластера** — модуль «Эксплуатация кластера»: version skew, `kubeadm upgrade plan/apply` под нагрузкой, удалённые API, обновление kubelet по узлам. Часть 10-1 в этой версии курса не опубликована (00-plan §0).
+Эта часть закрывает модуль «Расширение API»: вы увидели, как чужой код на пути записи и на пути удаления способен остановить кластер и чем его отключать. Следующая часть, 10-1, начинает модуль эксплуатации со сборки кластера из компонентов control plane. Она идёт следующей потому, что теперь понятно, какую ответственность несёт API-сервер, и можно разобрать, как его запускают, соединяют с etcd и защищают сертификатами.
