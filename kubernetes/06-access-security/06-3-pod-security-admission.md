@@ -80,7 +80,7 @@ Admission состоит из двух фаз, и порядок фаз важе
 | baseline | privileged-контейнеры, host-пространства имён, hostPath, лишние capabilities | обычные приложения |
 | restricted | non-root, seccomp, drop ALL, запрет повышения привилегий | чувствительные нагрузки |
 
-Список в baseline включает ещё порты хоста, профили AppArmor и SELinux вне разрешённых, смонтированный `/proc` и ограниченный набор sysctl. Начиная с Kubernetes 1.34 baseline запрещает и поле `host` в `httpGet` и `tcpSocket` проб и хуков жизненного цикла: через него проба била в произвольный адрес, а не в под. Restricted требует `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` и `seccompProfile` типа `RuntimeDefault` или `Localhost`. Смысл этих полей объяснён в 06-2.
+Список в baseline включает ещё порты хоста, профили AppArmor и SELinux вне разрешённых, смонтированный `/proc` и ограниченный набор sysctl. С Kubernetes 1.34 baseline запрещает и поле `host` в `httpGet` и `tcpSocket` проб и хуков. Через это поле проба или хук бьёт в произвольный адрес, а не в под. Restricted требует `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]` и `seccompProfile` типа `RuntimeDefault` или `Localhost`. Смысл этих полей объяснён в 06-2.
 
 ### Pod Security Admission: метки namespace
 
@@ -160,7 +160,7 @@ ValidatingAdmissionPolicy        ValidatingAdmissionPolicyBinding
 | Генерация объектов | нет | да | нет |
 | Внешние данные | нет | да | ограниченно |
 
-Таблица строится по документации проектов; версии и режимы зависят от установки, поэтому детали проверяйте в курсе `security`. Практический вывод простой: простые правила по полям объекта пишут на CEL внутри API-сервера, а за генерацией объектов, проверкой подписей образов и обращением к внешним данным идут в Kyverno или Gatekeeper.
+Таблица строится по документации проектов; версии и режимы зависят от установки, поэтому детали проверяйте в курсе `security`. Практический вывод простой. Правила по полям объекта пишут на CEL внутри API-сервера, а за генерацией объектов, проверкой подписей и внешними данными идут в Kyverno или Gatekeeper.
 
 ---
 
@@ -555,12 +555,13 @@ kubectl -n lab-06-3b run hostnet --image=busybox:1.37 \
 | `--overrides='{"spec":{"hostNetwork":true}}'` | добавить в спецификацию сеть узла |
 | `-- sleep 60` | команда контейнера: спать 60 секунд |
 
-Результат (строки сокращены `…`):
+Результат (строки сокращены `…` и перенесены):
 
 ```
 Warning: would violate PodSecurity "restricted:latest": allowPrivilegeEscalation != false …
 pod/plain created
-Error from server (Forbidden): … violates PodSecurity "baseline:latest": host namespaces (hostNetwork=true)
+Error from server (Forbidden): … violates PodSecurity "baseline:latest":
+host namespaces (hostNetwork=true)
 ```
 
 Разбор:
@@ -589,8 +590,10 @@ kubectl label --dry-run=server --overwrite ns orders \
 Результат:
 
 ```
-Warning: existing pods in namespace "orders" violate the new PodSecurity enforce level "restricted:latest"
-Warning: orders-api-7f45b67f95-c47t8 (and 2 other pods): allowPrivilegeEscalation != false, unrestricted capabilities, runAsNonRoot != true, seccompProfile
+Warning: existing pods in namespace "orders" violate the new PodSecurity
+enforce level "restricted:latest"
+Warning: orders-api-7f45b67f95-c47t8 (and 2 other pods):
+allowPrivilegeEscalation != false, unrestricted capabilities, runAsNonRoot != true, seccompProfile
 namespace/orders labeled (server dry run)
 ```
 
@@ -718,7 +721,8 @@ kubectl -n lab-06-3b run w1 --image=busybox -- sleep 60
 Результат:
 
 ```
-Warning: Validation failed for ValidatingAdmissionPolicy 'no-latest-tag' with binding 'no-latest-tag': образ без тега или с :latest запрещён: busybox
+Warning: Validation failed for ValidatingAdmissionPolicy 'no-latest-tag' with binding
+'no-latest-tag': образ без тега или с :latest запрещён: busybox
 ```
 
 Разбор:
@@ -753,7 +757,8 @@ done
 Результат:
 
 ```
-busybox                       -> … ValidatingAdmissionPolicy 'no-latest-tag' with binding 'no-latest-tag' denied request
+busybox                       -> … ValidatingAdmissionPolicy 'no-latest-tag' with binding
+                                 'no-latest-tag' denied request
 busybox:latest                -> … denied request
 busybox:1.37                  -> pod/… created
 localhost:5001/orders-api:2.0 -> pod/… created
@@ -990,4 +995,4 @@ kubectl delete ns lab-06-3c lab-06-3 lab-06-3b
 
 ## → Дальше
 
-Мы научились решать, какой объект кластер примет и как его изменит, но пока не знаем, кто и когда эти решения принимал. Следующая часть, 06-4, добавляет журнал: аудит API-сервера записывает запросы и аннотации нарушений, которые мы здесь упоминали. На него же опираются политики образов: разрешённые реестры, дайджесты и проверка подписи, где те же VAP и вебхуки работают с содержимым, а не с полями пода.
+Мы научились решать, какой объект кластер примет и как его изменит, но пока не знаем, кто и когда эти решения принимал. Следующая часть, 06-4, добавляет журнал: аудит API-сервера записывает запросы и аннотации нарушений, которые мы здесь упоминали. На него опираются и политики образов: разрешённые реестры, дайджесты и проверка подписи.

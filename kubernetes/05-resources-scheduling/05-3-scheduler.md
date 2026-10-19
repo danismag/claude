@@ -77,7 +77,9 @@ Scheduler решает при создании пода и больше его �
 | VolumeBinding | том доступен на узле | близость к тому |
 | DynamicResources | устройство для claim есть | нет |
 
-Если кандидатов много, scheduler оценивает не все. Параметр `percentageOfNodesToScore` по умолчанию подбирается сам: в кластере меньше 100 узлов проверяются все узлы, в большом доля падает до 5 %. Узел для оценки отбирается по кругу, чтобы нагрузка не липла к началу списка.
+Оценку NodeResourcesFit задаёт стратегия в конфигурации scheduler. По умолчанию это `LeastAllocated`: под идёт на узел, где requests заняли меньшую долю. Обратная стратегия `MostAllocated` плотно упаковывает поды (bin packing), чтобы освободить узлы для автомасштабирования (05-4).
+
+Если кандидатов много, scheduler оценивает не все. Параметр `percentageOfNodesToScore` по умолчанию подбирается сам, и в кластере меньше 100 узлов проверяются все узлы. В большом кластере доля равна 50 % минус процент на каждые 125 узлов, но не ниже 5 % и не меньше 100 узлов. Узел для оценки отбирается по кругу, чтобы нагрузка не липла к началу списка.
 
 ### Повторные попытки и подсказки QueueingHints
 
@@ -153,8 +155,8 @@ spec:
 Разбор: первая секция связывает имя `gpu` с шаблоном, вторая даёт контейнеру устройство из этой заявки. Остальные возможности DRA собраны в §6 с версиями, а здесь важны три:
 
 - **Prioritized list** — запрос с перечнем запасных вариантов: scheduler берёт первый, который можно выделить (GA в 1.36).
-- **Extended resource** — класс получает `extendedResourceName`, и под просит устройство старым способом `example.com/gpu: 2` (GA в 1.37).
-- **Device taints** — taint на устройстве работает как taint на узле: NoSchedule не пускает новые поды, NoExecute выселяет работающие (GA в 1.37).
+- **Extended resource** — класс получает `extendedResourceName`, и под просит устройство старым способом `example.com/gpu: 2` (в 1.36 beta, GA в 1.37).
+- **Device taints** — taint на устройстве работает как taint на узле: NoSchedule не пускает новые поды, NoExecute выселяет работающие (в 1.36 beta, GA в 1.37).
 
 Одно ограничение стоит запомнить: scheduler не вытесняет работающие поды ради устройства. Под с высоким приоритетом остаётся Pending, пока устройство не освободится.
 
@@ -265,6 +267,8 @@ tolerations:
 2. `effect` ограничивает toleration одним эффектом; без него она подходит ко всем.
 3. `tolerationSeconds` работает только с `NoExecute`: под остаётся на узле 20 секунд после появления taint и затем выселяется.
 
+В 1.35 появились операторы `Gt` и `Lt` для сравнения числовых значений taint, но в 1.36 они в alpha и выключены (гейт `TaintTolerationComparisonOperators`).
+
 Системные taint'ы ставит сам Kubernetes: `node.kubernetes.io/not-ready` и `unreachable` (01-2; под терпит их 300 секунд), `memory-pressure`, `disk-pressure` и `pid-pressure` (05-5), `unschedulable` при cordon и `node-role.kubernetes.io/control-plane`. Свои taint'ы называют с префиксом организации, например `dedicated=db:NoSchedule`.
 
 ### Важнее других: PriorityClass и вытеснение
@@ -363,7 +367,7 @@ anti-affinity rules. no new claims to deallocate, preemption: 0/4 nodes are avai
 | didn't match Pod's node affinity/selector | нет подходящей метки узла | get nodes --show-labels |
 | didn't match pod anti-affinity rules | узлы заняты подами из правила | селектор правила |
 | didn't match pod topology spread constraints | нарушится maxSkew | §5, правило spread |
-| had volume node affinity conflict | том привязан к другому узлу | 04-2 |
+| didn't match PersistentVolume's node affinity | том привязан к другому узлу | 04-2 |
 | Too many pods | достигнут лимит подов на узле | maxPods kubelet, 110 |
 
 Если событий нет совсем, причину ищут не в правилах: scheduler остановлен (01-1), в `schedulerName` опечатка, и под ждёт несуществующий scheduler, или под в состоянии `SchedulingGated`.
@@ -384,11 +388,11 @@ Rollout Deployment с жёстким spread по узлам может зави�
 
 Схема 4. Счёт доменов при зависшем rollout: нулевой минимум на control-plane не даёт поставить четвёртый под ни на один worker.
 
-Способов лечения три. `matchLabelKeys: [pod-template-hash]` считает поды отдельно для каждой ревизии: старые не мешают новым. `nodeTaintsPolicy: Honor` исключает control-plane из доменов, и минимум становится равен 1. Третий вариант, `maxSurge: 0` с `maxUnavailable: 1`, обходит ловушку, но снижает доступность на время обновления. В лабораторной работе 2 проверены `matchLabelKeys` и зависание, а `Honor` — в работе 5.
+Способов лечения три. `matchLabelKeys: [pod-template-hash]` считает поды отдельно для каждой ревизии: старые не мешают новым. `nodeTaintsPolicy: Honor` исключает control-plane из доменов, и минимум становится равен 1. Третий вариант, `maxSurge: 0` с `maxUnavailable: 1`, обходит ловушку, но снижает доступность на время обновления. Работа 2 воспроизводит зависание и лечение через `matchLabelKeys`, а `Honor` разобран в работе 5.
 
 ### Узел с taint'ом остаётся доменом
 
-Вариант той же ловушки встречается при отказе узла (01-2). Отказавший узел получает taint `unreachable`, но при `Ignore` остаётся доменом без подов. Замена пода на другом узле нарушает перекос и висит в Pending, пока узел не вернётся. `nodeTaintsPolicy: Honor` убирает такие узлы из расчёта.
+Вариант той же ловушки встречается при отказе узла (01-2). Отказавший узел получает taint `unreachable`, но при `Ignore` остаётся доменом. Поды на нём после выселения в счёт не входят, потому что плагин не считает поды в состоянии удаления, и домен становится пустым. Замена пода на другом узле нарушает перекос и висит в Pending, пока узел не вернётся. `nodeTaintsPolicy: Honor` убирает такие узлы из расчёта.
 
 ### Вытеснение и каскады
 
@@ -410,7 +414,7 @@ Rollout Deployment с жёстким spread по узлам может зави�
 - **Системные классы** — `system-cluster-critical` 2000000000, `system-node-critical` 2000001000.
 - **Toleration от admission** — `not-ready` и `unreachable` с `tolerationSeconds` 300 (01-2).
 - **Очередь отсрочки** — пауза от 1 до 10 секунд, неподходящий под возвращается не позже чем через 5 минут.
-- **Выборка узлов** — кластер до 100 узлов оценивается целиком.
+- **Выборка узлов** — кластер меньше 100 узлов оценивается целиком, в большом — не меньше 100 узлов и 5 %.
 
 ### Статус функций
 
@@ -427,11 +431,11 @@ Rollout Deployment с жёстким spread по узлам может зави�
 | Prioritized list, admin access | GA | 1.36 |
 | Extended resource, device taints (DRA) | GA | 1.37 |
 
-Версия 1.37 на стенд не берётся. Функции DRA из последней строки на стенде 1.36 находятся в beta и включены, но без устройств проверить их нельзя.
+Версия 1.37 на стенд не берётся. Функции DRA из последней строки на стенде 1.36 находятся в beta и включены, кроме объекта DeviceTaintRule: он в beta выключен. Без устройств проверить их нельзя.
 
 ### Чего планировщик не делает
 
-Scheduler не перепланирует работающие поды, не измеряет нагрузку и не вытесняет поды ради устройств DRA. Групповое планирование (**gang scheduling**, когда все поды задания стартуют вместе или никто) в ядре Kubernetes пока в beta. Для заданий машинного обучения его дают очереди вроде Kueue. Перекос после массовых операций исправляют descheduler с политикой `RemovePodsViolatingTopologySpreadConstraint` или rollout.
+Scheduler не перепланирует работающие поды, не измеряет нагрузку и не вытесняет поды ради устройств DRA. Групповое планирование (**gang scheduling**) запускает все поды задания вместе или ни одного. В 1.36 оно есть только как alpha и выключено, а в 1.37 перешло в beta. Для заданий машинного обучения его дают очереди вроде Kueue. Перекос после массовых операций исправляют descheduler с политикой `RemovePodsViolatingTopologySpreadConstraint` или rollout.
 
 ---
 
@@ -973,7 +977,7 @@ k delete pod t-new --now
 | `k run t-new` | новый под, закреплённый за тем же узлом |
 | `delete pod t-new --now` | убрать Pending-под сразу |
 
-Результат (сокращён):
+Результат (сокращён до имени и статуса):
 
 ```
 t-new Pending
@@ -1075,6 +1079,7 @@ Taint'ы должны остаться только у control-plane.
 **Что понадобится.**
 
 - Стенд 00-1, три worker'а, namespace `lab-05-3`.
+- Хост с 12 CPU; при другом числе CPU замените запрос 10 на число CPU хоста минус 2.
 - Около 10 минут.
 
 **Схема опыта.** Три пода `batch` с низким приоритетом занимают по 10 CPU на worker'е (kind показывает каждому узлу все 12 CPU хоста, 05-1). Под `critical` с высоким приоритетом просит те же 10 CPU.
@@ -1161,9 +1166,9 @@ k run critical --image=registry.k8s.io/pause:3.10 --overrides='{"spec":{
   "priorityClassName":"lab-05-3-high","containers":[{"name":"critical",
   "image":"registry.k8s.io/pause:3.10","resources":{"requests":{"cpu":"10"}}}]}}'
 k wait --for=condition=Ready pod/critical
+k get pod critical -o wide
 k get events --field-selector reason=Preempted \
   -o custom-columns=OBJ:.involvedObject.name,MSG:.message
-k get pods -l app=batch
 ```
 
 Разбор команд:
@@ -1171,30 +1176,51 @@ k get pods -l app=batch
 | Часть команды | Значение |
 |---|---|
 | `priorityClassName: lab-05-3-high` | под принадлежит высокому классу |
-| `k wait --for=condition=Ready` | ждать запуска под |
+| `k wait --for=condition=Ready` | ждать запуска пода |
+| `get pod critical -o wide` | на каком узле встал под |
 | `reason=Preempted` | события вытеснения |
-| `get pods -l app=batch` | что стало с низкоприоритетными подами |
 
-Результат (сокращён):
+Результат (сокращён до значимых полей):
 
 ```
-critical Ready after 1s on lab-worker3
+critical       lab-worker3
 batch-55c5fc9bfc-drfgg   Preempted by pod d93570d8-… on node lab-worker3
-batch-55c5fc9bfc-9x8g8   Pending — 3 Insufficient cpu … No preemption victims found …
 ```
 
 Разбор вывода:
 
-1. `critical` стал готовым за 1 секунду на `lab-worker3`: удаление одного пода `batch` освободило 10 CPU.
-2. Событие `Preempted` называет вытесненный под, под-вытеснитель и узел.
-3. Замена вытесненного пода висит Pending: `Insufficient cpu` на трёх worker'ах, а вытеснять некого — у `batch` самый низкий приоритет.
+1. `critical` встал на `lab-worker3`: удаление одного пода `batch` освободило там 10 CPU.
+2. Событие `Preempted` называет вытесненный под, под-вытеснитель (по UID) и узел.
+
+Теперь посмотрим на замену вытесненного пода и прочитаем её событие.
+
+```bash
+k get pods -l app=batch
+P=$(k get pods -l app=batch --field-selector=status.phase=Pending -o name | head -1)
+k get events \
+  --field-selector involvedObject.name=${P#pod/},reason=FailedScheduling \
+  -o jsonpath='{.items[-1:].message}{"\n"}'
+```
+
+Результат (сокращён):
+
+```
+batch-55c5fc9bfc-9x8g8   0/1   Pending   …
+… 3 Insufficient cpu … 1 No preemption victims found for incoming pod …
+```
+
+Разбор вывода:
+
+1. ReplicaSet создал замену `9x8g8`, и она висит Pending.
+2. `3 Insufficient cpu` — на трёх worker'ах не хватает CPU.
+3. `No preemption victims found` — вытеснять некого: у `batch` самый низкий приоритет.
 
 **Итог.**
 
 | Что делали | Что увидели | Вывод |
 |---|---|---|
 | Три `batch` по 10 CPU | узлы заполнены | вытеснение нужно, когда места нет |
-| `critical` с большим приоритетом | готов за 1 с, один batch вытеснен | жертва — под с меньшим приоритетом |
+| `critical` с большим приоритетом | встал, один batch вытеснен | жертва — под с меньшим приоритетом |
 | Событие `Preempted` | указан под-вытеснитель | вытеснение видно в событиях |
 | Замена вытесненного пода | Pending | вытеснение не создаёт места навсегда |
 

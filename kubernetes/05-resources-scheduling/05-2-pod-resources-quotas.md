@@ -98,9 +98,7 @@ Pod  spec.resources: requests 200m / 100Mi,  limits memory 200Mi
 
 Если заданы оба уровня, запрос и лимит пода приоритетнее, а контейнер без своих ресурсов ограничен только бюджетом пода. QoS-класс тоже определяется по уровню пода, когда он задан. Под получает Guaranteed, если и для CPU, и для памяти запрос пода равен лимиту. Если в `spec.resources` для ресурса нет запроса или лимита, класс будет Burstable, даже когда у контейнеров запросы равны лимитам.
 
-### Правила сочетания уровней
-
-API проверяет сочетание уровней при создании пода и при каждом resize, поэтому ошибка приходит сразу. Правил четыре.
+Сочетание уровней API проверяет при создании пода и при каждом resize, поэтому ошибка приходит сразу. Правил четыре.
 
 - **Запросы.** Сумма запросов контейнеров не может быть больше запроса пода.
 - **Лимиты.** Лимит любого контейнера не может быть больше лимита пода, а сумма лимитов контейнеров может: так контейнеры делят бюджет.
@@ -335,7 +333,7 @@ kubectl get pod shared -o jsonpath="$T"
 2. `pod=` — запрос и лимит на весь под; пусто, если `spec.resources` не задан.
 3. `overhead=` — накладные расходы из RuntimeClass; на стенде kind пусто.
 
-Неявный лимит контейнера в spec не попадает, поэтому его читают из cgroup контейнера: `kubectl exec <под> -c <контейнер> -- cat /sys/fs/cgroup/memory.max`. Занятость узла по requests показывает `describe node`, его разбор — в 05-1 §4.
+Неявный лимит контейнера в spec не попадает, поэтому его читают через `kubectl exec` из файла `/sys/fs/cgroup/memory.max` нужного контейнера. Занятость узла по requests показывает `describe node`, его разбор — в 05-1 §4.
 
 ### Квоты и LimitRange
 
@@ -391,7 +389,7 @@ kubectl get pod shared -o jsonpath="$T"
 
 Если под получил `Failed` и `reason: Evicted`, а в колонке STATUS стоит `Error`, ищите причину в `status.message`: `Pod ephemeral local storage usage exceeds the total limit of containers …`. Возможны два источника: лимит самого пода или давление диска на узле (05-5).
 
-Пороги выселения по давлению диска по умолчанию (Linux): `nodefs.available<10%`, `imagefs.available<15%`, `nodefs.inodesFree<5%`. Диск заполняют обычно логи без ротации, слой записи контейнера и `emptyDir` без `sizeLimit`.
+Пороги выселения по давлению диска по умолчанию (Linux): `nodefs.available<10%`, `imagefs.available<15%`, `nodefs.inodesFree<5%` и `imagefs.inodesFree<5%`. Диск заполняют обычно логи без ротации, слой записи контейнера и `emptyDir` без `sizeLimit`.
 
 ---
 
@@ -406,10 +404,12 @@ kubectl get pod shared -o jsonpath="$T"
 - Меняются только CPU и память; QoS-класс не меняется никогда.
 - Запрос сверх allocatable узла в 1.36 отклоняется на admission.
 - Resize ресурсов пода (`InPlacePodLevelResourcesVerticalScaling`) — beta, включён с 1.36.
+- Resize работающего обычного init-контейнера — beta в 1.36, GA в 1.37.
 
 ### Ресурсы пода и swap
 
 - PodLevelResources — beta с 1.34, включено по умолчанию; ресурсы — CPU, память, hugepages; Windows не поддерживается.
+- CPU Manager, Memory Manager и Topology Manager учитывают ресурсы пода только с гейтом `PodLevelResourceManagers` (alpha в 1.36, выключен).
 - NodeSwap — stable с 1.34; по умолчанию `swapBehavior: NoSwap`, а kubelet не стартует с swap без `failSwapOn: false`.
 - Swap получают только Burstable-поды в режиме `LimitedSwap`.
 - Kernel 6.3 и новее нужен для опции `noswap` у tmpfs.
@@ -418,14 +418,16 @@ kubectl get pod shared -o jsonpath="$T"
 
 - Квот и LimitRange в namespace нет, пока вы их не создали.
 - Квота не меняет уже созданные объекты, а LimitRange не проверяет работающие поды.
-- Область BestEffort допускает только оператор `Exists`.
+- Области `Terminating`, `NotTerminating`, `BestEffort` и `NotBestEffort` допускают только оператор `Exists`.
+- Для расширенных ресурсов квота принимает только ключи с префиксом `requests.`.
 - Один LimitRange на namespace; несколько дают непредсказуемые значения по умолчанию.
-- Максимум подов на узел в kind — 110 (поле `pods` в allocatable).
+- Число подов на узле по умолчанию ограничено 110 (параметр kubelet `maxPods`, поле `pods` в allocatable); квота `pods` считает поды namespace, а не узла.
 
 ### Диск
 
 - Выселение по лимиту пода срабатывает после периодического измерения kubelet: на стенде это заняло около 20–25 секунд.
-- Пороги hard eviction по умолчанию: `nodefs.available<10%`, `imagefs.available<15%`, `nodefs.inodesFree<5%`, `memory.available<100Mi`.
+- Пороги проверяются раз в `housekeeping-interval`, по умолчанию 10 секунд.
+- Пороги hard eviction по умолчанию (Linux): `memory.available<100Mi`, `nodefs.available<10%`, `imagefs.available<15%`, `nodefs.inodesFree<5%`, `imagefs.inodesFree<5%`.
 - `emptyDir` в памяти считается как память пода, а не как диск.
 
 ---
@@ -823,70 +825,27 @@ kubectl delete pod shared --now
 
 </details>
 
-### Лабораторная работа 3. Requests, квота, LimitRange и ephemeral storage
+### Лабораторная работа 3. Квота, LimitRange и ephemeral storage
 
-**Цель.** Увидеть, что scheduler смотрит на requests, а не на limits, а квота требует ресурсов и режет реплики. Проверить, что LimitRange подставляет значения, а под с превышенным лимитом диска выселяется.
+**Цель.** Увидеть, что квота требует ресурсов у каждого пода и режет реплики, LimitRange подставляет значения и проверяет границы, а под с превышенным лимитом диска выселяется.
 
-**Что понадобится.** Namespaces `lab-05-2` и `lab-05-2q`, образ `python:3.12-slim`. Шаг 4 пишет 100 МиБ в слой записи контейнера на узле kind и удаляет их при выселении.
+**Что понадобится.** Namespaces `lab-05-2` и `lab-05-2q`, образ `python:3.12-slim`. Шаг 3 пишет 100 МиБ в слой записи контейнера на узле kind и удаляет их при выселении.
 
 **Схема опыта.**
 
 ```
-шаг 1  big (requests 20Gi) → Pending      greedy (requests 64Mi, limits 40Gi) → Running
-шаг 2  квота без LimitRange → отказ       шаг 3  LimitRange → под создан, Deployment 7/12
-шаг 4  disk (limit 50Mi, пишет 100Mi) → Evicted
+шаг 1  квота без LimitRange → отказ
+шаг 2  LimitRange → под создан, Deployment 7/12, huge (limit 2Gi) → отказ
+шаг 3  disk (limit 50Mi, пишет 100Mi) → Evicted
 ```
 
 Схема 8. Три отказа и их источники: квота, LimitRange, kubelet.
 
-#### Шаг 1. Планирование по requests
-
-Команда создаёт два пода: один просит 20 ГиБ памяти, другой просит 64 МиБ при лимите 40 ГиБ.
-
-```bash
-kubectl run big --image=python:3.12-slim --overrides='{"spec":{"containers":[{"name":"big",
-"image":"python:3.12-slim","command":["sleep","infinity"],
-"resources":{"requests":{"memory":"20Gi"}}}]}}'
-kubectl run greedy --image=python:3.12-slim --overrides='{"spec":{"containers":[{"name":"greedy",
-"image":"python:3.12-slim","command":["sleep","infinity"],
-"resources":{"requests":{"memory":"64Mi"},"limits":{"memory":"40Gi"}}}]}}'
-sleep 5
-kubectl get pod big greedy
-kubectl get events --field-selector involvedObject.name=big,reason=FailedScheduling \
-  -o jsonpath='{.items[0].message}{"\n"}'
-```
-
-| Часть команды | Значение |
-|---|---|
-| `--overrides='{…}'` | задать контейнер с ресурсами, которых нет у `kubectl run` |
-| `requests.memory: 20Gi` | запрос больше, чем память любого узла |
-| `limits.memory: 40Gi` | лимит больше памяти узла, но запрос мал |
-| `reason=FailedScheduling` | события отказа scheduler |
-
-Результат (последняя строка перенесена):
-
-```
-NAME     READY   STATUS    RESTARTS   AGE
-big      0/1     Pending   0          5s
-greedy   1/1     Running   0          5s
-0/4 nodes are available: 1 node(s) had untolerated taint(s), 3 Insufficient memory.
-no new claims to deallocate, preemption: 0/4 nodes are available: 4 Preemption is not
-helpful for scheduling.
-```
-
-Разбор:
-
-1. `big` остался `Pending`: запрос 20 ГиБ не помещается ни в один узел (около 15,5 ГиБ).
-2. `greedy` запущен, хотя лимит 40 ГиБ в 2,5 раза больше памяти узла: scheduler лимит не учитывает.
-3. В сообщении `1 node(s) had untolerated taint(s)` — управляющий узел отсеян taint'ом, `3 Insufficient memory` — у трёх рабочих узлов не хватает памяти.
-4. `Preemption is not helpful` — вытеснение подов с меньшим приоритетом не поможет.
-
-#### Шаг 2. Квота требует ресурсов
+#### Шаг 1. Квота требует ресурсов
 
 Команда создаёт namespace с квотой и пытается создать под без ресурсов.
 
 ```bash
-kubectl delete pod big greedy --now
 kubectl create ns lab-05-2q
 kubectl -n lab-05-2q apply -f - <<'EOF'
 apiVersion: v1
@@ -919,7 +878,7 @@ must specify limits.memory for: nores; requests.cpu for: nores; requests.memory 
 
 Разбор: квота содержит ключи `cpu` и `memory`, поэтому каждый под обязан их указать. Под без ресурсов отклонён на admission, он даже не появился в кластере.
 
-#### Шаг 3. LimitRange подставляет значения
+#### Шаг 2. LimitRange подставляет значения
 
 Команда создаёт LimitRange, повторяет создание пода и проверяет, что получил контейнер.
 
@@ -971,7 +930,7 @@ kubectl -n lab-05-2q get resourcequota team-quota
 | `describe rs \| grep -m1` | первое событие `exceeded quota` у ReplicaSet |
 | `get resourcequota` | расход квоты по ключам |
 
-Результат (строки события и квоты перенесены):
+Результат (строки события перенесены, колонка AGE у квоты опущена):
 
 ```
 NAME   READY   UP-TO-DATE   AVAILABLE   AGE
@@ -981,10 +940,8 @@ many   7/12    7            7           8s
   requested: limits.memory=256Mi,requests.memory=128Mi,
   used: limits.memory=2Gi,requests.memory=1Gi,
   limited: limits.memory=2Gi,requests.memory=1Gi
-NAME         REQUEST
-team-quota   pods: 8/10, requests.cpu: 800m/1, requests.memory: 1Gi/1Gi
-NAME         LIMIT
-team-quota   limits.memory: 2Gi/2Gi
+NAME         REQUEST                                                      LIMIT
+team-quota   pods: 8/10, requests.cpu: 800m/1, requests.memory: 1Gi/1Gi   limits.memory: 2Gi/2Gi
 ```
 
 Разбор:
@@ -1002,6 +959,11 @@ kubectl -n lab-05-2q run huge --image=python:3.12-slim \
 "resources":{"limits":{"memory":"2Gi"}}}]}}'
 ```
 
+| Часть команды | Значение |
+|---|---|
+| `--overrides='{…}'` | задать контейнеру ресурсы, которых нет у `kubectl run` |
+| `limits.memory: 2Gi` | лимит выше `max: 1Gi` из LimitRange |
+
 Результат (строка перенесена):
 
 ```
@@ -1011,7 +973,7 @@ maximum memory usage per Container is 1Gi, but limit is 2Gi
 
 Разбор: сработал `max` из LimitRange: лимит 2Gi выше 1Gi, и под отклонён на admission.
 
-#### Шаг 4. Выселение по ephemeral-storage
+#### Шаг 3. Выселение по ephemeral-storage
 
 Команда создаёт под с лимитом диска 50 МиБ, который пишет 100 МиБ.
 
@@ -1064,11 +1026,10 @@ containers 50Mi.
 
 | Что узнали | Где видно |
 |---|---|
-| Scheduler смотрит на requests и не смотрит на limits | шаг 1, `big` и `greedy` |
-| Квота на cpu и memory требует ресурсов у каждого пода | шаг 2 |
-| LimitRange подставляет значения и проверяет границы | шаг 3 |
-| Квота режет реплики на уровне ReplicaSet | шаг 3, `7/12` |
-| Диск пода ограничивает kubelet выселением | шаг 4, `Evicted` |
+| Квота на cpu и memory требует ресурсов у каждого пода | шаг 1 |
+| LimitRange подставляет значения и проверяет границы | шаг 2 |
+| Квота режет реплики на уровне ReplicaSet | шаг 2, `7/12` |
+| Диск пода ограничивает kubelet выселением | шаг 3, `Evicted` |
 
 **Уборка.**
 
@@ -1083,7 +1044,7 @@ kubectl delete ns lab-05-2
 
 **Вопросы для самопроверки.**
 
-1. Почему `greedy` запустился, а `big` остался Pending?
+1. Квота по `limits.memory` уже исчерпана. Почему `huge` отклонил LimitRange, а не квота?
 2. Где искать причину, если Deployment показывает `7/12`?
 3. Почему квоту ставят вместе с LimitRange?
 4. Почему у выселенного пода `STATUS` равен `Error`?
@@ -1091,7 +1052,7 @@ kubectl delete ns lab-05-2
 <details>
 <summary>Ответ</summary>
 
-1. Scheduler сравнивает requests с allocatable, а limits не учитывает: запрос `greedy` мал, а запрос `big` больше памяти любого узла.
+1. Плагин LimitRanger стоит в цепочке admission раньше ResourceQuota, который проверяет последним. Лимит 2Gi выше `max: 1Gi`, поэтому отказ пришёл от LimitRange, и до квоты запрос не дошёл.
 2. В событиях ReplicaSet (`kubectl describe rs`), где написано `exceeded quota`, а не в событиях Deployment.
 3. Квота на cpu и memory требует, чтобы каждый под указал ресурсы. LimitRange подставляет значения по умолчанию, и поды без ресурсов не отклоняются.
 4. Колонка STATUS показывает состояние контейнера, а не причину пода. Выселение видно в `status.reason` как `Evicted`.
@@ -1102,4 +1063,4 @@ kubectl delete ns lab-05-2
 
 ## → Дальше
 
-Эта часть закончила разговор о числах. Теперь ясно, как контейнер и под получают CPU, память и диск, как их менять на месте и как ограничить namespace. Все эти числа читает scheduler, который выбирает узел по requests, taints и правилам размещения. Поэтому 05-3 разбирает планировщик: как запросы превращаются в выбор узла, как разводить реплики по узлам и что происходит, когда места нет и под с высоким приоритетом вытесняет менее важные.
+Эта часть закончила разговор о числах: контейнер и под получают CPU, память и диск, числа меняются на месте, а namespace ограничен квотой. Все эти числа читает scheduler, который выбирает узел по requests, taints и правилам размещения. Поэтому 05-3 разбирает планировщик и то, как запросы превращаются в выбор узла. Там же видно, что происходит, когда места нет и под с высоким приоритетом вытесняет менее важные.
