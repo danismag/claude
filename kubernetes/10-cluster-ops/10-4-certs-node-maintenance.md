@@ -48,7 +48,7 @@
 
 ### Сроки сертификатов kubeadm
 
-**Листовой сертификат** (leaf certificate) — сертификат компонента, подписанный центром сертификации (CA, 10-1). Сертификаты CA живут долго, листовые — год, поэтому именно они истекают первыми.
+Сертификаты CA живут долго, а листовые сертификаты (10-1 §2) — год, поэтому именно они истекают первыми.
 
 | Что | Срок по умолчанию | Кто продлевает |
 |---|---|---|
@@ -80,7 +80,7 @@ CA, 10 лет:   ca            etcd-ca          front-proxy-ca
 
 **Ротация** (rotation) — замена сертификата новым до истечения старого, без участия человека. Клиентским сертификатом kubelet подтверждает себя API-серверу: имя `system:node:<узел>`, группа `system:nodes`. Если в конфиге kubelet стоит `rotateCertificates: true` (kubeadm включает это сам), kubelet обновляет сертификат так.
 
-1. На случайной отметке между 70 % и 90 % срока kubelet создаёт запрос на подпись. **CSR** (certificate signing request) — API-объект с публичным ключом и просьбой выдать сертификат (06-1).
+1. На случайной отметке между 70 % и 90 % срока kubelet создаёт запрос на подпись, объект CSR (06-1).
 2. Controller-manager одобряет запрос автоматически: запрос пришёл от того же узла с действующим сертификатом, а привязка RBAC разрешает группе `system:nodes` такое продление (в kubeadm она называется `kubeadm:node-autoapprove-certificate-rotation`).
 3. Controller-manager подписывает сертификат ключом CA на срок `--cluster-signing-duration` (1 год по умолчанию).
 4. Kubelet кладёт файл в `/var/lib/kubelet/pki`, переключает ссылку `kubelet-client-current.pem` и переподключается.
@@ -105,7 +105,7 @@ kubelet              API-сервер            controller-manager
 
 ### Kubeconfig администратора
 
-Kubeadm создаёт на узле control plane два файла с клиентскими сертификатами администратора. Начиная с версии 1.29 они различаются группами.
+Kubeadm создаёт на узле control plane два файла с клиентскими сертификатами администратора. Начиная с версии 1.29 они различаются группами (10-1 §2).
 
 - **admin.conf** — группа `kubeadm:cluster-admins`. Права ей выдаёт ClusterRoleBinding на роль `cluster-admin`, поэтому их можно отозвать, удалив привязку.
 - **super-admin.conf** — группа `system:masters`. Она обходит RBAC целиком (06-1), поэтому права не отнять правилами.
@@ -283,7 +283,7 @@ kubectl -n kube-node-lease get lease lab-worker2 -o jsonpath='{.spec.renewTime}{
 
 ### Сменился адрес узла control plane
 
-Сертификаты содержат адрес узла в поле **SAN** (Subject Alternative Name) — списке имён и IP, на которые выдан сертификат. Если адрес изменился (перенос ВМ, DHCP, перезапуск Docker), клиенты, которые ходят по IP, перестают доверять серверу. В прогоне 10-3 сертификат etcd был выписан на `172.20.0.4`, узел получил `172.20.0.2`, и kubeadm остановился с ошибкой `failed to create etcd client: error syncing endpoints with etcd`.
+Сертификаты содержат адрес узла в SAN (10-1 §2). Если адрес изменился (перенос ВМ, DHCP, перезапуск Docker), клиенты, которые ходят по IP, перестают доверять серверу. Пример на стенде с ошибкой `failed to create etcd client` разобран в 10-3 §5, а перевыпуск сертификатов etcd проходит лабораторная работа 1 части 10-3 (шаги 3 и 4).
 
 Лечение — перевыпустить сертификаты командами `kubeadm init phase certs etcd-server`, `etcd-peer` и, если нужно, `apiserver` с конфигурацией, где указан новый адрес. Затем правят адрес в манифестах static pod и перезапускают компоненты. Профилактика: стабильные адреса и DNS-имя в `controlPlaneEndpoint` (на стенде `lab-control-plane:6443`).
 
@@ -298,7 +298,7 @@ kubectl -n kube-node-lease get lease lab-worker2 -o jsonpath='{.spec.renewTime}{
 Если узел остаётся `NotReady`, идут по цепочке снизу вверх.
 
 1. Службы: `systemctl status kubelet containerd`.
-2. Журнал: `journalctl -u kubelet -n 50`; частая причина после перезагрузки — вернувшийся swap. По умолчанию `failSwapOn: true`, и kubelet при включённом swap не стартует с ошибкой `running with swap on is not supported`. Swap на узлах поддерживается с 1.34 (GA), но его включают явно: `failSwapOn: false` в конфиге kubelet.
+2. Журнал: `journalctl -u kubelet -n 50`; частая причина после перезагрузки — вернувшийся swap. По умолчанию `failSwapOn: true`, и kubelet при включённом swap не стартует с ошибкой `running with swap on is not supported`. Swap на узлах поддерживается с 1.34 (GA, 05-2), но его включают явно: `failSwapOn: false` в конфиге kubelet.
 3. Время: `timedatectl`, неверные часы ломают TLS.
 4. Сеть: под CNI на узле (01-2) должен быть `Running`, пока он не запущен, узел `NotReady`.
 
