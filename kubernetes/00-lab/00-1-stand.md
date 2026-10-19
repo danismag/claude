@@ -465,6 +465,7 @@ fs.inotify.max_user_watches = 524288
 | Что узнали | Как проверить |
 |---|---|
 | Для стенда нужны Docker, kind, kubectl и helm | `docker --version`, `kind version`, `kubectl version --client`, `helm version --short` |
+| Хост работает на cgroup v2 | `stat -fc %T /sys/fs/cgroup/` |
 | Узлы kind делят один лимит inotify | `sysctl fs.inotify.max_user_instances` |
 | Версия kubectl не дальше чем на одну минорную от кластера | `kubectl version` (после подъёма стенда) |
 | Параметры ядра сохраняются в `/etc/sysctl.d` | `cat /etc/sysctl.d/99-kind.conf` |
@@ -1342,7 +1343,7 @@ kubectl -n orders get pods
 
 <details><summary>Ответ</summary>
 
-Проверю число готовых эндпоинтов командой `kubectl -n orders get endpointslice`. Если готов только один под, весь трафик идёт на него, а причина обычно в провале проверки готовности у второго (`kubectl -n orders get pods`).
+Проверьте число готовых эндпоинтов командой `kubectl -n orders get endpointslice`. Если готов только один под, весь трафик идёт на него, а причина обычно в провале проверки готовности у второго (`kubectl -n orders get pods`).
 
 </details>
 
