@@ -224,6 +224,7 @@ A шпаргалки (kubectl, Helm, Kustomize, argocd, crictl, etcdctl, kubeadm
 | Часть | Источник вывода | Версии | Что не проверено |
 |---|---|---|---|
 | 01-1 | прогон 2026-10-14; ревью по kubernetes/website, коду kubernetes и исследованию | kind 0.32.0, k8s 1.36.1 | формат строк Response при -v=6 (лаба 1 шаг 1); вывод jq (лаба 2 шаг 1); «прошло 21 с» (лаба 3 шаг 4); всплеск CPU в «Рисках» лабы 3; время, за которое kubelet замечает манифест; состав /readyz?verbose |
+| 01-2 | прогон 2026-10-14; ревью по документации и исследованию | kind 0.32.0, k8s 1.36.1 | переход node-monitor-grace-period 40→50 с; готовность подов после перезапуска kubelet (1.35), --config-dir, maxParallelImagePulls, nodes/configz, запрет static pods со ссылками на Secret (1.37) — по исследованию; срок отказа от запасного cgroupDriver; PLEG 1 с и 3 мин; get nodes (работа 1 шаг 3), crictl ps (работа 4 шаги 1, 3); узел дерева cgroup в работе 2 |
 | 02-1 | прогон 2026-10-14; ревью по kubernetes/website и коду kubernetes | kind 0.32.0, k8s 1.36.1 | порядок строк `status.conditions` (работа 1, шаг 3); хвостовой `\n` в `message` (работа 2, шаг 2); коды 137/143 для PID 1 без обработчика; команды переноса busybox в реестр стенда; поле kubelet `crashLoopBackOff.maxContainerRestartPeriod` |
 | 03-2, работа 1 | прогон 2026-10-14 (шаги 3–7); ревью по kubernetes/website и коду kube-proxy | kind 0.32.0, k8s 1.36.1 | сообщения kubectl в шагах 1–2 и уборке; время второго отказа (шаг 7); вывод шага 8; вид `describe endpointslice` с `Ready: false`; удаление ns ~30 с |
 
