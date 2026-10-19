@@ -1,0 +1,4 @@
+# Отчёт писателя 02-3 StatefulSet
+Файл: /home/user/claude/kubernetes/02-workloads/02-3-statefulset.md. Читаемость: 262 предложения, среднее 11,6 слов, >25 слов: 0, нарушений 0.
+Структура: Где мы на карте; 1 Задача (3 ###); 2 Устройство (5); 3 Управление (5); 4 Состояние (4); 5 Поломки (4); 6 Пределы (4); Лабораторные 1 (6 шагов), 2 (5 шагов), 3 (5 шагов); Дальше.
+Сомнительное: см. ответ. Вынесено в модуль 12: кейс про Kafka-стенды и helm uninstall (PVC не удаляются); 8 вопросов (отличия от Deployment, headless, судьба данных, partition, Parallel, откат сломанной ревизии, узел/at-most-once, отказоустойчивость); подводные камни (serviceName, publishNotReadyAddresses, busybox nslookup, осиротевшие PVC, старые данные при scale up, forced rollback, volumeClaimTemplates неизменяем, local-path привязка к узлу); звёздочка (readiness по DNS соседей, publishNotReadyAddresses + Parallel).
