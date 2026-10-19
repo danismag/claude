@@ -1,105 +1,225 @@
 # 01-2. Узел: kubelet, CRI, CNI, kube-proxy
 
-> Модуль 1 «Архитектура» · часть 2 из 3 · 🟢🟡🔴 · ~1,5 ч чтения + ~1 ч лабы (из них 7 мин — ожидание вытеснения) · Нужно: стенд 00-1
+> Модуль 01 «Архитектура» · часть 2 из 3 · ~1,5 ч чтения + ~1 ч лабы (из них 7 мин — ожидание вытеснения) · Нужно: стенд 00-1 (контекст `kind-lab`), crictl из 00-2, доступ узлов к образу `busybox:1.37` · Опирается на: 01-1 (control plane)
+
+## Где мы на карте
+
+В 01-1 мы разобрали control plane: apiserver принимает объекты, scheduler выбирает узел, controller manager держит желаемое состояние. Все они только читают и пишут записи в API. Эта часть показывает, кто превращает запись «под P на узле N» в работающий процесс. Это компоненты узла: kubelet, containerd, CNI-плагины и kube-proxy.
+
+Следующая часть, 01-3, вернётся к API и разберёт сами объекты: метки, владельцев, apply и finalizers. А всё, что запускают в кластере, упирается в узел. Под (02-1), Service (03-2), тома (04-2) и лимиты (05-1) работают через механизмы, которые описаны здесь.
+
+```
+   control plane (01-1)    решает: под P → узел N, пишет в API
+          │ watch
+   ┌──────▼──────────────────────────────────────────────────┐
+   │ узел N                                                   │
+   │  kubelet ─CRI─► containerd ─► shim ─► runc ─► процесс    │
+   │     │               └─ CNI-плагины ─► интерфейс и IP     │
+   │     └─ статус и Lease ─► apiserver                       │
+   │  kube-proxy ─► правила Service (03-2)                    │
+   └──────────────────────────────────────────────────────────┘
+```
+
+Схема 1. Что стоит на узле. Стрелки показывают, кто кого вызывает; вверх от kubelet идут только статусы и heartbeat.
 
 ---
 
-## Зачем это DevOps-у
+## 1. Какую задачу решает узел
 
-Control plane решает, **где** запустить под; всё остальное делает узел. Когда «под не стартует», «контейнер работает, а под NotReady», «узел флапает» или «после падения узла сервис лёг, хотя БД жива» — разбираться приходится на узле: kubelet, containerd, CNI, cgroups. На собеседовании спрашивают про pause-контейнер, static pods, что такое CRI и CNI, и через сколько поды уедут с упавшего узла — с цифрами.
+Узел превращает записи в API в процессы и следит, чтобы они жили. Разберём, что на нём работает и почему для этого не нужен Docker.
 
-В сквозном сценарии мы остановим kubelet на узле с PostgreSQL и увидим, что через 53 секунды `curl http://orders.localhost:8088/api/orders` начинает отвечать 503, хотя процесс PostgreSQL продолжает работать.
+### От записи в API к процессу в ядре
+
+Когда scheduler записывает в под поле `spec.nodeName`, в кластере появляется только строка в etcd. Процесса ещё нет. **Узел** (node) — машина, физическая или виртуальная, на которой работают поды. **kubelet** — агент на каждом узле: он следит за подами, назначенными его узлу, и приводит узел в соответствие с записью.
+
+kubelet запускает контейнеры через рантайм, монтирует тома, выполняет пробы (02-5) и перезапускает упавшие контейнеры по `restartPolicy`. Он пишет в API статус подов и узла и регулярно сообщает «я жив». Если kubelet молчит, control plane считает узел потерянным (§5).
+
+### Что ещё стоит на узле
+
+Кроме kubelet, на узле работают пять компонентов. У каждого своя задача.
+
+- **containerd** — **контейнерный рантайм** (container runtime): служба, которая хранит образы и запускает контейнеры. Работает как systemd-служба.
+- **runc** — **OCI runtime**: программа, которая создаёт процесс в нужных namespaces и cgroups. **OCI** (Open Container Initiative) — стандарт формата образа и запуска контейнера.
+- **CNI-плагины** — бинарники в `/opt/cni/bin` с конфигом в `/etc/cni/net.d`. Они дают поду интерфейс, IP и маршруты (§2).
+- **kube-proxy** — агент, который пишет на узле правила iptables, nftables или ipvs для Service (03-2). Работает как DaemonSet.
+- **CNI-агент** (kindnet на стенде, Calico, Cilium) — тоже DaemonSet: раздаёт подсети, строит маршруты и применяет NetworkPolicy (03-5).
+
+**DaemonSet** — контроллер, который держит ровно один под на каждом узле (02-4). Поэтому kube-proxy и CNI-агент видны как обычные поды в `kube-system`, хотя работают на уровне узла.
+
+### Docker на узле не нужен
+
+Раньше kubelet умел говорить только с Docker через встроенный слой dockershim. С версии 1.24 этот слой удалён. Теперь kubelet общается с любым рантаймом по единому интерфейсу **CRI** (Container Runtime Interface, §2). На стенде работает containerd 2.3.1.
+
+Образы, собранные Docker'ом, продолжают работать: это обычные OCI-образы. Меняется только то, кто их запускает. Отсюда практическое следствие: на узле команда `docker ps` ничего не покажет, контейнеры смотрят через `crictl` (карточка инструмента — 00-2).
 
 ---
 
-## 1. Что работает на узле 🟢
+## 2. Как устроен узел
 
-| Компонент | Как запущен | Что делает |
-|---|---|---|
-| **kubelet** | systemd-сервис | watch подов своего узла в apiserver; создаёт их через CRI; probes; монтирует тома; пишет status и heartbeat |
-| **containerd** (CRI-рантайм) | systemd-сервис | образы, контейнеры, sandbox'ы подов; вызывает runc и CNI |
-| **runc** | вызывается containerd | создаёт процесс в namespaces и cgroups (OCI runtime) |
-| **CNI-плагины** | бинарники в `/opt/cni/bin`, конфиг в `/etc/cni/net.d` | вызываются при создании sandbox'а: интерфейс, IP, маршруты |
-| **kube-proxy** | DaemonSet | правила iptables/nftables/ipvs для Service (03-2) |
-| CNI-агент (kindnet, Calico, Cilium) | DaemonSet | раздаёт подсети узлам, маршруты, NetworkPolicy |
+Разберём цепочку вызовов от kubelet до процесса, затем sandbox пода, путь пода до статуса Running, получение IP и heartbeat.
 
-Docker в узле Kubernetes не нужен: с 1.24 dockershim удалён, kubelet говорит с рантаймом по **CRI** (gRPC). На стенде — containerd 2.3.1. Образы, собранные Docker'ом, работают — это OCI-образы.
+### Цепочка kubelet → containerd → runc
 
-## 2. Под изнутри: pause-контейнер и namespaces 🟢🟡
+**CRI** — gRPC-интерфейс между kubelet и рантаймом. Он состоит из двух служб: одна управляет sandbox'ами и контейнерами, другая — образами. kubelet подключается к unix-сокету рантайма; у containerd это `/run/containerd/containerd.sock`.
 
-Под — это **sandbox** (набор общих namespaces) плюс контейнеры в нём. Sandbox держит крошечный процесс `/pause` (образ `registry.k8s.io/pause:3.10` на стенде): он создаёт и удерживает сетевой namespace, пока контейнеры пода перезапускаются.
-
-Проверено на узле (под orders-api):
+Сам containerd процессы не создаёт. Для каждого sandbox он запускает **shim** — маленький процесс-посредник, который держит ввод-вывод контейнеров и запоминает код выхода. Shim вызывает runc, а runc делает системные вызовы, создаёт namespaces и cgroups и запускает процесс. Поэтому перезапуск kubelet или containerd не убивает контейнеры: они живут под присмотром shim.
 
 ```
-"image": "registry.k8s.io/pause:3.10",
-"path": "/var/run/netns/cni-542787ea-dd36-7a95-0fc7-860c6ccbef33",
-"ip": "10.244.1.5"
-
-/proc/1616/ns/net -> net:[4026534532]      ← pause
-/proc/1643/ns/net -> net:[4026534532]      ← контейнер api: тот же сетевой namespace
-/proc/1616/ns/pid -> pid:[4026534597]
-/proc/1643/ns/pid -> pid:[4026534599]      ← PID namespace у каждого свой
+kubelet ──CRI (gRPC, unix-сокет)──► containerd ──► shim ──► runc ──► процесс пода
+                                        │
+                                        └──► CNI-плагины ──► veth, IP, маршруты
 ```
 
-Общее у контейнеров пода: сеть (IP, порты, `localhost`), IPC, тома. Раздельное по умолчанию: PID и файловая система. `shareProcessNamespace: true` даёт общий PID-namespace (тогда PID 1 — pause, и сигналы ведут себя иначе), `kubectl debug --target` подключает отладочный контейнер к PID-namespace одного контейнера (00-2).
+Схема 2. Цепочка запуска. runc выходит сразу после старта процесса; shim остаётся и держит контейнер.
 
-Почему pause, а не первый контейнер: если контейнер приложения упал и перезапустился, IP и сетевой namespace остаются — порт-маппинги, правила kube-proxy и endpoints не меняются.
+### Sandbox и контейнер pause
 
-## 3. Путь от binding до Running 🟡
+**Namespace ядра** (Linux namespace) — механизм ядра, который даёт процессам собственный вид ресурса: сеть, список процессов (PID), IPC, точки монтирования. Это не namespace Kubernetes: слова совпадают, смысл разный.
+
+**Sandbox** пода (pod sandbox) — набор общих namespaces, в которых работают контейнеры пода. Его держит крошечный процесс `/pause`, образ `registry.k8s.io/pause:3.10` на стенде. Pause ничего не делает: он создаёт сетевой namespace и ждёт.
+
+Контейнеры пода присоединяются к namespaces pause. Общими становятся сеть (IP, порты, `localhost`) и IPC. PID и файловая система остаются раздельными. Флаг `shareProcessNamespace: true` объединяет и PID-namespace: тогда PID 1 — pause, и сигналы ведут себя иначе. Отладочный контейнер `kubectl debug --target` присоединяется к PID-namespace одного контейнера (00-2).
+
+Почему pause, а не первый контейнер приложения? Контейнер приложения может упасть и перезапуститься. Если бы namespace принадлежал ему, исчезли бы IP и сетевое состояние пода. Pause живёт, пока жив под, поэтому IP, правила kube-proxy и endpoints не меняются при перезапусках.
+
+```
+      sandbox пода (процесс /pause держит net и IPC)
+   ┌──────────────────────────────────────────────┐
+   │ pause   ── net:[4026534532]                  │
+   │ api     ── net:[4026534532]  ← тот же netns  │
+   │         ── pid:[…599]        ← свой pid-ns   │
+   └──────────────────────────────────────────────┘
+```
+
+Схема 3. Pause и контейнер приложения делят сетевой namespace и различаются по PID. Номера взяты из лабораторной работы 1.
+
+### Путь пода от привязки до Running
+
+Получив под с `nodeName`, kubelet проходит фиксированную последовательность шагов. Знание порядка помогает: по тому, где остановился под, видно, какой шаг сломан.
 
 ```
 apiserver: pod.spec.nodeName = lab-worker3
    │ watch
 kubelet: syncPod
-   1. admission на узле (хватает ли ресурсов, nodeSelector, taints — «последняя проверка»)
+   1. проверка на узле (ресурсы, nodeSelector, taints) — последний барьер
    2. cgroup пода (по QoS-классу, 05-1)
-   3. тома: Secret/ConfigMap/PVC — смонтировать, дождаться attach (04-2)
+   3. тома: Secret, ConfigMap, PVC — смонтировать и дождаться attach (04-2)
    4. CRI RunPodSandbox → containerd → pause + CNI ADD → IP
    5. pull образов (imagePullPolicy, секреты реестра)
-   6. init-контейнеры по очереди, затем sidecar'ы, затем основные (02-1)
-   7. probes: startup → readiness/liveness (02-5)
-   8. status → apiserver: PodReadyToStartContainers, Initialized, ContainersReady, Ready
+   6. init-контейнеры по очереди, затем sidecar, затем основные (02-1)
+   7. пробы: startup → readiness и liveness (02-5)
+   8. статус → apiserver: PodReadyToStartContainers, Initialized, Ready
 ```
 
-Ошибки этого пути видны в событиях пода и в его статусе: `FailedMount`, `FailedCreatePodSandBox` (часто — CNI), `ErrImagePull`/`ImagePullBackOff`, `CreateContainerConfigError` (нет ключа в Secret/ConfigMap), `CrashLoopBackOff`. Разбор каждой — 11-1.
+Схема 4. Работа kubelet над одним подом. Условие `PodReadyToStartContainers` ставится после шага 4: песочница и сеть готовы.
 
-Как kubelet узнаёт, что контейнер умер: **PLEG** (Pod Lifecycle Event Generator) периодически сверяет состояние контейнеров с рантаймом (в новых версиях — по событиям CRI). Сообщение `PLEG is not healthy` в логах kubelet и узел NotReady — рантайм не отвечает (перегружен, завис containerd, тысячи мёртвых контейнеров).
+### Откуда у пода IP: CNI
 
-## 4. CNI: откуда у пода IP 🟡
-
-При создании sandbox'а containerd вызывает плагины из `/etc/cni/net.d`. На стенде — kindnet (проверено, сокращено):
+**CNI** (Container Network Interface) — стандарт, по которому рантайм вызывает сетевой плагин. Когда containerd создаёт sandbox, он читает конфиг из `/etc/cni/net.d` и запускает указанные плагины с командой ADD и путём к netns пода. На стенде работает kindnet (сокращённый конфиг):
 
 ```json
 { "cniVersion": "0.3.1", "name": "kindnet",
   "plugins": [
-    { "type": "ptp", "ipam": { "type": "host-local", "ranges": [[ { "subnet": "10.244.1.0/24" } ]] }, "mtu": 1500 },
+    { "type": "ptp", "ipam": { "type": "host-local",
+        "ranges": [[ { "subnet": "10.244.1.0/24" } ]] }, "mtu": 1500 },
     { "type": "portmap", "capabilities": { "portMappings": true } } ] }
 ```
 
-`ptp` создаёт veth-пару (один конец в netns пода, другой на узле), `host-local` выдаёт IP из подсети узла. Таблица маршрутов узла `lab-worker3` (проверено):
+Разбор:
+
+1. `ptp` — плагин создаёт **veth-пару**: два виртуальных сетевых интерфейса, соединённых напрямую. Один конец лежит в netns пода, другой на узле.
+2. `host-local` — модуль **IPAM** (IP address management): выдаёт адрес из подсети узла `10.244.1.0/24`.
+3. `portmap` — открывает `hostPort` пода на узле.
+
+Подсеть узла берётся из поля `spec.podCIDR` объекта Node. На узле `lab-worker3` таблица маршрутов (сокращена) показывает, как достичь подов:
 
 ```
 default via 172.20.0.1 dev eth0
-10.244.0.0/24 via 172.20.0.2 dev eth0       ← подсеть пода на другом узле — через его IP
-10.244.1.3 dev vethc3005564 scope host       ← под на этом узле — прямо в veth
+10.244.0.0/24 via 172.20.0.2 dev eth0       ← подсеть другого узла: через его IP
+10.244.1.3 dev vethc3005564 scope host       ← под на этом узле: прямо в veth
 10.244.1.5 dev veth6a79cd61 scope host
 10.244.2.0/24 via 172.20.0.3 dev eth0
 10.244.3.0/24 via 172.20.0.5 dev eth0
 ```
 
-Модель Kubernetes: каждый под получает IP, поды видят друг друга без NAT. Как именно — дело CNI: маршруты (kindnet, Calico BGP), оверлей (VXLAN, Geneve), eBPF (Cilium). Подробно, с трассировкой пакета — 03-1.
+Модель Kubernetes требует: каждый под получает IP, и поды видят друг друга без NAT. Как это сделано — решает плагин: маршруты (kindnet, Calico в режиме BGP), оверлей VXLAN или Geneve, eBPF (Cilium). Трассировка пакета и сравнение вариантов — 03-1.
 
-## 5. cgroups узла 🟡
+### Heartbeat: Lease и статус узла
 
-Kubelet с `cgroupDriver: systemd` (проверено) раскладывает поды в slice'ы по QoS-классам. На стенде (`systemd-cgls -u kubelet.slice`, сокращено):
+Узел сообщает о себе двумя способами. Оба идут от kubelet к apiserver.
+
+**Lease** (аренда) — маленький объект в namespace `kube-node-lease`, по одному на узел. kubelet продлевает его примерно каждые 10 с: меняется только поле `renewTime`. Объект крошечный, поэтому heartbeat почти ничего не стоит.
+
+**Статус узла** (`node.status`) — крупный объект с условиями (Ready, MemoryPressure, DiskPressure, PIDPressure), ресурсами и списком образов. kubelet проверяет его каждые 10 с. Полную запись он отправляет при изменении или раз в 5 минут.
+
+Роль судьи играет **node lifecycle controller** в controller manager. Если Lease не обновлялся дольше `node-monitor-grace-period` (50 с), он ставит условию Ready значение Unknown. Что происходит дальше, разбирает §5.
+
+---
+
+## 3. Как управлять узлом
+
+Параметры узла задаёт конфиг kubelet. Раскладкой ресурсов управляет драйвер cgroups, локальными подами — каталог static pods, а логами и образами — настройки ротации и сборки мусора.
+
+### Конфигурация kubelet
+
+Конфиг kubelet — YAML-файл вида **KubeletConfiguration**. Путь передаёт флаг `--config`; в kubeadm и kind это `/var/lib/kubelet/config.yaml`. Параметры из файла — `nodeStatusUpdateFrequency`, `maxPods`, `evictionHard`, `cgroupDriver` — проверяются при старте. Чтобы применить правку, перезапускают службу: `systemctl restart kubelet`. Контейнеры при этом продолжают работать, потому что их держит shim.
+
+Эффективные значения, с учётом умолчаний и флагов, видны только в работающем kubelet (§4). Поэтому после правки конфига значение проверяют там, а не по файлу.
+
+### Драйвер cgroups и раскладка по QoS
+
+**cgroup** (control group) — механизм ядра, который объединяет процессы в группу и ограничивает её ресурсы: память, CPU, число процессов. kubelet создаёт cgroup для каждого пода и каждого контейнера. Лимиты из манифеста превращаются в значения файлов этой иерархии (05-1).
+
+**QoS-класс** (quality of service) — категория пода по его requests и limits: Guaranteed, Burstable, BestEffort. Поды раскладываются в ветки по классу, чтобы при нехватке памяти ядро и kubelet выбирали жертву предсказуемо (05-4).
+
+**Драйвер cgroups** определяет, кто создаёт эти группы: сам kubelet (`cgroupfs`) или systemd (`systemd`). Драйвер kubelet и рантайма обязан совпадать. На дистрибутивах с systemd (Ubuntu, Manjaro) выбирают `systemd`: в kubelet это `cgroupDriver: systemd`, в containerd — `SystemdCgroup = true`. Иначе два менеджера работают с одной иерархией, и под нагрузкой узел ведёт себя непредсказуемо.
+
+### Static pods
+
+**Static pod** (статический под) — под, который kubelet запускает из файла, без scheduler и без apiserver. Каталог указывает параметр `staticPodPath`; на стенде это `/etc/kubernetes/manifests` на всех узлах. kubelet перечитывает каталог раз в 20 с (`fileCheckFrequency`). Появился файл — запускается под, исчез — останавливается.
+
+Чтобы под был виден в кластере, kubelet создаёт в API его копию — **mirror pod** (зеркальный под). У зеркального пода к имени добавлен суффикс узла, а владелец в `ownerReferences` — объект Node. Зеркало только отражает: `kubectl delete` удалит его, но kubelet создаст зеркало заново, а контейнер останется прежним. Остановить static pod можно только удалением файла на узле.
+
+Так запущен control plane в kubeadm: apiserver, scheduler и controller manager — static pods. Это удобно для компонентов, которые должны работать до того, как кластер готов принимать объекты.
+
+Это же и риск. Файл в каталоге манифестов на любом узле запускает под в обход RBAC и admission-проверок. Admission-плагин `NodeRestriction` запрещает зеркальным подам ссылаться на Secret, ConfigMap и ServiceAccount. Но под с `hostPath` он не остановит. Поэтому права на запись в `/etc/kubernetes/manifests` приравнивают к правам root на узле.
+
+### Логи контейнеров и образы
+
+kubelet через containerd пишет stdout и stderr контейнера в файл `/var/log/pods/<ns>_<под>_<uid>/<контейнер>/N.log`. Каталог `/var/log/containers/` содержит симлинки на эти файлы: из него читают агенты сбора логов (Fluent Bit, Promtail). Ротацию делает kubelet: файл растёт до `containerLogMaxSize` (10Mi по умолчанию), хранится до `containerLogMaxFiles` файлов (по умолчанию 5). Логи удаляются вместе с подом.
+
+Образы чистит **сборка мусора образов** (image GC). Когда диск заполнен выше `imageGCHighThresholdPercent` (по умолчанию 85%), kubelet удаляет неиспользуемые образы, пока занятость не упадёт до `imageGCLowThresholdPercent` (80%). Образы тянутся по одному: параметр `serializeImagePulls` по умолчанию равен `true`. Один огромный образ из медленного реестра задерживает старт других подов узла.
+
+---
+
+## 4. Как увидеть состояние узла
+
+Состояние узла видно с трёх сторон: из API, из рантайма на самом узле и из журналов.
+
+### Узел глазами API
+
+Команда `kubectl get nodes` показывает статус и версию. Подробности даёт `kubectl describe node <имя>`: блок Conditions со статусами Ready, MemoryPressure, DiskPressure, PIDPressure, блок Capacity и Allocatable и список подов узла. **Capacity** — все ресурсы машины, **Allocatable** — то, что остаётся подам после резервов системы и порога вытеснения (05-1, 05-4). В kind они совпадают.
+
+Heartbeat читают из Lease: `kubectl -n kube-node-lease get lease <узел>`. Если `renewTime` старше минуты, kubelet молчит, и причину ищут на узле, а не в API.
+
+### Конфигурация, которую применяет kubelet
+
+kubelet отдаёт свою эффективную конфигурацию через эндпоинт `configz`. Запрос идёт через apiserver как через прокси: `kubectl get --raw /api/v1/nodes/<узел>/proxy/configz`. Ответ содержит все параметры с умолчаниями. Работа 2 показывает, как выбрать нужные поля через `jq`.
+
+### Контейнеры и sandbox на узле
+
+API знает только про поды. Что реально запущено, знает рантайм. Утилита `crictl` (карточка — 00-2) говорит с containerd по CRI: `crictl pods` показывает sandbox'ы, `crictl ps` — контейнеры, `crictl inspectp` — детали sandbox, включая IP и путь к netns. Узлы kind — контейнеры Docker, поэтому на них заходят через `docker exec`. На обычном узле для этого нужен ssh и права root.
+
+### Раскладка cgroup
+
+Дерево cgroup узла показывает `systemd-cgls`. На стенде kubelet сам работает внутри контейнера kind, поэтому к именам добавлен префикс `kubelet-` (сокращено):
 
 ```
 kubelet.slice
 ├─kubelet.service
 │ └─222 /usr/bin/kubelet ...
 └─kubelet-kubepods.slice
-  ├─kubelet-kubepods-pod01b8c840_….slice           ← Guaranteed — прямо в kubepods
+  ├─kubelet-kubepods-pod01b8c840_….slice           ← Guaranteed: прямо в kubepods
   │ ├─cri-containerd-e6f0….scope  └─724 /bin/kindnetd
   │ └─cri-containerd-eec6….scope  └─466 /pause
   ├─kubelet-kubepods-besteffort.slice
@@ -109,126 +229,456 @@ kubelet.slice
   └─kubelet-kubepods-burstable.slice …
 ```
 
-Префикс `kubelet-` и вложенность в `kubelet.slice` — особенность kind (kubelet сам в контейнере). На обычном узле: `/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid>.slice/cri-containerd-<id>.scope`. Драйвер cgroups у kubelet и рантайма **обязан совпадать** (systemd на systemd-дистрибутивах) — иначе под нагрузкой узел становится нестабильным.
+Схема 5. Ветки по QoS-классам. Под Guaranteed лежит прямо в `kubepods`, Burstable и BestEffort — в своих ветках. Каждый контейнер — отдельный `scope`.
 
-## 6. Static pods и mirror pods 🟡
+**Slice** — узел иерархии systemd, группирующий cgroup. **Scope** — группа внешних процессов, которую systemd не запускал сам: containerd создаёт по одному scope на контейнер. На обычном узле путь короче: `/sys/fs/cgroup/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid>.slice/cri-containerd-<id>.scope`.
 
-Kubelet на каждом узле следит за каталогом `staticPodPath` (проверено: `/etc/kubernetes/manifests` на всех узлах стенда, не только на control-plane) и запускает поды из файлов — без scheduler'а и без apiserver. В API появляется **mirror pod** с суффиксом имени узла.
+### Журналы компонентов
 
-Проверено:
-
-| Действие | Результат |
-|---|---|
-| файл `static-web.yaml` в `/etc/kubernetes/manifests` на `lab-worker2` | через ≤15 с `static-web-lab-worker2 1/1 Running`; аннотация `kubernetes.io/config.source: file`, ownerReference — `Node lab-worker2` |
-| `kubectl delete pod static-web-lab-worker2` | mirror pod пересоздан, **контейнер тот же** (`crictl ps`: создан 20 с назад) — удалением через API static pod не убить |
-| удалить файл | через ~30 с под исчез и в API, и на узле (kubelet перечитывает каталог раз в 20 с — `fileCheckFrequency`) |
-
-Применение: control plane kubeadm, иногда — агенты, которые должны работать до сети кластера. Опасность: файл в `/etc/kubernetes/manifests` на любом узле — способ запустить под в обход RBAC и admission. Плагин `NodeRestriction` запрещает mirror pod'ам ссылаться на Secret/ConfigMap/ServiceAccount, но сам под с `hostPath` запустится.
-
-## 7. Heartbeat, NotReady и вытеснение 🟡🔴
-
-Kubelet сообщает «я жив» двумя способами:
-
-| Механизм | Частота (проверено, `/configz`) | Зачем |
-|---|---|---|
-| Lease в `kube-node-lease` | продление каждые ~10 с, `leaseDurationSeconds: 40` | дешёвый heartbeat — маленький объект |
-| `node.status` | `nodeStatusUpdateFrequency: 10s` проверка; полная запись при изменении или раз в `nodeStatusReportFrequency: 5m` | условия узла (Ready, MemoryPressure, DiskPressure, PIDPressure), ресурсы, образы |
-
-Node lifecycle controller в controller-manager ждёт `node-monitor-grace-period` (в 1.36 — 50 с; раньше было 40 с) без обновлений и ставит узлу `Ready=Unknown` и taint'ы `node.kubernetes.io/unreachable:NoSchedule` и `:NoExecute`. Каждый под по умолчанию получает toleration к `unreachable:NoExecute` с `tolerationSeconds: 300` — через 5 минут он помечается на удаление, и его контроллер создаёт замену на другом узле.
-
-Замер на стенде (лаба, шаг 5) — остановлен kubelet на `lab-worker`, где работают PostgreSQL и один под `web`:
-
-| t | Что произошло |
-|---|---|
-| 0 | `systemctl stop kubelet`. Контейнеры узла **продолжают работать** (containerd жив) |
-| +53 с | узел `Unknown/NodeStatusUnknown`, taint'ы `unreachable` NoSchedule + NoExecute; у `postgres-0` `Ready=False`, endpoint postgres неготов; сквозной запрос — **503** |
-| +353 с | поды узла получили `deletionTimestamp`: `web` → `Terminating`, создан новый `web`; `postgres-0` → `Terminating` и **не пересоздаётся** |
-| kubelet вернули | через 8 с `api=200`; Terminating-поды удалены, `postgres-0` создан заново на том же узле (его PV local-path привязан к `lab-worker`), данные на месте |
-
-Три вывода из замера:
-
-1. **Сервис лёг через 53 секунды, хотя ни один процесс не упал.** Endpoint'ы подов на узле `Unknown` помечаются неготовыми; headless Service `postgres` перестал отдавать адрес в DNS, orders-api не смог подключиться к БД и ответил 503 на readiness — оба пода orders-api выпали из Service.
-2. **StatefulSet не пересоздаёт под, пока узел не подтвердит его смерть.** Гарантия StatefulSet — не больше одного пода с этим именем одновременно (иначе два PostgreSQL на одном томе). Контроллер не знает, мёртв ли узел или просто потерял связь, — и ждёт. Выход для действительно мёртвого узла — удалить объект Node (или под с `--force --grace-period=0`, понимая риск), либо taint `node.kubernetes.io/out-of-service` (non-graceful node shutdown, stable с 1.28) — тогда поды и тома освобождаются.
-3. **Замена под `web` осталась Pending** до возврата узла: `topologySpreadConstraints` с `maxSkew: 1` по `kubernetes.io/hostname` продолжает считать узел с taint'ом доменом (по умолчанию `nodeTaintsPolicy: Ignore`), и новый под «не помещается»:
-
-```
-0/4 nodes are available: 2 node(s) didn't match pod topology spread constraints, 2 node(s) had untolerated taint(s). ...
-```
-
-Подробности spread — 05-2. Итого с дефолтами: **~5 минут 50 секунд** от потери узла до замены подов Deployment, и бесконечно — для StatefulSet без вмешательства. Ускоряют: меньший `tolerationSeconds` в подах (не ниже минуты — иначе короткий сетевой сбой устроит массовую миграцию), readiness, не зависящий от единственной БД, реплики БД на разных узлах с автоматическим failover (09-1).
-
-## 8. Логи, образы, ресурсы узла 🟡
-
-- **Логи контейнеров**: kubelet через containerd пишет stdout/stderr в `/var/log/pods/<ns>_<pod>_<uid>/<container>/N.log`; `/var/log/containers/*.log` — симлинки для агентов сбора (Fluent Bit, Promtail). Ротация — kubelet: `containerLogMaxSize: 10Mi`, `containerLogMaxFiles: 5` (проверено). `kubectl logs` читает текущий файл через kubelet, `--previous` — предыдущий экземпляр. Логи удаляются вместе с подом.
-- **Образы**: GC при заполнении диска выше `imageGCHighThresholdPercent` (дефолт 85%) до `imageGCLowThresholdPercent` (80%). В kind GC выключен (`100`), eviction-пороги — `0%`: стенд не защищает свой диск, следите за `docker system df`.
-- **`maxPods: 110`** на узел — дефолт; ограничен ещё и размером подсети узла (/24 = 254 адреса).
-- **`serializeImagePulls: true`** — образы тянутся по одному; на узле с медленным реестром один огромный образ задерживает старт всех подов.
-- **Allocatable**: capacity минус `kube-reserved`, `system-reserved` и порог eviction — 05-1, 05-4. В kind — равно capacity.
-
-Эффективную конфигурацию kubelet (с дефолтами) показывает `/configz`:
-
-```bash
-kubectl get --raw /api/v1/nodes/lab-worker3/proxy/configz | jq '.kubeletconfig | {nodeStatusUpdateFrequency, nodeLeaseDurationSeconds, containerLogMaxSize, containerLogMaxFiles, imageGCHighThresholdPercent, evictionHard, maxPods}'
-```
+Журналы kubelet и containerd лежат в journald: `journalctl -u kubelet` и `journalctl -u containerd`. Для kind команда та же, но через `docker exec <узел>`. События пода (`kubectl describe pod`) показывают то, что kubelet отправил в API. Журнал показывает остальное, например жалобы на рантайм.
 
 ---
 
-## 🔧 Лаба
+## 5. Что ломается и как найти причину
 
-### Шаг 0. Подготовка
+Поломки узла бывают двух видов: узел перестал отвечать, или не получается пройти шаг запуска пода. Сначала разберём потерю узла: она ломает больше всего и требует точных цифр.
+
+### Узел потерял kubelet: хронология
+
+Остановим kubelet и посмотрим, что делает кластер. Контейнеры при этом продолжают работать, потому что их держит containerd. Но control plane этого не видит: Lease не обновляется. Хронология с цифрами стенда (лабораторная работа 4):
+
+| Момент | Что видно | Что сработало |
+|---|---|---|
+| 0 | `systemctl stop kubelet`, контейнеры живы | — |
+| +10 с и дальше | `renewTime` Lease не меняется | kubelet молчит |
+| +53 с | узел Unknown, taint'ы `unreachable` | `node-monitor-grace-period` 50 с |
+| +53 с | поды узла `Ready=False`, endpoints неготовы | endpoint-контроллеры |
+| +353 с | у подов `deletionTimestamp`, создаются замены | toleration 300 с |
+
+Слово taint нужно определить. **Taint** (метка-запрет) — отметка на узле: новые поды на него не попадут, а текущие уйдут, если не терпят её. **Toleration** (терпимость) — запись в поде, которая позволяет терпеть taint. Когда узел становится Unknown, node lifecycle controller вешает на него два taint'а: `node.kubernetes.io/unreachable:NoSchedule` и `unreachable:NoExecute`. Первый запрещает новые поды. Второй вытесняет уже работающие.
+
+Каждый под получает при создании toleration к `unreachable:NoExecute` на `tolerationSeconds: 300` (его добавляет admission-плагин). Через 300 с после taint'а под помечается на удаление, и его контроллер создаёт замену на другом узле. Итого с умолчаниями: 50 + 300 ≈ 350 секунд. Замер на стенде показал +353 с.
+
+### Почему сервис лёг, а процессы живы
+
+Самое неприятное происходит на 53-й секунде, задолго до вытеснения. Поды узла становятся неготовыми, и их адреса исчезают из endpoint'ов. Если на узле работает единственная база данных, зависимый сервис теряет её, а процесс PostgreSQL при этом работает.
+
+На стенде так и вышло. Headless Service `postgres` перестал отдавать адрес в DNS. orders-api не смог подключиться к БД и ответил 503 на readiness. Оба пода orders-api выпали из Service, и сквозной запрос получил 503. Ни один процесс не упал.
+
+Из этого следует правило проектирования: readiness, которая жёстко зависит от единственной внешней зависимости, превращает сбой одного узла в сбой всех реплик. Варианты защиты — реплика БД с автоматическим переключением (09-1) и readiness, которая допускает деградированный ответ (02-5).
+
+### StatefulSet не переезжает сам
+
+Через 353 с под `web` из Deployment получил `deletionTimestamp`, и контроллер создал замену. А `postgres-0` из StatefulSet тоже получил отметку удаления, перешёл в Terminating и не пересоздался. **StatefulSet** — контроллер подов с постоянным именем и своим томом (02-3).
+
+Причина в гарантии StatefulSet: одновременно существует не больше одного пода с этим именем. Иначе два PostgreSQL писали бы в один том. Контроллер не знает, мёртв узел или просто потерял связь, поэтому ждёт подтверждения. Ждёт бесконечно, пока узел не вернётся.
+
+Для действительно мёртвого узла есть три выхода:
+
+1. Удалить объект Node. Контроллер сборки мусора удалит поды, привязанные к нему.
+2. Выполнить `kubectl delete pod --force --grace-period=0`. Это снимает запись из API, но не останавливает процесс. Если узел на самом деле жив, получится два экземпляра на одном томе.
+3. Повесить taint `node.kubernetes.io/out-of-service=nodeshutdown:NoExecute` (**non-graceful node shutdown**, stable с 1.28). Это явное заявление «узел выключен»: поды удаляются, тома освобождаются. Использовать его можно, только убедившись, что узел действительно выключен.
+
+Том local-path привязан к диску узла. Поэтому даже после удаления пода новый `postgres-0` не запустится на другом узле (04-2).
+
+### Замена зависла в Pending
+
+Замена пода `web` осталась в Pending до возврата узла. Причина в `topologySpreadConstraints` с `maxSkew: 1` по `kubernetes.io/hostname` (05-2). Узел с taint'ом по умолчанию остаётся доменом распределения (`nodeTaintsPolicy: Ignore`). Новый под не может встать на узел, где уже есть `web`, а на мёртвый узел его не пускает taint. Событие `FailedScheduling` говорит об этом:
+
+```
+0/4 nodes are available: 2 node(s) didn't match pod topology spread constraints,
+2 node(s) had untolerated taint(s). ...
+```
+
+### Ошибки пути пода и PLEG
+
+Остальные поломки узла относятся к шагам схемы 4. Ошибки видны в событиях и статусе пода:
+
+- `FailedMount` — шаг 3, том не смонтировался (04-2).
+- `FailedCreatePodSandBox` — шаг 4, часто CNI не выдал IP (03-1).
+- `ErrImagePull`, `ImagePullBackOff` — шаг 5, образ или доступ к реестру.
+- `CreateContainerConfigError` — шаг 6, нет ключа в Secret или ConfigMap.
+- `CrashLoopBackOff` — процесс падает, kubelet ждёт перед повтором (02-1).
+
+Методика разбора каждой ошибки — 11-1.
+
+Отдельный случай — узел NotReady из-за рантайма. **PLEG** (Pod Lifecycle Event Generator) — часть kubelet, которая раз в секунду сверяет состояние контейнеров с рантаймом и узнаёт, что контейнер умер. Сообщение `PLEG is not healthy` в журнале kubelet значит, что рантайм не отвечает слишком долго (порог — 3 минуты). Причины: перегруженный или зависший containerd, тысячи остановленных контейнеров, медленный диск. Смотрят `journalctl -u kubelet -u containerd` и число контейнеров в `crictl ps -a`. Перезапуск containerd лечит симптом, а не причину.
+
+---
+
+## 6. Пределы и значения по умолчанию
+
+Ниже собраны числа этой части для Kubernetes 1.36. Значения стенда проверены через `configz`.
+
+### Heartbeat и вытеснение
+
+- Продление Lease — раз в ~10 с; `nodeLeaseDurationSeconds` — 40.
+- `nodeStatusUpdateFrequency` — 10 с; `nodeStatusReportFrequency` — 5 минут.
+- `node-monitor-grace-period` — 50 с (в старых версиях было 40 с).
+- Toleration к `unreachable` и `not-ready` с `tolerationSeconds` — 300 с.
+- Полная задержка до замены подов Deployment — около 350 с; на стенде измерено 353 с.
+- Для StatefulSet задержка не ограничена без вмешательства.
+
+Сокращать `tolerationSeconds` можно, но не ниже минуты. Короткий сетевой сбой иначе вызовет массовую миграцию подов.
+
+### Узел и поды
+
+- `maxPods` — 110 на узел. Предел накладывает и подсеть узла: `/24` даёт 254 адреса.
+- `serializeImagePulls` — `true`.
+- `fileCheckFrequency` для static pods — 20 с.
+- Allocatable равен capacity минус `kube-reserved`, `system-reserved` и порог вытеснения (05-1, 05-4).
+
+### Логи и образы
+
+- `containerLogMaxSize` — 10Mi; `containerLogMaxFiles` — 5.
+- `imageGCHighThresholdPercent` — 85; `imageGCLowThresholdPercent` — 80.
+
+### Особенности стенда
+
+В kind настройки отличаются от умолчаний. `imageGCHighThresholdPercent` равен 100, то есть сборка образов выключена. Пороги `evictionHard` равны `0%`, и kubelet не защищает диск хоста. Заполнение диска легко не заметить, поэтому на стенде проверяют `docker system df` вручную.
+
+---
+
+## Лабораторные работы
+
+Работы идут на стенде 00-1 в namespace `lab-01-2`. Работы 1 и 2 только читают состояние, работы 3 и 4 меняют узлы стенда и начинаются с блока «Риски». Хост не меняется: узлы kind — контейнеры Docker. Файлы с манифестами, если они понадобятся, лежат в `~/lab/k8s/01-2/`.
+
+Подготовка выполняется один раз.
 
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-01-2
 kubectl config set-context --current --namespace=lab-01-2
-kubectl -n orders get pods -o wide        # запомните, на каком узле postgres-0 (у автора — lab-worker)
+kubectl -n orders get pods -o wide
 ```
 
-### Шаг 1. Sandbox, pause и namespaces
+Первая команда выбирает кластер стенда. Вторая создаёт namespace. Третья делает его текущим, чтобы не писать `-n lab-01-2`. Четвёртая показывает, на каком узле работает `postgres-0`: у автора это `lab-worker`. Если у вас иначе, подставьте свой узел в работе 4. Namespace удаляется в уборке работы 4.
+
+### Лабораторная работа 1. Sandbox, pause и namespaces пода
+
+**Цель.** Найти на узле sandbox пода, убедиться, что pause и контейнер приложения делят сетевой namespace, и сопоставить IP пода с конфигом CNI и маршрутами узла.
+
+**Что понадобится.** Стенд 00-1, работающий под orders-api в namespace `orders`, `crictl` на узлах kind.
+
+**Схема опыта.**
+
+```
+kubectl ──► узел W (docker exec)
+              ├─ crictl pods / inspectp  → sandbox, IP, путь netns
+              ├─ /proc/<pid>/ns/net, pid → pause и api: net общий, pid разный
+              └─ /etc/cni/net.d, ip route → подсеть и маршруты узла
+```
+
+Схема 6. Три источника на узле: рантайм, `/proc` и конфигурация сети. Сравниваем их между собой.
+
+#### Шаг 1. Найти sandbox пода
+
+Команда определяет узел, где работает orders-api, и показывает три поля sandbox: образ pause, путь к netns и IP.
 
 ```bash
-W=$(kubectl -n orders get pod -l app=orders-api -o jsonpath='{.items[0].spec.nodeName}')
+W=$(kubectl -n orders get pod -l app=orders-api \
+  -o jsonpath='{.items[0].spec.nodeName}')
+echo "узел: $W"
 docker exec $W sh -c '
   P=$(crictl pods --namespace orders --name orders-api -q | head -1)
-  crictl inspectp $P | grep -E "\"(ip|path|image)\"" | head -4
+  crictl inspectp $P | grep -E "\"(ip|path|image)\"" | head -4'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `jsonpath='{.items[0].spec.nodeName}'` | узел первого пода с меткой `app=orders-api` |
+| `docker exec $W sh -c '…'` | выполнить блок внутри узла kind |
+| `crictl pods … -q` | вывести только идентификаторы sandbox'ов |
+| `crictl inspectp $P` | подробности sandbox в JSON |
+| `grep -E` | оставить поля `ip`, `path`, `image` |
+
+Результат (у автора узел `lab-worker3`, значения у вас другие):
+
+```
+"image": "registry.k8s.io/pause:3.10",
+"path": "/var/run/netns/cni-542787ea-dd36-7a95-0fc7-860c6ccbef33",
+"ip": "10.244.1.5"
+```
+
+Разбор:
+
+1. `image` — образ pause, который держит sandbox.
+2. `path` — netns пода. Имя начинается с `cni-`: его создал containerd при вызове CNI.
+3. `ip` — адрес пода из подсети узла. Он должен совпасть с `kubectl get pod -o wide`.
+
+#### Шаг 2. Сравнить namespaces
+
+Команда берёт PID процесса pause и PID контейнера `api`, затем сравнивает их ссылки на сетевой и PID-namespace.
+
+```bash
+docker exec $W sh -c '
+  P=$(crictl pods --namespace orders --name orders-api -q | head -1)
   PP=$(crictl inspectp -o go-template --template "{{.info.pid}}" $P)
-  C=$(crictl ps --pod $P -q); CP=$(crictl inspect -o go-template --template "{{.info.pid}}" $C)
+  C=$(crictl ps --pod $P -q)
+  CP=$(crictl inspect -o go-template --template "{{.info.pid}}" $C)
   ls -l /proc/$PP/ns/net /proc/$CP/ns/net /proc/$PP/ns/pid /proc/$CP/ns/pid
   ps -eo pid,args | grep "[/]pause" | head -3'
 ```
 
-Ожидаемо (проверено): у pause и контейнера `api` одинаковый `net:[…]` и разные `pid:[…]`, по одному процессу `/pause` на каждый под узла.
+| Часть команды | Значение |
+|---|---|
+| `inspectp -o go-template` | вывести только поле `.info.pid` sandbox |
+| `crictl ps --pod $P -q` | контейнеры этого пода |
+| `/proc/<pid>/ns/net` | ссылка на сетевой namespace процесса |
+| `/proc/<pid>/ns/pid` | ссылка на PID-namespace процесса |
+| `grep "[/]pause"` | найти pause, не находя сам `grep` |
 
-### Шаг 2. CNI и маршруты
+Результат (сокращён до пути и ссылки):
+
+```
+/proc/1616/ns/net -> net:[4026534532]      ← pause
+/proc/1643/ns/net -> net:[4026534532]      ← контейнер api: тот же сетевой namespace
+/proc/1616/ns/pid -> pid:[4026534597]
+/proc/1643/ns/pid -> pid:[4026534599]      ← PID namespace у каждого свой
+```
+
+Последняя команда должна показать по одному процессу `/pause` на каждый под узла; их число совпадает с числом sandbox'ов в `crictl pods`.
+
+Разбор:
+
+1. Номер `net:[4026534532]` одинаковый: pause и `api` в одном сетевом namespace. Поэтому у них общий IP.
+2. Номера `pid:[…]` разные: PID-namespace у контейнеров раздельные.
+3. Процесс pause не принадлежит контейнеру приложения, поэтому перезапуск `api` не меняет сеть пода.
+
+#### Шаг 3. Сопоставить IP, CNI и маршруты
+
+Команды показывают конфиг CNI узла, таблицу маршрутов и подсети всех узлов.
 
 ```bash
 docker exec $W cat /etc/cni/net.d/10-kindnet.conflist
 docker exec $W ip route
-kubectl get nodes -o custom-columns=NAME:.metadata.name,PODCIDR:.spec.podCIDR,IP:.status.addresses[0].address
+kubectl get nodes -o custom-columns=\
+NAME:.metadata.name,PODCIDR:.spec.podCIDR,IP:.status.addresses[0].address
 ```
 
-Сопоставьте: подсеть узла в `podCIDR` = `subnet` в конфиге CNI; маршрут на каждую чужую подсеть ведёт через IP её узла, на свои поды — через veth.
+| Часть команды | Значение |
+|---|---|
+| `10-kindnet.conflist` | список CNI-плагинов kindnet на этом узле |
+| `ip route` | таблица маршрутов узла |
+| `custom-columns=…` | свои колонки: имя, подсеть подов, IP узла |
+| `.spec.podCIDR` | подсеть, которую узлу выдал control plane |
 
-### Шаг 3. cgroups и конфигурация kubelet
+Результат конфига и маршрутов (сокращён) — как в §2. Ожидаемый результат команды `get nodes`: по строке на каждый из четырёх узлов, в колонке PODCIDR подсеть вида `10.244.N.0/24`.
+
+Разбор:
+
+1. `subnet` в конфиге CNI совпадает с `podCIDR` этого узла: kindnet берёт подсеть из объекта Node.
+2. Маршрут `10.244.1.5 dev veth… scope host` ведёт к поду из шага 1 прямо в veth.
+3. Маршрут `10.244.0.0/24 via 172.20.0.2` — подсеть другого узла достигается через IP этого узла.
+4. Маршрутов `via` столько, сколько других узлов: три.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Под — это sandbox с процессом pause и контейнеры в нём | шаг 1, образ pause |
+| Контейнеры пода делят сетевой namespace, но не PID | шаг 2, номера `net` и `pid` |
+| IP выдаёт CNI из подсети узла | шаг 3, `subnet` и `podCIDR` |
+| Поды чужих узлов достигаются маршрутом через IP узла | шаг 3, `ip route` |
+
+**Уборка.** Работа ничего не создавала. Убираем только переменную.
 
 ```bash
-docker exec $W systemd-cgls --no-pager -u kubelet.slice | head -25
-kubectl get --raw /api/v1/nodes/$W/proxy/configz | jq -c '.kubeletconfig | {nodeStatusUpdateFrequency, nodeStatusReportFrequency, nodeLeaseDurationSeconds, containerLogMaxSize, containerLogMaxFiles, imageGCHighThresholdPercent, imageGCLowThresholdPercent, evictionHard, maxPods, serializeImagePulls}'
-kubectl -n kube-node-lease get lease $W -o jsonpath='{.spec}{"\n"}'
-docker exec $W ls -l /var/log/containers | head -3
+unset W
 ```
 
-Проверено:
+**Вопросы для самопроверки.**
+
+1. Почему перезапуск контейнера приложения не меняет IP пода?
+2. По какому признаку в `/proc` видно, что два процесса делят сетевой namespace?
+3. Откуда в конфиге CNI подсеть `10.244.1.0/24`?
+
+<details>
+<summary>Ответы</summary>
+
+1. Сетевой namespace принадлежит процессу pause, а не контейнеру приложения. Pause живёт, пока жив под.
+2. Совпадают числа в ссылках `/proc/<pid>/ns/net -> net:[…]`.
+3. Это `podCIDR` объекта Node, выданный control plane; kindnet записывает его в конфиг плагина `host-local`.
+
+</details>
+
+### Лабораторная работа 2. cgroups и конфигурация kubelet
+
+**Цель.** Увидеть раскладку подов по QoS-веткам cgroup, прочитать эффективную конфигурацию kubelet и проверить heartbeat узла.
+
+**Что понадобится.** Стенд 00-1, `jq` на хосте, узел `lab-worker`.
+
+**Схема опыта.**
 
 ```
-{"nodeStatusUpdateFrequency":"10s","nodeStatusReportFrequency":"5m0s","nodeLeaseDurationSeconds":40,"containerLogMaxSize":"10Mi","containerLogMaxFiles":5,"imageGCHighThresholdPercent":100,"imageGCLowThresholdPercent":80,"evictionHard":{"imagefs.available":"0%","nodefs.available":"0%","nodefs.inodesFree":"0%"},"maxPods":110,"serializeImagePulls":true}
+docker exec lab-worker   → systemd-cgls          (дерево cgroup)
+kubectl get --raw …/configz → jq                 (параметры kubelet с умолчаниями)
+kubectl get lease        → renewTime             (heartbeat, меняется каждые ~10 с)
+docker exec lab-worker   → /var/log/containers   (симлинки на логи)
+```
+
+Схема 7. Четыре источника: дерево cgroup, настройки kubelet, объект Lease и каталог логов.
+
+#### Шаг 1. Дерево cgroup
+
+Команда показывает первые строки дерева systemd для kubelet и всех его подов.
+
+```bash
+N=lab-worker
+docker exec $N systemd-cgls --no-pager -u kubelet.slice | head -25
+```
+
+| Часть команды | Значение |
+|---|---|
+| `N=lab-worker` | узел, на котором смотрим |
+| `systemd-cgls` | вывести дерево cgroup |
+| `--no-pager` | не запускать постраничный просмотр |
+| `-u kubelet.slice` | показать только ветку этого slice |
+
+Результат: дерево, показанное в §4 (схема 5).
+
+Разбор:
+
+1. `kubelet.service` — сам kubelet, отдельный процесс в корне slice.
+2. `kubelet-kubepods-besteffort.slice` и `…-burstable.slice` — ветки по QoS. Под Guaranteed лежит прямо в `kubepods`.
+3. `cri-containerd-<id>.scope` — один scope на контейнер. В каждом поде есть scope с процессом `/pause`.
+4. Префикс `kubelet-` — особенность kind. На обычном узле имена начинаются с `kubepods`.
+
+#### Шаг 2. Конфигурация kubelet
+
+Команда запрашивает `configz` у kubelet через apiserver и выбирает нужные поля.
+
+```bash
+kubectl get --raw /api/v1/nodes/$N/proxy/configz | jq '.kubeletconfig | {
+  cgroupDriver, nodeStatusUpdateFrequency, nodeStatusReportFrequency,
+  nodeLeaseDurationSeconds, containerLogMaxSize, containerLogMaxFiles,
+  imageGCHighThresholdPercent, imageGCLowThresholdPercent,
+  evictionHard, maxPods, serializeImagePulls }'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `get --raw …/proxy/configz` | запрос к kubelet узла через apiserver |
+| `jq '.kubeletconfig'` | войти в объект с настройками |
+| `{ cgroupDriver, … }` | оставить перечисленные поля |
+
+Результат (значения из лабораторного прогона; поле `cgroupDriver` в нём имеет значение `systemd`):
+
+```
+"nodeStatusUpdateFrequency": "10s",
+"nodeStatusReportFrequency": "5m0s",
+"nodeLeaseDurationSeconds": 40,
+"containerLogMaxSize": "10Mi",
+"containerLogMaxFiles": 5,
+"imageGCHighThresholdPercent": 100,
+"imageGCLowThresholdPercent": 80,
+"evictionHard": { "imagefs.available": "0%", "nodefs.available": "0%",
+                  "nodefs.inodesFree": "0%" },
+"maxPods": 110,
+"serializeImagePulls": true
+```
+
+Разбор:
+
+1. `cgroupDriver: systemd` — kubelet и containerd работают через systemd.
+2. `nodeStatusUpdateFrequency` 10 с и `nodeLeaseDurationSeconds` 40 — параметры heartbeat из §2.
+3. `imageGCHighThresholdPercent: 100` и `evictionHard` по `0%` — настройки kind: сборка образов и вытеснение по диску выключены. Умолчания Kubernetes — 85 и конкретные пороги.
+4. `maxPods: 110`, `serializeImagePulls: true`, `containerLogMaxSize: 10Mi` — умолчания.
+
+#### Шаг 3. Lease и логи
+
+Команды читают Lease узла несколько раз и показывают симлинки логов.
+
+```bash
+for i in 1 2 3; do
+  kubectl -n kube-node-lease get lease $N -o jsonpath='{.spec}{"\n"}'
+  sleep 10
+done
+docker exec $N ls -l /var/log/containers | head -3
+```
+
+| Часть команды | Значение |
+|---|---|
+| `get lease $N` | Lease узла в namespace `kube-node-lease` |
+| `jsonpath='{.spec}'` | вывести только спецификацию |
+| `sleep 10` | пауза между чтениями |
+| `ls -l /var/log/containers` | симлинки на логи контейнеров |
+
+Результат одного чтения Lease и первой строки каталога логов (время и идентификаторы у вас другие):
+
+```
 {"holderIdentity":"lab-worker","leaseDurationSeconds":40,"renewTime":"2026-10-14T08:51:49.053074Z"}
 lrwxrwxrwx 1 root root 140 Oct 14 08:25 envoy-…_envoy-gateway-system_envoy-e2d4….log -> /var/log/pods/envoy-gateway-system_envoy-…_1cefb68a-…/envoy/0.log
 ```
 
-Повторите `get lease` несколько раз — `renewTime` сдвигается каждые ~10 с.
+Разбор:
 
-### Шаг 4. Static pod на worker'е
+1. `holderIdentity` — узел, который держит аренду. Он совпадает с именем узла.
+2. `leaseDurationSeconds: 40` — срок аренды.
+3. В трёх чтениях `renewTime` сдвигается примерно на 10 с: так выглядит heartbeat. Секунды у вас будут свои.
+4. Файл в `/var/log/containers` — симлинк на `/var/log/pods/<ns>_<под>_<uid>/<контейнер>/N.log`. Это тот каталог, который читают агенты сбора логов.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Поды раскладываются по cgroup в ветки QoS | шаг 1, `besteffort` и `burstable` |
+| Драйвер cgroups — systemd | шаг 2, `cgroupDriver` |
+| Умолчания kubelet и отличия kind | шаг 2, GC и `evictionHard` |
+| Heartbeat — обновление Lease раз в ~10 с | шаг 3, `renewTime` |
+| Логи подов лежат в `/var/log/pods`, ссылки — в `/var/log/containers` | шаг 3 |
+
+**Уборка.** Работа ничего не создавала.
+
+```bash
+unset N
+```
+
+**Вопросы для самопроверки.**
+
+1. Почему драйвер cgroups у kubelet и containerd должен совпадать?
+2. Как по Lease понять, что kubelet завис, не заходя на узел?
+3. Где искать лог упавшего контейнера на узле, если под уже удалён?
+
+<details>
+<summary>Ответы</summary>
+
+1. Иначе два менеджера (systemd и cgroupfs) управляют одной иерархией. Под нагрузкой возможны сбои создания подов и неверные лимиты.
+2. Смотреть `renewTime`: если он не меняется больше минуты, kubelet не продлевает аренду.
+3. Нигде: логи удаляются вместе с подом. Нужен внешний сбор (агент читает `/var/log/containers` заранее).
+
+</details>
+
+### Лабораторная работа 3. Static pod на worker'е
+
+**Риски.** Работа добавляет файл на узел стенда.
+
+- **Что меняется:** на узле `lab-worker2` (контейнер Docker) появляется файл в `/etc/kubernetes/manifests`, и kubelet запускает по нему под с busybox.
+- **Надолго ли:** на время работы, около 2 минут; уборка удаляет файл.
+- **Безопасность:** под без привилегий и `hostPath`, образ `busybox:1.37` закреплён по версии. Файл в этом каталоге обходит RBAC и admission, поэтому не оставляйте его после работы.
+- **Влияние на систему:** затрагивается один узел стенда; хост и другие кластеры не меняются.
+- **Откат:** удалить файл (`rm`, см. шаг 4 и «Уборка»).
+
+**Цель.** Запустить static pod на worker'е, увидеть его зеркало в API и убедиться, что `kubectl delete` не останавливает контейнер.
+
+**Что понадобится.** Стенд 00-1, namespace `lab-01-2`, образ `busybox:1.37`, узел `lab-worker2`.
+
+**Схема опыта.**
+
+```
+файл в /etc/kubernetes/manifests (lab-worker2)
+        │ kubelet читает каталог (≤ 20 с)
+        ▼
+контейнер web  ──► mirror pod static-web-lab-worker2 в API
+        ▲                       │ kubectl delete
+        └── тот же контейнер ◄──┘ зеркало пересоздаётся
+```
+
+Схема 8. Источник истины — файл. Объект в API лишь отражает его.
+
+#### Шаг 1. Положить манифест
+
+Команда записывает манифест в каталог static pods узла и через 15 с показывает поды.
 
 ```bash
 docker exec -i lab-worker2 sh -c 'cat > /etc/kubernetes/manifests/static-web.yaml' <<'EOF'
@@ -241,34 +691,177 @@ spec:
     image: busybox:1.37
     command: ["sleep", "infinity"]
 EOF
-sleep 15; kubectl get pods -o wide
-kubectl get pod static-web-lab-worker2 -o jsonpath='{.metadata.annotations}{"\n"}{.metadata.ownerReferences}{"\n"}'
-kubectl delete pod static-web-lab-worker2; sleep 5; kubectl get pods
-docker exec lab-worker2 crictl ps --name '^web$'
-docker exec lab-worker2 rm /etc/kubernetes/manifests/static-web.yaml
-sleep 30; kubectl get pods
+sleep 15
+kubectl get pods -o wide
 ```
 
-Проверено:
+| Часть команды | Значение |
+|---|---|
+| `docker exec -i lab-worker2 sh -c 'cat > …'` | записать stdin в файл на узле |
+| `<<'EOF'` | передать манифест как stdin |
+| `namespace: lab-01-2` | static pod сам указывает namespace зеркала |
+| `sleep 15` | дать kubelet время заметить файл |
+
+Результат (сокращён):
 
 ```
 NAME                     READY   STATUS    RESTARTS   AGE   IP            NODE          ...
 static-web-lab-worker2   1/1     Running   0          15s   10.244.3.10   lab-worker2   ...
-{"kubernetes.io/config.hash":"17b2e4f7…","kubernetes.io/config.mirror":"17b2e4f7…","kubernetes.io/config.seen":"2026-10-14T08:52:06…","kubernetes.io/config.source":"file"}
+```
+
+Разбор:
+
+1. Имя `static-web-lab-worker2` — имя из манифеста плюс суффикс узла.
+2. Scheduler этот под не выбирал: узел определён самим файлом.
+3. Под Running меньше чем за 15 с.
+
+#### Шаг 2. Прочитать признаки зеркала
+
+Команда выводит аннотации и владельца зеркального пода.
+
+```bash
+kubectl get pod static-web-lab-worker2 \
+  -o jsonpath='{.metadata.annotations}{"\n"}{.metadata.ownerReferences}{"\n"}'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `.metadata.annotations` | аннотации, которые поставил kubelet |
+| `.metadata.ownerReferences` | владелец объекта |
+
+Результат (хеши и время сокращены):
+
+```
+{"kubernetes.io/config.hash":"17b2e4f7…","kubernetes.io/config.mirror":"17b2e4f7…",
+ "kubernetes.io/config.seen":"2026-10-14T08:52:06…","kubernetes.io/config.source":"file"}
 [{"apiVersion":"v1","controller":true,"kind":"Node","name":"lab-worker2","uid":"8eddb6f6-…"}]
+```
+
+Разбор:
+
+1. `config.source: file` — под пришёл из файла, а не из API.
+2. `config.mirror` — отметка зеркального пода.
+3. Владелец — объект Node `lab-worker2`, а не ReplicaSet или другой контроллер.
+
+#### Шаг 3. Удалить зеркало
+
+Команда удаляет объект пода в API и сразу сверяет контейнер на узле.
+
+```bash
+kubectl delete pod static-web-lab-worker2
+sleep 5
+kubectl get pods
+docker exec lab-worker2 crictl ps --name '^web$'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `kubectl delete pod …` | удалить зеркальный объект |
+| `crictl ps --name '^web$'` | найти контейнер `web` на узле |
+
+Результат:
+
+```
 pod "static-web-lab-worker2" deleted from lab-01-2 namespace
 NAME                     READY   STATUS    RESTARTS   AGE
 static-web-lab-worker2   1/1     Running   0          6s
 CONTAINER           IMAGE               CREATED             STATE     NAME   ATTEMPT   POD ID          POD                      NAMESPACE
 83462e6183552       30ecbe1509090       20 seconds ago      Running   web    0         b3d278488e485   static-web-lab-worker2   lab-01-2
+```
+
+Разбор:
+
+1. Зеркало «помолодело» (`AGE 6s`): kubelet создал новое.
+2. Контейнер создан 20 с назад: тот же, что и до удаления. Он не пересоздавался.
+3. `kubectl delete` убирает только объект в API.
+
+#### Шаг 4. Удалить файл
+
+Команда удаляет манифест с узла и проверяет, что под исчез.
+
+```bash
+docker exec lab-worker2 rm /etc/kubernetes/manifests/static-web.yaml
+sleep 30
+kubectl get pods
+```
+
+| Часть команды | Значение |
+|---|---|
+| `rm …/static-web.yaml` | убрать файл — источник static pod |
+| `sleep 30` | подождать период опроса каталога (20 с) и остановку |
+
+Результат:
+
+```
 No resources found in lab-01-2 namespace.
 ```
 
-Mirror pod после `delete` «помолодел» (6 с), а контейнер — тот же, созданный 20 с назад.
+Разбор: файл исчез, и kubelet остановил контейнер и убрал зеркало. Подождать нужно до 20 с (`fileCheckFrequency`) плюс остановка.
 
-### Шаг 5. Узел теряет kubelet
+**Итог.**
 
-Разложите три пода по узлам и запустите наблюдение на 7 минут. Если PostgreSQL у вас не на `lab-worker` — подставьте его узел в `NODE`.
+| Что узнали | Где видно |
+|---|---|
+| Static pod запускает kubelet из файла, без scheduler | шаг 1 |
+| В API он виден как зеркало с владельцем Node | шаг 2, `config.source: file` |
+| `kubectl delete` не останавливает контейнер | шаг 3, возраст контейнера 20 с |
+| Остановить static pod можно, только убрав файл | шаг 4 |
+
+**Уборка.** Файл удалён в шаге 4. Убедитесь, что каталог чист.
+
+```bash
+docker exec lab-worker2 ls /etc/kubernetes/manifests
+```
+
+Результат — пустой вывод (на worker'ах стенда в каталоге нет других манифестов). Эту работу вы можете повторить, не меняя ничего больше.
+
+**Вопросы для самопроверки.**
+
+1. Почему `kubectl delete` не останавливает static pod?
+2. Кто выбирает узел для static pod?
+3. Чем опасен записываемый каталог манифестов на узле?
+4. Как узнать по API, что под — зеркальный?
+
+<details>
+<summary>Ответы</summary>
+
+1. Объект в API — зеркало файла. kubelet создаёт зеркало заново, пока файл существует.
+2. Никто: под запускается на том узле, где лежит файл. Scheduler не участвует.
+3. Файл запускает под в обход RBAC и admission. Под может примонтировать `hostPath`, значит, запись в каталог эквивалентна root на узле.
+4. По аннотации `kubernetes.io/config.mirror` и владельцу `Node` в `ownerReferences`.
+
+</details>
+
+### Лабораторная работа 4. Узел без kubelet: NotReady и вытеснение
+
+**Риски.** Работа останавливает kubelet на рабочем узле стенда.
+
+- **Что меняется:** на узле `lab-worker` останавливается служба kubelet. Контейнеры узла продолжают работать, но узел теряет связь с кластером. В namespace `lab-01-2` создаётся Deployment `web`.
+- **Надолго ли:** около 7 минут наблюдения; kubelet возвращается командой в конце.
+- **Безопасность:** привилегий сверх `docker exec` не нужно, секреты не затрагиваются.
+- **Влияние на систему:** на `lab-worker` работает `postgres-0` из namespace `orders`. Пока kubelet остановлен, `curl http://orders.localhost:8088/api/orders` отвечает 503. Не запускайте другие работы параллельно.
+- **Откат:** `docker exec lab-worker systemctl start kubelet`. Если терминал потерян, выполните эту команду в новом.
+
+**Цель.** Измерить, через сколько секунд узел уходит в NotReady, когда поды получают метку удаления, и что при этом делают Deployment и StatefulSet.
+
+**Что понадобится.** Стенд 00-1 с приложением orders, узел `lab-worker` с `postgres-0` (при другом расположении подставьте узел в `NODE`), образ `busybox:1.37`, `curl` и `jq` на хосте, два окна терминала.
+
+**Схема опыта.**
+
+```
+lab-worker:      kubelet (остановлен) │ containerd │ postgres-0 (процесс жив)
+lab-worker2,3:   kubelet работает     │ web ×2
+                                       ▼
+t=0     systemctl stop kubelet
+t=+53 с узел Unknown + taint'ы unreachable → endpoint postgres неготов → api=503
+t=+353 с поды узла получают deletionTimestamp → Deployment создаёт замену
+```
+
+Схема 9. Хронология опыта. Наблюдатель-цикл печатает строку при каждом изменении.
+
+#### Шаг 1. Разложить поды
+
+Команда создаёт Deployment из трёх подов, которые по `topologySpreadConstraints` занимают разные worker'ы, и показывает их расположение.
 
 ```bash
 kubectl apply -f - <<'EOF'
@@ -282,21 +875,50 @@ spec:
     metadata: {labels: {app: web}}
     spec:
       topologySpreadConstraints:
-      - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: DoNotSchedule, labelSelector: {matchLabels: {app: web}}}
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector: {matchLabels: {app: web}}
       containers:
       - {name: web, image: busybox:1.37, command: ["sleep", "infinity"]}
 EOF
 kubectl rollout status deploy/web
 kubectl get pods -o wide
+```
 
+| Часть команды | Значение |
+|---|---|
+| `replicas: 3` | три пода |
+| `maxSkew: 1` | разница числа подов между узлами не больше одного |
+| `topologyKey: kubernetes.io/hostname` | распределять по узлам |
+| `whenUnsatisfiable: DoNotSchedule` | не ставить под, если правило нарушается |
+| `rollout status` | дождаться готовности всех подов |
+
+Ожидаемый результат: три пода `web` Running, по одному на `lab-worker`, `lab-worker2` и `lab-worker3` (control plane закрыт taint'ом).
+
+Разбор: на `lab-worker` стоит один под `web` и `postgres-0`. Эти поды понадобятся для сравнения Deployment и StatefulSet.
+
+#### Шаг 2. Остановить kubelet и наблюдать
+
+Скрипт останавливает kubelet и 7 минут выводит строку при каждом изменении: состояние узла, `postgres-0`, endpoint БД, поды `web` и ответ API. Запустите его в первом окне.
+
+```bash
 NODE=lab-worker
+NJ='{.status.conditions[?(@.type=="Ready")].status}/'
+NJ+='{.status.conditions[?(@.type=="Ready")].reason} '
+NJ+='taints={.spec.taints[*].key}:{.spec.taints[*].effect}'
+PJ='{.status.phase}/ready={.status.conditions[?(@.type=="Ready")].status}'
+PJ+='/del={.metadata.deletionTimestamp}'
 t0=$(date +%s); prev=""
 docker exec $NODE systemctl stop kubelet; echo "t=0 kubelet stopped on $NODE"
 while [ $(( $(date +%s)-t0 )) -lt 420 ]; do
-  n=$(kubectl get node $NODE -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}/{.status.conditions[?(@.type=="Ready")].reason} taints={.spec.taints[*].key}:{.spec.taints[*].effect}')
-  p=$(kubectl -n orders get pod postgres-0 -o jsonpath='{.status.phase}/ready={.status.conditions[?(@.type=="Ready")].status}/del={.metadata.deletionTimestamp}')
-  w=$(kubectl get pods -o wide --no-headers | awk '{printf "%s:%s:%s ", substr($1,length($1)-4), $3, $7}')
-  ep=$(kubectl -n orders get endpointslice -l kubernetes.io/service-name=postgres -o jsonpath='{.items[0].endpoints[*].conditions.ready}')
+  n=$(kubectl get node $NODE -o jsonpath="$NJ")
+  p=$(kubectl -n orders get pod postgres-0 -o jsonpath="$PJ")
+  w=$(kubectl get pods -o wide --no-headers |
+    awk '{printf "%s:%s:%s ", substr($1,length($1)-4), $3, $7}')
+  ep=$(kubectl -n orders get endpointslice \
+    -l kubernetes.io/service-name=postgres \
+    -o jsonpath='{.items[0].endpoints[*].conditions.ready}')
   c=$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://orders.localhost:8088/api/orders)
   cur="node=$n | pg=$p ep_ready=$ep | web=$w | api=$c"
   [ "$cur" != "$prev" ] && echo "t=+$(( $(date +%s)-t0 ))s $cur" && prev=$cur
@@ -304,33 +926,91 @@ while [ $(( $(date +%s)-t0 )) -lt 420 ]; do
 done
 ```
 
-Проверено (запросы к API — из сети kind, 00-1 §4.4):
+| Часть команды | Значение |
+|---|---|
+| `NJ`, `PJ` | шаблоны jsonpath для узла и для `postgres-0` |
+| `docker exec $NODE systemctl stop kubelet` | остановить kubelet на узле |
+| `substr($1,length($1)-4)` | последние пять знаков имени пода |
+| `endpoints[*].conditions.ready` | готовность адресов БД в EndpointSlice |
+| `curl -m 3 -w '%{http_code}'` | код ответа сквозного запроса, не дольше 3 с |
+| `[ "$cur" != "$prev" ] && echo …` | печатать, только если строка изменилась |
+
+Результат (строки перенесены; запросы идут из сети kind, 00-1 §4.4):
 
 ```
 t=0 kubelet stopped on lab-worker
-t=+1s node=True/KubeletReady taints=: | pg=Running/ready=True/del= ep_ready=true | web=j62pr:Running:lab-worker2 wz5nv:Running:lab-worker xpvrm:Running:lab-worker3  | api=200
-t=+53s node=Unknown/NodeStatusUnknown taints=node.kubernetes.io/unreachable node.kubernetes.io/unreachable:NoSchedule NoExecute | pg=Running/ready=False/del= ep_ready=false | web=j62pr:Running:lab-worker2 wz5nv:Running:lab-worker xpvrm:Running:lab-worker3  | api=503
-t=+353s node=Unknown/NodeStatusUnknown taints=node.kubernetes.io/unreachable node.kubernetes.io/unreachable:NoSchedule NoExecute | pg=Running/ready=False/del=2026-10-14T09:00:41Z ep_ready=false | web=5hmqj:Pending:<none> j62pr:Running:lab-worker2 wz5nv:Terminating:lab-worker xpvrm:Running:lab-worker3  | api=503
+t=+1s node=True/KubeletReady taints=: | pg=Running/ready=True/del= ep_ready=true |
+  web=j62pr:Running:lab-worker2 wz5nv:Running:lab-worker xpvrm:Running:lab-worker3  | api=200
+t=+53s node=Unknown/NodeStatusUnknown taints=node.kubernetes.io/unreachable
+  node.kubernetes.io/unreachable:NoSchedule NoExecute | pg=Running/ready=False/del=
+  ep_ready=false | web=j62pr:Running:lab-worker2 wz5nv:Running:lab-worker
+  xpvrm:Running:lab-worker3  | api=503
+t=+353s node=Unknown/NodeStatusUnknown taints=node.kubernetes.io/unreachable
+  node.kubernetes.io/unreachable:NoSchedule NoExecute | pg=Running/ready=False/
+  del=2026-10-14T09:00:41Z ep_ready=false | web=5hmqj:Pending:<none> j62pr:Running:lab-worker2
+  wz5nv:Terminating:lab-worker xpvrm:Running:lab-worker3  | api=503
 ```
 
-Пока узел «мёртв», проверьте, что PostgreSQL на самом деле жив, и почему новый `web` не планируется:
+Разбор:
+
+1. `t=+1s` — узел `True/KubeletReady`, всё работает: за секунду control plane ещё ничего не заметил.
+2. `t=+53s` — узел `Unknown/NodeStatusUnknown`, два taint'а `unreachable`, `postgres-0` стал `ready=False`, endpoint неготов, API отвечает 503. Процессы живы, а сервис уже лёг.
+3. Между +53 и +353 с строк нет: состояние не менялось. Эти 300 с — `tolerationSeconds` по умолчанию.
+4. `t=+353s` — у `postgres-0` есть `deletionTimestamp`. Под `wz5nv` перешёл в Terminating, и контроллер создал замену `5hmqj`, она Pending без узла.
+5. Время +53 с совпадает с `node-monitor-grace-period` (50 с) плюс интервал опроса цикла. +353 с равно 53 + 300.
+
+#### Шаг 3. Проверить, что БД жива, и найти причину Pending
+
+Пока цикл работает, во втором окне проверим, что процесс PostgreSQL работает, и прочитаем событие планировщика.
 
 ```bash
-docker exec $NODE crictl ps --name postgres                   # Running
-kubectl get events --field-selector reason=FailedScheduling -o jsonpath='{.items[-1:].message}{"\n"}'
+docker exec lab-worker crictl ps --name postgres
+kubectl get events --field-selector reason=FailedScheduling \
+  -o jsonpath='{.items[-1:].message}{"\n"}'
 ```
 
-Верните kubelet и засеките восстановление:
+| Часть команды | Значение |
+|---|---|
+| `crictl ps --name postgres` | контейнеры с этим именем на узле |
+| `--field-selector reason=FailedScheduling` | только события отказа планировщика |
+| `{.items[-1:].message}` | текст последнего события |
+
+Ожидаемый результат: у контейнера postgres состояние `Running`. Сообщение события (сокращено):
+
+```
+0/4 nodes are available: 2 node(s) didn't match pod topology spread constraints,
+2 node(s) had untolerated taint(s). ...
+```
+
+Разбор:
+
+1. Контейнер Running: узел потерял связь с кластером, а процесс не пострадал.
+2. Два узла не подошли из-за правила распределения: на каждом уже есть по поду `web`.
+3. Два узла не подошли из-за taint'ов: control plane и мёртвый `lab-worker`.
+4. Замена `web` стоит в Pending, хотя места в кластере достаточно.
+
+#### Шаг 4. Вернуть kubelet и засечь восстановление
+
+Команда запускает kubelet и ждёт, пока сквозной запрос снова вернёт 200.
 
 ```bash
 t0=$(date +%s); docker exec $NODE systemctl start kubelet
-until [ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' http://orders.localhost:8088/api/orders)" = 200 ]; do sleep 1; done
+until [ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' \
+  http://orders.localhost:8088/api/orders)" = 200 ]; do sleep 1; done
 echo "api=200 after $(( $(date +%s)-t0 ))s"
-kubectl -n orders get pods -o wide; kubectl get pods -o wide
+kubectl -n orders get pods -o wide
+kubectl get pods -o wide
 curl -s http://orders.localhost:8088/api/orders | jq -c '[.orders[].item]'
 ```
 
-Проверено:
+| Часть команды | Значение |
+|---|---|
+| `systemctl start kubelet` | запустить службу на узле |
+| `until [ … = 200 ]; do sleep 1; done` | опрашивать раз в секунду, пока не будет 200 |
+| `get pods -o wide` | поды с узлами и IP |
+| `jq -c '[.orders[].item]'` | список товаров из ответа |
+
+Результат (сокращён):
 
 ```
 api=200 after 8s
@@ -340,112 +1020,58 @@ web-747b449645-5hmqj Running lab-worker
 ["book","pen","lamp"]
 ```
 
-`postgres-0` — новый под (`RESTARTS 0`, новый IP) на том же узле и с теми же данными: том local-path живёт на диске `lab-worker`.
+Разбор:
 
-### Уборка
+1. `after 8s` — через 8 секунд API снова отвечает 200.
+2. `postgres-0` — новый под (`RESTARTS 0`, новый IP) на том же узле. Прежний был удалён после возврата kubelet.
+3. Замена `web` стартовала на `lab-worker`: вернувшийся узел снова принимает поды.
+4. Список заказов на месте: том local-path лежит на диске `lab-worker`, данные сохранились.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Процессы живут, когда kubelet остановлен | шаг 3, `crictl ps` |
+| Узел становится Unknown через ~50 с | шаг 2, `t=+53s` |
+| Сервис падает на этом же шаге | шаг 2, `api=503`, `ep_ready=false` |
+| Поды получают метку удаления через 300 с после taint'а | шаг 2, `t=+353s` |
+| StatefulSet не создаёт замену без вмешательства | шаг 2, `postgres-0` в Terminating |
+| Замена из Deployment может зависнуть из-за spread | шаг 3, `FailedScheduling` |
+
+**Уборка.** Проверяем, что kubelet работает, удаляем созданное и namespace.
 
 ```bash
-docker exec lab-worker systemctl is-active kubelet           # active
-docker exec lab-worker2 ls /etc/kubernetes/manifests          # пусто — static-web удалён
+docker exec lab-worker systemctl is-active kubelet
+docker exec lab-worker2 ls /etc/kubernetes/manifests
+kubectl -n orders get pods
 kubectl config set-context --current --namespace=default
 kubectl delete ns lab-01-2
+unset NODE NJ PJ t0 prev
 ```
 
----
+Первая команда должна вывести `active`, вторая — ничего (каталог пуст, `static-web` удалён в работе 3). Третья показывает поды `orders`: все Running. Остальное удаляет namespace вместе с Deployment `web`.
 
-## 🔥 Кейс из прода: «упал один узел — лёг весь сервис, хотя у нас две реплики»
+**Вопросы для самопроверки.**
 
-**Контекст.** orders-api — 2 реплики Deployment, PostgreSQL — StatefulSet с одной репликой на локальном диске узла. Узел с PostgreSQL перестал отвечать (завис kubelet после OOM на узле; ssh работал, контейнеры тоже). Через минуту — алерт «5xx 100%», хотя оба пода orders-api на других узлах и Running.
+1. Через сколько секунд после остановки kubelet узел становится Unknown и откуда берётся эта цифра?
+2. Почему orders-api отвечал 503, если PostgreSQL не падал?
+3. Почему `postgres-0` не появился на другом узле, а замена `web` появилась?
+4. Почему замена `web` осталась Pending?
+5. Как ускорить замену подов Deployment и что вы при этом рискуете?
 
-**Разбор.**
-1. `kubectl get pods -n orders` — orders-api `0/1 Running` (не Ready), postgres-0 `1/1 Running` — статус устаревший: узел `NotReady`/`Unknown`.
-2. `kubectl -n orders get endpointslice` — у postgres адрес `ready: false`. Headless Service отдаёт в DNS только готовые адреса: `postgres` не резолвится, readiness orders-api (`/ready` проверяет БД) падает, оба пода выпадают из Service. Каскад: проблема узла → неготовый endpoint → readiness зависимого сервиса → 503 у всех.
-3. Через 5 минут postgres-0 перешёл в `Terminating` и так и остался — StatefulSet ждал подтверждения от узла. Дежурный удалил под с `--force` — новый `postgres-0` повис в Pending: PV local-path привязан к недоступному узлу (04-2).
-4. Спасло возвращение узла: перезапуск kubelet по ssh.
+<details>
+<summary>Ответы</summary>
 
-**Фикс.**
-- PostgreSQL — с репликой и автоматическим failover (оператор CloudNativePG, 09-1) и томами, не привязанными к одному узлу.
-- Readiness orders-api не роняет под при недоступной БД целиком: под остаётся в Service и отдаёт деградированный ответ (кэш, 503 только на запись) — модель «зависимости в readiness» разобрана в 02-5.
-- Runbook «узел NotReady»: проверить kubelet и containerd по ssh до любых `--force`; `--force` для подов StatefulSet — только когда узел гарантированно выключен (или taint `node.kubernetes.io/out-of-service`).
-- Алерт на `kube_node_status_condition{condition="Ready",status!="true"}` с понятным текстом «какие StatefulSet живут на узле».
+1. Через `node-monitor-grace-period` — 50 с по умолчанию в 1.36. На стенде замерено +53 с с учётом шага опроса.
+2. Поды на узле Unknown становятся неготовыми, адрес БД пропал из endpoint'ов и DNS. Readiness orders-api зависит от БД, поэтому оба пода вышли из Service.
+3. StatefulSet гарантирует не больше одного пода с этим именем и ждёт подтверждения от узла. Том local-path к тому же привязан к диску узла. Deployment такой гарантии не даёт.
+4. Spread с `maxSkew: 1` считает узел с taint'ом доменом (`nodeTaintsPolicy: Ignore`), а на остальных узлах уже стоят поды `web`.
+5. Уменьшить `tolerationSeconds` в подах до значения не ниже минуты. Короткий сетевой сбой иначе приведёт к лишней миграции подов.
 
-**Что запомнить.**
-- NotReady-узел за ~50 с делает endpoint'ы своих подов неготовыми — даже если процессы живы.
-- Поды Deployment уезжают через ~5 минут; StatefulSet — только после подтверждения смерти узла.
-- Одна реплика stateful-зависимости + readiness, проверяющий эту зависимость, = единая точка отказа для всех реплик сервиса.
+</details>
 
 ---
 
-## 💼 Вопросы с собеседования
+## → Дальше
 
-### 🟢 Junior
-
-**1. Что делает kubelet?**
-Агент на каждом узле: следит (watch) за подами, назначенными узлу, запускает их через CRI-рантайм (containerd), монтирует тома, выполняет probes, перезапускает контейнеры по restartPolicy, пишет статус подов и узла и heartbeat (Lease) в apiserver.
-
-**2. Что такое pause-контейнер?**
-Процесс `/pause` в sandbox'е пода, который держит общие namespaces (прежде всего сетевой). Контейнеры пода присоединяются к ним; при перезапуске контейнера IP пода не меняется.
-
-**3. Нужен ли Docker на узле Kubernetes?**
-Нет. С 1.24 kubelet работает с рантаймом через CRI (containerd, CRI-O); dockershim удалён. Образы, собранные Docker'ом, — обычные OCI-образы и запускаются.
-
-### 🟡 Middle
-
-**4. Что такое CRI и CNI и кто их вызывает?**
-CRI — gRPC-интерфейс kubelet → рантайм (создать sandbox, контейнер, pull образа). CNI — интерфейс рантайм → сетевой плагин: при создании sandbox'а containerd вызывает бинарники из `/opt/cni/bin` по конфигу `/etc/cni/net.d`, они создают интерфейс в netns пода, выдают IP и маршруты.
-
-**5. Что такое static pod и как его удалить?**
-Под из файла в `staticPodPath` (`/etc/kubernetes/manifests`), который kubelet запускает сам. В API — mirror pod; `kubectl delete` пересоздаёт только mirror, контейнер продолжает работать. Удалить — убрать файл с узла.
-
-**6. Узел упал. Через сколько поды переедут?**
-Kubelet перестаёт продлевать Lease; через `node-monitor-grace-period` (50 с в новых версиях) узел `Unknown` и получает taint `unreachable:NoExecute`; поды имеют toleration на 300 с — через ~5 мин 50 с они помечаются на удаление, Deployment создаёт замену. StatefulSet не создаёт замену, пока узел не подтвердит удаление пода (или не удалён объект Node / стоит taint out-of-service).
-
-### 🔴 Senior
-
-**7. Почему после потери узла с единственной репликой БД сервис может лечь целиком через минуту, хотя БД жива?**
-Endpoint'ы подов на узле `Unknown` помечаются неготовыми; Service (особенно headless) перестаёт отдавать адрес; если readiness зависимого сервиса проверяет БД — все его поды выпадают из endpoints. Решение: реплика БД с failover, readiness без жёсткой зависимости от единственной БД, PDB и anti-affinity.
-
-**8. Что значит `PLEG is not healthy` и что делать?**
-Kubelet не успевает получить от рантайма состояние контейнеров за отведённое время (3 мин); узел становится NotReady. Причины: перегруженный или зависший containerd, тысячи остановленных контейнеров, проблемы диска (IO wait), большое число подов. Смотреть `journalctl -u kubelet -u containerd`, `crictl ps -a | wc -l`, `iostat`; лечить причину, перезапуск containerd — временная мера.
-
-**9. Почему драйвер cgroups у kubelet и рантайма должен совпадать?**
-Иначе два менеджера (systemd и cgroupfs) управляют одной иерархией, systemd не знает о части cgroup'ов, и под давлением ресурсов узел ведёт себя непредсказуемо (сбои создания подов, некорректные лимиты). На systemd-дистрибутивах — `systemd` у обоих (`cgroupDriver` в kubelet и `SystemdCgroup = true` в containerd).
-
----
-
-## ⚠️ Подводные камни
-
-- Контейнеры на узле продолжают работать, когда kubelet остановлен, — `kubectl get pods` при этом показывает устаревший статус.
-- Узел `Unknown` → endpoint'ы его подов неготовы → зависимые сервисы падают через readiness. Каскад наступает за ~50 с.
-- `kubectl delete pod --force` для StatefulSet на «потерянном» узле может дать два экземпляра на одном томе, если узел на самом деле жив.
-- Поды с PV на локальном диске (local-path, local) не переезжают с узла — Pending до его возвращения.
-- `topologySpreadConstraints` по умолчанию считает узлы с taint'ами доменами — замена может зависнуть Pending, пока узел мёртв (`nodeTaintsPolicy: Honor` меняет это).
-- Удаление mirror pod не останавливает static pod; файл в `/etc/kubernetes/manifests` на любом узле — обход RBAC и admission.
-- В kind GC образов и eviction по диску выключены — диск хоста заполняется незаметно.
-- `imagePullPolicy: Always` + медленный реестр + `serializeImagePulls: true` — долгий старт всех подов узла.
-
----
-
-## Чеклист
-
-- [ ] Покажу на узле pause-контейнер и общий сетевой namespace пода.
-- [ ] Объясню путь от binding до Ready и где на нём типовые ошибки.
-- [ ] Найду конфиг CNI, подсеть узла и маршруты к подам других узлов.
-- [ ] Найду cgroup пода и объясню раскладку по QoS-слайсам.
-- [ ] Создам и удалю static pod; объясню, почему `kubectl delete` его не убивает.
-- [ ] Назову цифры: 10 с heartbeat, 50 с до Unknown, 300 с до вытеснения; объясню, почему StatefulSet не переезжает.
-
----
-
-## Задание со звёздочкой
-
-Сократите время реакции на потерю узла для orders-api и измерьте результат:
-
-1. Добавьте в под orders-api toleration `node.kubernetes.io/unreachable:NoExecute` с `tolerationSeconds: 60` (и такую же для `not-ready`).
-2. Положите один под orders-api на узел `lab-worker` (nodeSelector или affinity) и повторите шаг 5, наблюдая за orders-api вместо `web`.
-3. Сравните время до появления замены с дефолтными 353 с. Чем рискуете, если поставить 10 с? Что будет при сетевом сбое на 30 секунд у трёх узлов из четырёх?
-4. Попробуйте taint `node.kubernetes.io/out-of-service=nodeshutdown:NoExecute` на «мёртвом» узле: что происходит с `postgres-0` и его томом? Снимите taint и верните kubelet.
-
----
-
-→ Следующая часть: **01-3. API-объекты и kubectl под капотом** — labels и selectors, client-side и server-side apply, field managers и конфликты, ownerReferences и каскадное удаление, finalizers и подресурсы; почему `kubectl apply` затирает `replicas`, выставленные HPA.
+Узел исполняет то, что записано в объектах API, и сообщает о себе через статусы и Lease. Теперь нужно понять сами объекты: откуда берутся ownerReferences, как apply решает, чьи поля менять, и что держит объект в Terminating. Эти механизмы мы уже видели: зеркальный под с владельцем Node, поды с `deletionTimestamp`, статус, который пишет kubelet. Поэтому следующая часть, 01-3, разбирает API-объекты и kubectl под капотом: метки и селекторы, client-side и server-side apply, поля-владельцы, каскадное удаление и finalizers.

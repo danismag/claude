@@ -1,71 +1,363 @@
 # 00-1. Стенд курса
 
-> Модуль 0 «Стенд и инструменты» · часть 1 из 2 · 🟢 · ~30 мин чтения + ~20 мин запуска · Нужно: Docker 27+, 8 ГБ свободной RAM, 20 ГБ диска, kind, kubectl, helm
+Модуль 00 «Стенд и инструменты» · часть 1 из 2 · ~1 ч чтения + ~1,5 ч лабораторных · Нужно: Docker 27+, 8 ГБ свободной RAM, 20 ГБ диска, доступ в интернет для скачивания образов · Опирается на: ничего, это первая часть курса.
 
-> Проверено: стенд поднят `lab/lab-up.sh` с нуля за 2 мин 9 с, повторный запуск идемпотентен (18 с), `lab-down.sh` (без `--purge`) → `lab-up.sh` восстанавливает кластер со всеми данными за 51 с; сквозной запрос к orders-api через Gateway отвечает данными из PostgreSQL. kind 0.32.0, Kubernetes 1.36.1, containerd 2.3.1, Envoy Gateway 1.9.2, metrics-server 0.8.0, Docker 29.7.2, Manjaro (ядро 6.18).
+## Где мы на карте
+
+Это первая часть курса. Все остальные части выполняют лабораторные работы на стенде, который собирается здесь. Следующая часть (00-2) разбирает инструменты: kubectl, crictl, k9s, stern. Модули 01–11 используют стенд как готовую среду и ничего в нём не устанавливают заново.
+
+```
+модули 01 … 11      лабораторные работы: поды, сеть, диски, доступ, GitOps, диагностика
+      │
+      ▼
+00-2 инструменты    kubectl, crictl, k9s, stern
+      │
+      ▼
+00-1 стенд          кластер kind + реестр + вход + демо-приложение   <- эта часть
+      │
+      ▼
+хост                Docker, ядро Linux, ваш ~/.kube/config
+```
+
+Схема 1. Стенд лежит под всеми лабораторными работами; он работает поверх Docker на вашей машине.
 
 ---
 
-## Зачем это DevOps-у
+## 1. Какую задачу решает стенд
 
-Все лабы курса идут на одном кластере, который поднимается одной командой и пересоздаётся за пару минут. Кластер настоящий: те же kube-apiserver, etcd, kubelet и containerd, что в проде, только узлы — контейнеры Docker на вашей машине. Ломать его можно смело: в худшем случае `lab-down.sh --purge && lab-up.sh`.
+Стенд даёт один и тот же кластер для всех частей, который поднимается за пару минут. Разберём, что в нём настоящее и чего в нём нет.
 
-Сквозной сценарий курса — сервис orders-api из курса `cicd`, теперь в Kubernetes, с PostgreSQL:
+### Один кластер на весь курс
 
-```
-curl http://orders.localhost:8088/api/orders
-```
+Лабораторные работы нужны на настоящем кластере, а не на имитации. Стенд запускает те же kube-apiserver, etcd, kubelet и containerd, что работают в проде. Кластер можно ломать смело: в худшем случае его пересоздают одной командой (§3).
 
-Каждая часть возвращается к этому запросу: ломает или улучшает одно звено его пути.
+Расширения (cert-manager, Argo CD, Gitea, CloudNativePG и другие) стенд не содержит. Каждая работа ставит свои расширения командами в начале и удаляет в конце. Поэтому стенд остаётся одинаковым для всех частей.
+
+### Что такое kind
+
+**kind** (Kubernetes in Docker) — инструмент, который запускает узлы Kubernetes как контейнеры Docker. Один контейнер — один узел. Внутри контейнера работают systemd, kubelet и containerd. Кластер из четырёх узлов kind целиком помещается на ноутбук.
+
+**Узел** (node) — машина, на которой kubelet запускает поды. В kind роль «машины» играет контейнер, поэтому на узел заходят командой `docker exec`.
+
+### Чего стенд не воспроизводит
+
+Стенд моделирует управляющие компоненты и работу узлов, но не железо и не облако.
+
+- **Нет настоящей сети между узлами.** Узлы — контейнеры в одной docker-сети, задержек и потерь между ними нет.
+- **Нет облачного балансировщика.** Service типа LoadBalancer остаётся в состоянии `<pending>` (§6).
+- **Нет изоляции ресурсов между узлами.** Все четыре узла делят CPU и память одной машины (§6).
+
+Эти пределы названы там, где они влияют на опыт: в частях о ресурсах (05-1, 05-4) и о сети (03-1).
 
 ---
 
-## 1. Топология 🟢
+## 2. Как устроен стенд
+
+Стенд состоит из четырёх узлов kind, реестра образов, входа в кластер и нескольких дополнений. Всё работает в docker-сети `kind` на одной машине.
+
+### Топология
+
+Схема показывает, какие порты хоста ведут к каким компонентам. Смотрите на левый край: это три порта хоста.
 
 ```
 хост (127.0.0.1)
- ├─ :6443x ────────► lab-control-plane    apiserver, etcd, scheduler, controller-manager (static pods),
- │                                         CoreDNS, local-path-provisioner
- ├─ :8088 ─────────►   :30080 (NodePort) ─► Envoy Gateway → HTTPRoute orders.localhost → Service orders-api
- │                   lab-worker            ┐
- │                   lab-worker2           ├ kubelet + containerd 2.3, kube-proxy (iptables), kindnet (CNI)
- │                   lab-worker3           ┘
- └─ :5001 ─────────► kind-registry         registry:2.8.3 — образы стенда, на хосте и в узлах: localhost:5001/…
+ ├─ :6443x ────────► lab-control-plane   apiserver, etcd, scheduler, controller-manager,
+ │                                        CoreDNS, local-path-provisioner
+ ├─ :8088 ─────────►   :30080 (NodePort) ─► Envoy Gateway ─► HTTPRoute ─► Service orders-api
+ │                   lab-worker           ┐
+ │                   lab-worker2          ├ kubelet + containerd, kube-proxy, kindnet
+ │                   lab-worker3          ┘
+ └─ :5001 ─────────► kind-registry        registry:2.8.3 — образы стенда
                      (всё — в docker-сети kind)
 ```
 
-| Компонент | Где | Зачем в курсе |
+Схема 2. Три входа с хоста: apiserver на случайном порту 6443x, веб-вход на 8088, реестр на 5001.
+
+Таблица перечисляет компоненты и части, где они разбираются.
+
+| Компонент | Где работает | Где разбирается |
 |---|---|---|
-| kind, Kubernetes 1.36.1 | 4 контейнера `lab-*` | 1 control-plane + 3 worker: scheduling, drain, PDB, DaemonSet, отказ узла |
-| kindnet | DaemonSet в `kube-system` | CNI: IP подам, маршруты между узлами (03-1) |
-| kube-proxy, режим iptables | DaemonSet | Service → поды (03-2) |
-| CoreDNS | Deployment в `kube-system` | имена сервисов (03-3) |
-| local-path-provisioner | `local-path-storage`, StorageClass `standard` | PVC на диске узла (04-2) |
-| metrics-server 0.8.0 | `kube-system` | `kubectl top`, HPA (05-1, 05-3) |
-| Envoy Gateway 1.9.2 + CRD Gateway API | `envoy-gateway-system`, Gateway `lab` | вход в кластер по имени хоста (03-4) |
-| реестр | контейнер `kind-registry` | свои образы, ImagePullBackOff, дайджесты |
-| orders-api + PostgreSQL | namespace `orders` | сквозной сценарий |
+| kind, Kubernetes 1.36.1 | 4 контейнера `lab-*` | 01-1, 01-2 |
+| kindnet | DaemonSet в `kube-system` | 03-1 |
+| kube-proxy, режим iptables | DaemonSet в `kube-system` | 03-2 |
+| CoreDNS | Deployment в `kube-system` | 03-3 |
+| local-path-provisioner | `local-path-storage` | 04-2 |
+| metrics-server 0.8.0 | `kube-system` | 05-1, 05-3 |
+| Envoy Gateway 1.9.2 | `envoy-gateway-system` | 03-4 |
+| реестр `kind-registry` | контейнер Docker | 02-2 |
+| orders-api и PostgreSQL | namespace `orders` | лабораторная работа 3 |
 
-Расширения (cert-manager, Argo CD, Gitea, CloudNativePG и т. п.) ставятся командами в начале своих лаб и удаляются в их конце.
+### Узел как контейнер
 
-Особенности kind, которые встречаются в лабах:
+В кластере один **control plane** (управляющий узел: apiserver, etcd, scheduler, controller-manager) и три **worker** (рабочих узла, на которых запускаются поды). Имена узлов: `lab-control-plane`, `lab-worker`, `lab-worker2`, `lab-worker3`.
 
-- **Узел = контейнер.** Зайти на узел — `docker exec -it lab-worker bash`; там `crictl`, `journalctl -u kubelet`, `iptables-save`, `/etc/kubernetes/manifests`.
-- **Каждый узел видит все CPU и всю память хоста** (проверено: `cpu: 12`, `memory: 16315248Ki` у каждого из четырёх), резервов и порогов eviction нет. В 05-1 и 05-4 это оговаривается.
-- **LoadBalancer нет** — Service типа LoadBalancer остаётся в `<pending>`. Вход в кластер — через NodePort 30080, проброшенный на `127.0.0.1:8088`.
+На узел заходят командой `docker exec -it lab-worker bash`. Внутри доступны `crictl`, `journalctl -u kubelet`, `iptables-save` и каталог `/etc/kubernetes/manifests` (static pods, 01-2).
 
-## 2. Требования и установка инструментов 🟢
+### Реестр образов
 
-Ресурсы (замер `docker stats` на поднятом стенде с orders-api): control-plane 1,3 ГиБ, каждый worker 0,3–0,4 ГиБ, реестр 18 МиБ — около 2,5 ГиБ. С расширениями модулей 8–9 — до 5 ГиБ. Диск: образ узла kind ~1 ГБ, всего на стенд ~3 ГБ.
+**Реестр** (registry) — сервер, который хранит образы контейнеров. Стенд запускает собственный реестр `registry:2.8.3` в контейнере `kind-registry`. Он слушает `127.0.0.1:5001`, образы лежат в томе `kind-registry-data`.
 
-| Инструмент | 🐧 Ubuntu 24.04 | 🅼 Manjaro | Проверено на |
-|---|---|---|---|
-| Docker | `docker.io` или `docker-ce` (репозиторий Docker) | `sudo pacman -S docker` | 29.7.2 |
-| kind | нет в apt: бинарник с GitHub-релиза (ниже) | `sudo pacman -S kind` | 0.32.0 |
-| kubectl | репозиторий `pkgs.k8s.io` (ниже) | `sudo pacman -S kubectl` | 1.36.4 |
-| helm | репозиторий Helm или бинарник с релиза | `sudo pacman -S helm` | 4.2.2 |
+Образы собирает Docker на хосте и отправляет в `localhost:5001`. Узлы тянут образ оттуда же. Внутри узла `localhost` — это сам узел, а не хост. Поэтому скрипт пишет в каждый узел файл `hosts.toml`, который перенаправляет `localhost:5001` на `http://kind-registry:5000`. Читает этот файл **containerd** (среда запуска контейнеров на узле, 01-2).
 
-🐧 Ubuntu:
+### Вход в кластер
+
+**Gateway API** — набор объектов Kubernetes для входящего HTTP-трафика. **Envoy Gateway** — реализация этого API на прокси Envoy. Стенд создаёт Gateway с именем `lab` на порту 80. Он принимает маршруты (**HTTPRoute**) из любых namespace.
+
+Сервис Envoy имеет тип **NodePort**: kube-proxy открывает фиксированный порт (здесь 30080) на каждом узле. Kind пробрасывает порт 30080 узла `lab-control-plane` на `127.0.0.1:8088` хоста. В итоге `http://orders.localhost:8088` попадает в Gateway. Браузеры и curl сами разрешают любые имена `*.localhost` в `127.0.0.1`, править `/etc/hosts` не нужно.
+
+### Дополнения
+
+**metrics-server** собирает CPU и память подов и узлов; без него не работают `kubectl top` и HPA (05-3). В kind у kubelet самоподписанный сертификат, поэтому скрипт добавляет флаг `--kubelet-insecure-tls`.
+
+**local-path-provisioner** создаёт тома на диске узла. В kind он встроен и даёт StorageClass `standard`. Дальше PVC (запрос на том, 04-2) получает каталог на узле, где запущен под.
+
+---
+
+## 3. Как управлять стендом
+
+Стендом управляют два скрипта в каталоге `kubernetes/lab/`. Оба безопасно запускать повторно.
+
+### Подъём: lab-up.sh
+
+Команда `bash kubernetes/lab/lab-up.sh`, запущенная из корня репозитория, выполняет пять шагов. Каждый проверяет, сделано ли уже его дело, поэтому повторный запуск ничего не ломает.
+
+1. Запускает реестр `kind-registry` на `127.0.0.1:5001` с томом `kind-registry-data`.
+2. Пишет конфиг `~/lab/k8s/kind.yaml` и создаёт кластер `lab`: 1 control-plane и 3 worker.
+3. Подключает реестр к docker-сети `kind` и пишет `hosts.toml` в каждый узел.
+4. Ставит metrics-server и добавляет флаг `--kubelet-insecure-tls`.
+5. Ставит Envoy Gateway Helm-чартом, затем создаёт GatewayClass `eg` и Gateway `lab`.
+
+Первый запуск на машине автора занял 2 мин 9 с, повторный — 18 с. В конце скрипт переключает текущий контекст kubectl на `kind-lab`.
+
+### Выключение и включение
+
+Стенд не нужно держать запущенным. Команда `bash kubernetes/lab/lab-down.sh` без аргументов выполняет `docker stop` для узлов и реестра. Данные etcd, тома PVC и образы в узлах остаются. Команда `lab-up.sh` запускает те же контейнеры и ждёт apiserver. Полный цикл на машине автора занял 51 с (лабораторная работа 4).
+
+### Полная уборка
+
+Команда `bash kubernetes/lab/lab-down.sh --purge` удаляет кластер `lab`, контейнер `kind-registry`, том `kind-registry-data` и каталог `~/lab/k8s`. Каталог содержит исходники orders-api. Если вы правили код, сохраните его заранее. После `--purge` стенд поднимается заново командой `lab-up.sh`, но образы в реестре придётся собрать и отправить снова.
+
+### Контекст kubectl
+
+Скрипт добавляет в `~/.kube/config` контекст `kind-lab` и делает его текущим. Если у вас есть рабочие кластеры, проверяйте контекст перед каждой опасной командой: `kubectl config current-context`. Можно и отделить стенд в свой файл: `export KUBECONFIG=~/lab/k8s/kubeconfig` перед запуском скрипта.
+
+### Как в курсе выполняются команды
+
+Все команды запускаются с хоста: `kubectl` с контекстом `kind-lab` и `docker exec lab-<узел> …`, когда нужно заглянуть в узел. Каждая работа живёт в своём namespace `lab-NN-M` (по номеру части) и удаляет его в уборке. Файлы работы лежат в `~/lab/k8s/NN-M/`, метки и taints узлов имеют префикс `lab-NN-M/`, образы называются `localhost:5001/lab-NN-M/…`.
+
+Namespace `orders` с демо-приложением работы не удаляют. Если работа его меняет, уборка возвращает исходное состояние командой `kubectl apply -f ~/lab/k8s/orders-api/k8s/`. В выводах имена подов, IP-адреса, UID и время взяты с прогона автора. У вас они другие: сверяйте структуру и порядок величин.
+
+---
+
+## 4. Как увидеть состояние стенда
+
+Состояние стенда видно на трёх уровнях: контейнеры Docker, объекты кластера и путь запроса. Начинайте снизу.
+
+### Контейнеры Docker
+
+Узлы и реестр — обычные контейнеры, поэтому их видно в Docker. Таблица показывает команды и то, что они сообщают.
+
+| Команда | Что показывает |
+|---|---|
+| `docker ps --filter name=lab- --filter name=kind-registry` | пять контейнеров стенда и их порты |
+| `docker stats --no-stream` | CPU и память каждого контейнера |
+| `docker exec lab-worker crictl ps` | контейнеры, запущенные внутри узла |
+| `kind get clusters` | список кластеров kind, должен быть `lab` |
+
+Если контейнеров меньше пяти, стенд остановлен: запустите `lab-up.sh`.
+
+### Объекты кластера
+
+Если Docker в порядке, смотрим на кластер. Команды только читают состояние.
+
+| Команда | Что показывает |
+|---|---|
+| `kubectl get nodes` | четыре узла в состоянии Ready |
+| `kubectl get pods -A` | все поды; не должно быть Pending и CrashLoopBackOff |
+| `kubectl top nodes` | CPU и память узлов (работает metrics-server) |
+| `kubectl -n envoy-gateway-system get gateway lab` | Gateway в состоянии Programmed |
+| `kubectl config current-context` | текущий контекст, должен быть `kind-lab` |
+
+### Путь запроса
+
+Последний уровень — сквозной запрос к демо-приложению: `curl http://orders.localhost:8088/api/orders`. Он проходит порт хоста, NodePort, Envoy, Service и под. Ответ с данными из PostgreSQL подтверждает, что работают все звенья. Если ответа нет, идите по цепочке справа налево: под, Service, HTTPRoute, Gateway, NodePort (§5).
+
+---
+
+## 5. Что ломается при подъёме и как найти причину
+
+Большинство сбоев происходит в трёх местах: на хосте (порты, Docker, ядро), на пути образа от реестра к узлу и на входе в кластер. Ниже симптомы сгруппированы по месту.
+
+### Не стартует подъём
+
+Эти сбои происходят до появления кластера.
+
+- **`Bind for 0.0.0.0:8080 failed: port is already allocated`.** Порт хоста занят другим контейнером. Список занятых портов даёт `docker ps --format '{{.Names}} {{.Ports}}'`. Стенд выбрал 8088, потому что на машине автора 8080 занимает другой сервис. Другой порт меняют в `hostPort` скрипта `lab-up.sh` и в командах курса.
+- **`error getting credentials … docker-credential-desktop`.** В `~/.docker/config.json` прописан `credsStore` от Docker Desktop. Удалите ключ или запустите скрипт с `DOCKER_CONFIG=$(mktemp -d)`.
+- **`too many open files` в логах kubelet или kube-proxy, узлы NotReady.** Не хватает `fs.inotify.max_user_instances`. Поднимите лимит (лабораторная работа 1) и пересоздайте стенд: `lab-down.sh --purge`, затем `lab-up.sh`.
+
+### Узлы не скачивают образ
+
+Образ из реестра стенда не приходит на узел.
+
+- **`ImagePullBackOff`, в событиях `dial tcp [::1]:5001: connect: connection refused`.** В узле нет файла `/etc/containerd/certs.d/localhost:5001/hosts.toml` или он пустой. Внутри узла `localhost` — сам узел, поэтому без файла pull идёт в никуда. Проверьте файл командой `docker exec lab-worker cat /etc/containerd/certs.d/localhost:5001/hosts.toml` и перезапустите `lab-up.sh`.
+- **`manifest unknown` или `not found`.** Образ не отправлен в реестр. Список тегов даёт `curl -s http://127.0.0.1:5001/v2/orders-api/tags/list`.
+
+### Вход не отвечает
+
+Запрос на `:8088` не доходит до приложения. Различайте два симптома: отказ и зависание.
+
+- **`curl … :8088` → `Connection refused`.** Gateway не создан или не имеет состояния Programmed. Проверьте `kubectl -n envoy-gateway-system get gateway lab` и повторите `lab-up.sh`.
+- **Запрос висит до таймаута, а из пода через Service всё работает.** У Service Envoy стоит `externalTrafficPolicy: Local`. Kube-proxy на узле без пода Envoy сбрасывает пакеты NodePort правилом `has no local endpoints … DROP`. Скрипт задаёт `Cluster` через объект EnvoyProxy; если вы меняли значение, верните его (разбор в 03-2).
+
+### Демо-приложение не готово
+
+- **orders-api в `0/1 Running`, в логах `db not ready: …`.** PostgreSQL не готов или неверен `DATABASE_URL`. Смотрите `kubectl -n orders get pods` и `kubectl -n orders logs deploy/orders-api`. Приложение пробует подключиться 30 раз с паузой 2 с, то есть 60 с, и затем завершается.
+
+### Нет доступа к кластеру
+
+- **После перезагрузки машины `kubectl` → `connection refused`.** Контейнеры узлов остановлены. Запуск `lab-up.sh` стартует их и дожидается apiserver.
+- **`kubectl` ходит не в тот кластер.** Текущий контекст не `kind-lab`. Исправление: `kubectl config use-context kind-lab`.
+
+---
+
+## 6. Пределы и значения по умолчанию
+
+Стенд ограничен ресурсами машины и особенностями kind. Числа ниже измерены на машине автора.
+
+### Ресурсы
+
+Пустой стенд с orders-api занимает около 2,5 ГиБ RAM: control-plane 1,3 ГиБ, каждый worker 0,3–0,4 ГиБ, реестр 18 МиБ (замер `docker stats`). С расширениями модулей 08–09 потребление доходит до 5 ГиБ. Диск: образ узла kind около 1 ГБ, весь стенд около 3 ГБ. Скрипт `lab-up.sh` ждёт готовности узлов до 180 с, metrics-server до 180 с и Envoy Gateway до 5 мин.
+
+### Особенности kind
+
+Эти три свойства отличают стенд от настоящего кластера. Они встречаются в лабораторных работах.
+
+- **Каждый узел видит все CPU и всю память хоста.** На машине автора у каждого из четырёх узлов `cpu: 12` и `memory: 16315248Ki`. Узлы делят одно железо, а не получают по своей части.
+- **Пороги eviction отключены.** **Eviction** — выселение подов kubelet при нехватке памяти или диска. На стенде резервов и порогов нет; в частях 05-1 и 05-4 это оговаривается.
+- **LoadBalancer не работает.** Service этого типа остаётся в `<pending>`. Вход в кластер идёт через NodePort 30080, проброшенный на `127.0.0.1:8088`.
+
+### Версии
+
+В курсе: kind 0.32.0, Kubernetes 1.36.1, containerd 2.3.1, Envoy Gateway 1.9.2, metrics-server 0.8.0, PostgreSQL 17.6. Версия kubectl может отличаться от версии кластера не больше чем на одну минорную: 1.35–1.37 для кластера 1.36. Это правило **version skew** (допустимое расхождение версий, 10-2). Пароль PostgreSQL в манифестах учебный; как хранят секреты на самом деле, разбирают части 04-1 и 08-2.
+
+---
+
+## Лабораторные работы
+
+Работы идут по порядку: установка инструментов, подъём стенда, демо-приложение, выключение и включение. Работа 3 нужна всем остальным частям курса, поэтому не пропускайте её. Namespace `lab-NN-M` здесь не нужен: работы настраивают сам стенд. Демо-приложение живёт в namespace `orders`, который остальные работы не удаляют (§3).
+
+### Лабораторная работа 1. Установка инструментов и лимиты inotify
+
+Эту работу вы выполняете сами, результаты в ней — ожидаемые.
+
+**Цель.** Установить Docker, kind, kubectl и helm и поднять лимиты **inotify** (механизм ядра Linux, который сообщает программам об изменениях файлов). Без нужных лимитов кластер из четырёх узлов падает при старте.
+
+**Что понадобится.**
+
+- Ubuntu 24.04 или Manjaro, права `sudo`, доступ в интернет.
+- Около 1 ГБ свободного диска под бинарники и пакеты.
+- Docker 27 или новее, если он уже установлен.
+- Около 15 минут.
+
+**Схема опыта.** Каждый узел kind запускает systemd и kubelet, и оба расходуют inotify-экземпляры. Лимит действует на пользователя, а не на контейнер: все узлы делят один счётчик.
+
+```
+fs.inotify.max_user_instances (128 по умолчанию на многих Ubuntu)
+   ├─ узел lab-control-plane   systemd + kubelet + containerd
+   ├─ узел lab-worker          systemd + kubelet + containerd
+   ├─ узел lab-worker2         systemd + kubelet + containerd
+   └─ узел lab-worker3         systemd + kubelet + containerd
+        вместе с вашими сессиями быстро упираются в лимит -> too many open files
+```
+
+Схема показывает общий счётчик. Если он мал, первыми отказывают kubelet и kube-proxy.
+
+**Риски.** Работа меняет пакеты и параметры ядра на хосте.
+
+- **Что меняется:** ставятся пакеты Docker, бинарники `kind` и `helm` в `/usr/local/bin`, пакет `kubectl`; создаётся файл `/etc/sysctl.d/99-kind.conf` и меняются два параметра ядра.
+- **Надолго ли:** до ручной отмены; sysctl-файл переживает перезагрузку.
+- **Безопасность:** участник группы `docker` получает права, равные root на хосте. Добавляйте в группу только свою учётную запись. Бинарники и ключи скачиваются с официальных адресов по HTTPS.
+- **Влияние на систему:** лимит inotify поднимает потолок использования памяти ядра. Один экземпляр занимает немного, 512 экземпляров на пользователя безопасны на машине с 8 ГБ.
+- **Откат:** блок «Уборка» в конце работы.
+
+#### Шаг 1. Проверить, что уже есть
+
+Смотрим версии инструментов и свободное место. Команды только читают состояние. Если инструмент уже стоит нужной версии, соответствующий шаг пропустите.
+
+```bash
+docker --version
+kind version
+kubectl version --client
+helm version --short
+df -h /var/lib/docker /home
+```
+
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `docker --version` | версия Docker; нужна 27 или новее |
+| `kind version` | версия kind; в курсе 0.32.0 |
+| `kubectl version --client` | версия kubectl без обращения к кластеру |
+| `helm version --short` | версия helm; в курсе 4.2.x |
+| `df -h … /home` | свободное место в каталогах Docker и дома |
+
+Результат на чистой машине (ожидаемый):
+
+```
+Command 'docker' not found, but can be installed with: …
+Command 'kind' not found …
+```
+
+Разбор вывода:
+
+1. Сообщение `not found` значит, что инструмента нет и его надо установить.
+2. На диске должно быть не меньше 20 ГБ свободно (§6).
+
+#### Шаг 2. Установить Docker
+
+Docker запускает узлы kind. На Ubuntu подойдёт пакет `docker.io` из стандартного репозитория. На Manjaro пакет называется `docker`, а службу нужно включить вручную.
+
+```bash
+# Ubuntu
+sudo apt-get update && sudo apt-get install -y docker.io
+sudo usermod -aG docker "$USER"
+
+# Manjaro
+sudo pacman -S docker
+sudo systemctl enable --now docker
+sudo usermod -aG docker "$USER"
+```
+
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `apt-get install -y docker.io` | поставить Docker из репозитория Ubuntu |
+| `pacman -S docker` | поставить Docker из репозитория Manjaro |
+| `systemctl enable --now docker` | включить службу и запустить сразу |
+| `usermod -aG docker "$USER"` | добавить вас в группу `docker`, чтобы не писать `sudo` |
+
+Выйдите из сеанса и войдите снова: группа применяется при входе. Затем проверьте.
+
+```bash
+docker run --rm hello-world
+```
+
+Результат (ожидаемый):
+
+```
+Hello from Docker!
+This message shows that your installation appears to be working correctly.
+…
+```
+
+Разбор вывода: приветствие значит, что демон работает и вы можете запускать контейнеры без `sudo`.
+
+#### Шаг 3. Установить kind, kubectl и helm
+
+Три инструмента ставятся независимо. Команды даны для Ubuntu. На Manjaro все три ставятся одной командой `sudo pacman -S kind kubectl helm`.
 
 ```bash
 # kind — один статический бинарник
@@ -73,21 +365,55 @@ curl -Lo /tmp/kind https://kind.sigs.k8s.io/dl/v0.32.0/kind-linux-amd64
 sudo install -m 0755 /tmp/kind /usr/local/bin/kind && rm /tmp/kind
 
 # kubectl — официальный репозиторий, ветка минорной версии v1.36
+K8S_REPO=https://pkgs.k8s.io/core:/stable:/v1.36/deb
+KEYRING=/etc/apt/keyrings/kubernetes-apt-keyring.gpg
 sudo mkdir -p /etc/apt/keyrings
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+curl -fsSL "$K8S_REPO/Release.key" | sudo gpg --dearmor -o "$KEYRING"
+echo "deb [signed-by=$KEYRING] $K8S_REPO/ /" | \
+  sudo tee /etc/apt/sources.list.d/kubernetes.list
 sudo apt-get update && sudo apt-get install -y kubectl
 
-# helm — бинарник с релиза (версию сверьте с https://github.com/helm/helm/releases)
-curl -fsSL https://get.helm.sh/helm-v4.2.2-linux-amd64.tar.gz | tar -xz -C /tmp linux-amd64/helm
+# helm — бинарник с релиза (версию сверьте на github.com/helm/helm/releases)
+curl -fsSL https://get.helm.sh/helm-v4.2.2-linux-amd64.tar.gz | \
+  tar -xz -C /tmp linux-amd64/helm
 sudo install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
 ```
 
-⚠️ Установка на Ubuntu не проверялась в среде агента (стенд проверен на Manjaro); URL и имена пакетов — по документации kind, Kubernetes и Helm.
+Разбор команд:
 
-Версия kubectl должна отличаться от версии кластера не больше чем на одну минорную (1.35–1.37 для кластера 1.36) — это правило version skew (10-2).
+| Часть команды | Значение |
+|---|---|
+| `install -m 0755 … /usr/local/bin/kind` | положить бинарник в `PATH` с правом запуска |
+| `gpg --dearmor -o "$KEYRING"` | сохранить ключ репозитория в формате apt |
+| `signed-by=$KEYRING` | доверять пакетам этого репозитория только по этому ключу |
+| `/v1.36/` | ветка репозитория: kubectl версии 1.36 |
+| `tar -xz -C /tmp linux-amd64/helm` | распаковать из архива один файл `helm` |
 
-**Лимиты inotify.** Каждый узел kind запускает systemd и kubelet, которые съедают inotify-экземпляры. При дефолтном `fs.inotify.max_user_instances = 128` (так на многих Ubuntu) кластер из 4 узлов падает с `too many open files` в логах kubelet или kube-proxy. На машине автора — 1024, ошибок нет. Поднимите заранее:
+Проверяем версии.
+
+```bash
+kind version
+kubectl version --client
+helm version --short
+```
+
+Результат (ожидаемый, сокращён):
+
+```
+kind v0.32.0 go… linux/amd64
+Client Version: v1.36.x
+v4.2.2+g…
+```
+
+Разбор вывода:
+
+1. kind версии 0.32.0 создаёт узлы Kubernetes 1.36.1.
+2. kubectl 1.36.x подходит кластеру 1.36 по правилу version skew (§6).
+3. helm нужен скрипту подъёма для установки Envoy Gateway.
+
+#### Шаг 4. Поднять лимиты inotify
+
+Смотрим текущие значения и записываем новые в файл `/etc/sysctl.d/99-kind.conf`. Команда `sysctl --system` применяет все файлы настроек без перезагрузки.
 
 ```bash
 sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
@@ -96,24 +422,154 @@ fs.inotify.max_user_instances = 512
 fs.inotify.max_user_watches = 524288
 EOF
 sudo sysctl --system
+sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
 ```
 
-## 3. Запуск 🟢
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `max_user_instances` | сколько inotify-объектов может создать один пользователь |
+| `max_user_watches` | сколько файлов он может отслеживать |
+| `tee /etc/sysctl.d/99-kind.conf` | записать значения в файл, который читается при загрузке |
+| `sysctl --system` | перечитать все файлы настроек и применить |
+
+Результат (ожидаемый, на Ubuntu с настройками по умолчанию):
+
+```
+fs.inotify.max_user_instances = 128
+fs.inotify.max_user_watches = 65536
+…
+fs.inotify.max_user_instances = 512
+fs.inotify.max_user_watches = 524288
+```
+
+Разбор вывода:
+
+1. Первые две строки — значения до изменения. На машине автора (Manjaro) уже стояло 1024, и ошибок нет.
+2. Последние две строки — значения после изменения.
+3. Если в первых строках уже стояли значения больше ваших, файл не нужен: уменьшать лимиты нельзя. Удалите файл.
+
+#### Итог
+
+Что вы узнали:
+
+| Что узнали | Как проверить |
+|---|---|
+| Для стенда нужны Docker, kind, kubectl и helm | `docker --version`, `kind version`, `kubectl version --client`, `helm version --short` |
+| Узлы kind делят один лимит inotify | `sysctl fs.inotify.max_user_instances` |
+| Версия kubectl не дальше чем на одну минорную от кластера | `kubectl version` (после подъёма стенда) |
+| Параметры ядра сохраняются в `/etc/sysctl.d` | `cat /etc/sysctl.d/99-kind.conf` |
+
+#### Уборка
+
+Инструменты нужны всему курсу, поэтому их оставляем. Удаляем только настройку ядра, если хотите вернуть исходное состояние. Делайте это после окончания курса: без неё стенд может не подняться на машине с лимитом 128.
 
 ```bash
-cd ~/ai/runbooks            # корень репозитория курсов
+sudo rm /etc/sysctl.d/99-kind.conf
+sudo sysctl --system
+```
+
+Разбор: первая команда удаляет файл, вторая перечитывает настройки; значения ядра возвращаются к системным после следующей загрузки или после явной установки.
+
+#### Вопросы для самопроверки
+
+1. Почему лимит `max_user_instances` важнее для kind, чем для обычного Docker?
+
+<details><summary>Ответ</summary>
+
+Каждый узел kind — это systemd и kubelet, а они создают inotify-экземпляры. Лимит общий на пользователя. Четыре узла вместе с вашими сессиями быстро исчерпывают 128, и kubelet получает `too many open files`.
+
+</details>
+
+2. Чем опасно добавление пользователя в группу `docker`?
+
+<details><summary>Ответ</summary>
+
+Участник группы управляет демоном Docker, который работает от root. Он может смонтировать любой каталог хоста в контейнер и читать или менять его. Поэтому права группы `docker` равны правам root.
+
+</details>
+
+3. kubectl 1.38 и кластер 1.36: допустимо ли?
+
+<details><summary>Ответ</summary>
+
+Нет. Допустимое расхождение — одна минорная версия в обе стороны: для кластера 1.36 подходят kubectl 1.35, 1.36 и 1.37. Разница в две версии выходит за поддерживаемые границы.
+
+</details>
+
+### Лабораторная работа 2. Подъём стенда и проверка
+
+**Цель.** Поднять стенд скриптом `lab-up.sh` и убедиться, что узлы, реестр, metrics-server и Gateway работают. Вы увидите, что узлы кластера — контейнеры Docker.
+
+**Что понадобится.**
+
+- Инструменты из работы 1: Docker, kind, kubectl, helm.
+- Клон репозитория курса, в примерах каталог `~/ai/runbooks`.
+- Свободные порты хоста 5001 и 8088.
+- Около 3 ГБ диска, 2,5 ГиБ RAM; скачивание порядка 1,5 ГБ образов.
+- Около 3 минут на подъём.
+
+**Схема опыта.** Скрипт создаёт реестр и кластер, затем ставит дополнения. Проверяем результат по слоям, как в §4: контейнеры, объекты, дополнения.
+
+```
+lab-up.sh ─► kind-registry ─► кластер lab (4 узла) ─► hosts.toml в узлах
+                                                          │
+                                  metrics-server ◄────────┤
+                                  Envoy Gateway + Gateway lab
+проверяем:  docker ps ─► kubectl get nodes ─► kubectl top ─► get gateway
+```
+
+Схема показывает порядок подъёма слева направо. Проверка идёт в том же порядке.
+
+**Риски.** Работа создаёт контейнеры, том и запись в kubeconfig.
+
+- **Что меняется:** пять контейнеров Docker (`lab-*`, `kind-registry`), том `kind-registry-data`, образы `kindest/node` и `registry`, каталог `~/lab/k8s`, контекст `kind-lab` в `~/.kube/config`, порты `127.0.0.1:5001` и `127.0.0.1:8088`.
+- **Надолго ли:** до `lab-down.sh --purge`. Контейнер реестра запущен с `--restart=always`, поэтому он стартует вместе с Docker.
+- **Безопасность:** порты слушают только `127.0.0.1`. Привилегированные контейнеры создаёт сам kind: узлы работают в режиме privileged. Не публикуйте порты стенда наружу.
+- **Влияние на систему:** около 2,5 ГиБ RAM и 3 ГБ диска; чужие контейнеры и сети не затрагиваются. Текущий контекст kubectl меняется на `kind-lab`.
+- **Откат:** `lab-down.sh --purge` (уборка этой работы); контекст возвращается командой `kubectl config use-context <прежний>`.
+
+#### Шаг 1. Запомнить текущий контекст
+
+Перед подъёмом запоминаем контекст, который скрипт заменит. Команды только читают.
+
+```bash
+kubectl config current-context
+docker ps --format '{{.Names}} {{.Ports}}'
+```
+
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `config current-context` | имя контекста, который скрипт переключит на `kind-lab` |
+| `--format '{{.Names}} {{.Ports}}'` | показать имена контейнеров и занятые порты хоста |
+
+Результат: имя вашего прежнего контекста и список контейнеров. Если у вас нет kubectl-конфига, первая команда сообщит `error: current-context is not set`.
+
+Разбор вывода:
+
+1. Запишите прежний контекст, он понадобится для отката.
+2. Если в списке портов есть `5001` или `8088`, освободите их или смените порт (§5).
+
+#### Шаг 2. Запустить lab-up.sh
+
+Запускаем скрипт из корня репозитория. Он идёт до двух минут и печатает заголовки шагов `== …`.
+
+```bash
+cd ~/ai/runbooks
 bash kubernetes/lab/lab-up.sh
 ```
 
-Что делает скрипт (подробности — комментарии в самом `lab/lab-up.sh`):
+Разбор команд:
 
-1. Запускает реестр `kind-registry` на `127.0.0.1:5001` (том `kind-registry-data`).
-2. Создаёт кластер `lab` по конфигу `~/lab/k8s/kind.yaml`: 1 control-plane + 3 worker, проброс `127.0.0.1:8088 → :30080` узла control-plane, containerd ищет настройки реестров в `/etc/containerd/certs.d`.
-3. В каждом узле пишет `/etc/containerd/certs.d/localhost:5001/hosts.toml` → `http://kind-registry:5000`: внутри узла `localhost:5001` — это не хост, а сам узел, без этой настройки pull падает с `connection refused`.
-4. Ставит metrics-server с флагом `--kubelet-insecure-tls` (у kubelet в kind самоподписанный сертификат).
-5. Ставит Envoy Gateway Helm-чартом, создаёт `GatewayClass eg` и `Gateway lab` (порт 80, маршруты из любых namespace). Сервис Envoy — NodePort 30080 с `externalTrafficPolicy: Cluster`.
+| Часть команды | Значение |
+|---|---|
+| `cd ~/ai/runbooks` | корень репозитория курсов |
+| `bash kubernetes/lab/lab-up.sh` | поднять реестр, кластер и дополнения |
 
-Проверено (конец вывода первого запуска, 2 мин 9 с):
+Результат (конец вывода первого запуска, 2 мин 9 с):
 
 ```
 == Envoy Gateway 1.9.2 (+ CRD Gateway API)
@@ -129,24 +585,225 @@ lab-worker3         Ready    <none>          108s   v1.36.1
 Контекст: kind-lab · реестр: localhost:5001 · вход: http://<имя>.localhost:8088 (Gateway lab)
 ```
 
-Скрипт переключает текущий контекст kubectl на `kind-lab`. Если у вас есть рабочие кластеры — проверяйте контекст перед каждой опасной командой (`kubectl config current-context`) или держите стенд в отдельном файле: `export KUBECONFIG=~/lab/k8s/kubeconfig` перед запуском скрипта.
+Разбор вывода:
 
-## 4. Сквозной сценарий: orders-api 2.0 и PostgreSQL 🟢
+1. `condition met` — Gateway `lab` получил состояние Programmed: Envoy готов принимать трафик.
+2. Строка `== готово` значит, что скрипт дошёл до конца.
+3. Все четыре узла в состоянии `Ready`, версия `v1.36.1`.
+4. Control plane старше рабочих узлов: kind создаёт его первым.
+5. Последняя строка напоминает контекст и адрес входа.
 
-Сервис из курса `cicd`, доработанный под Kubernetes:
+#### Шаг 3. Проверить узлы как контейнеры
 
-| Путь | Что отвечает | Где используется |
-|---|---|---|
-| `/health` | 200, пока процесс жив | liveness (02-5) |
-| `/ready` | 200, если старт закончен и БД отвечает; 503 после SIGTERM | readiness (02-5), Service и endpoints (03-2) |
-| `/api/orders` | заказы из PostgreSQL (без `DATABASE_URL` — из памяти) + имя пода | сквозной запрос |
-| `/version` | версия и имя пода | rollout, canary (02-2, 03-4) |
-| `/config` | переменная `FEATURE_DISCOUNT` и содержимое `/etc/orders/config.json` | ConfigMap (04-1) |
-| `/work?ms=N` | сжечь N мс CPU | троттлинг, HPA (05-1, 05-3) |
+Узлы кластера видны в Docker. Смотрим контейнеры и заходим в один узел.
 
-Переменные: `DATABASE_URL` (из Secret), `STARTUP_DELAY` (сколько секунд не открывать порт — для startupProbe), `SHUTDOWN_DELAY` (сколько ещё обслуживать запросы после SIGTERM — для graceful shutdown).
+```bash
+docker ps --format '{{.Names}}\t{{.Image}}' | sort
+docker exec lab-worker crictl ps
+```
 
-### 4.1. Код и образ
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `docker ps --format …` | имя и образ каждого запущенного контейнера |
+| `sort` | упорядочить имена |
+| `docker exec lab-worker` | выполнить команду внутри узла `lab-worker` |
+| `crictl ps` | контейнеры, которые containerd запустил на узле |
+
+Результат (сокращён, образы без дайджестов):
+
+```
+kind-registry          registry:2.8.3
+lab-control-plane      kindest/node:v1.36.1
+lab-worker             kindest/node:v1.36.1
+lab-worker2            kindest/node:v1.36.1
+lab-worker3            kindest/node:v1.36.1
+CONTAINER      IMAGE      …   NAME          POD
+…              …          …   kindnet-cni   kindnet-…
+…              …          …   kube-proxy    kube-proxy-…
+```
+
+Разбор вывода:
+
+1. Пять контейнеров: четыре узла из образа `kindest/node` и реестр.
+2. Внутри узла `crictl ps` показывает системные контейнеры: `kindnet-cni` (сеть) и `kube-proxy` (правила Service). Набор контейнеров на вашем узле может отличаться: здесь работают и поды дополнений.
+
+#### Шаг 4. Проверить реестр и доступ узла к нему
+
+Убеждаемся, что реестр отвечает с хоста и что узел видит его как `localhost:5001`. Файл `hosts.toml` создал скрипт.
+
+```bash
+curl -s http://127.0.0.1:5001/v2/_catalog
+docker exec lab-worker cat /etc/containerd/certs.d/localhost:5001/hosts.toml
+```
+
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `curl -s …/v2/_catalog` | список репозиториев в реестре |
+| `cat …/hosts.toml` | файл, который перенаправляет `localhost:5001` в реестр |
+
+Результат (ожидаемый; пока образов нет):
+
+```
+{"repositories":[]}
+[host."http://kind-registry:5000"]
+```
+
+Разбор вывода:
+
+1. Реестр пуст: образ orders-api появится в работе 3.
+2. Во второй строке containerd получает адрес `kind-registry:5000` для запросов к `localhost:5001`.
+
+#### Шаг 5. Проверить metrics-server и Gateway
+
+Проверяем два дополнения. Метрики появляются через минуту после старта metrics-server.
+
+```bash
+kubectl top nodes
+kubectl -n envoy-gateway-system get gateway lab
+kubectl get storageclass
+```
+
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `top nodes` | CPU и память узлов из metrics-server |
+| `get gateway lab` | состояние Gateway |
+| `get storageclass` | классы томов; нужен `standard` |
+
+Результат (ожидаемый, сокращён; цифры у вас другие):
+
+```
+NAME                CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)
+lab-control-plane   …            …        …               …
+…
+NAME   CLASS   ADDRESS   PROGRAMMED   AGE
+lab    eg      …         True         …
+NAME                 PROVISIONER             …
+standard (default)   rancher.io/local-path   …
+```
+
+Разбор вывода:
+
+1. Таблица `top nodes` с цифрами значит, что metrics-server собирает метрики. При `Metrics API not available` подождите минуту.
+2. `PROGRAMMED True` — Gateway готов принимать трафик.
+3. StorageClass `standard` назначен классом по умолчанию.
+
+#### Шаг 6. Увидеть, что узлы делят ресурсы хоста
+
+Спрашиваем у каждого узла, сколько CPU и памяти он видит. Это особенность kind (§6).
+
+```bash
+kubectl get nodes \
+  -o custom-columns='NODE:.metadata.name,CPU:.status.capacity.cpu,MEM:.status.capacity.memory'
+```
+
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `-o custom-columns=…` | вывести только выбранные поля |
+| `.status.capacity.cpu` | сколько ядер видит узел |
+| `.status.capacity.memory` | сколько памяти видит узел |
+
+Результат (на машине автора; формат колонок ожидаемый):
+
+```
+NODE                CPU   MEM
+lab-control-plane   12    16315248Ki
+lab-worker          12    16315248Ki
+lab-worker2         12    16315248Ki
+lab-worker3         12    16315248Ki
+```
+
+Разбор вывода:
+
+1. У всех узлов одинаковые значения: это CPU и память всего хоста.
+2. Сумма «ёмкостей» узлов больше физического железа в четыре раза. Для scheduler это незаметно, поэтому лимиты в лабораторных работах задаёт явно сам манифест.
+
+#### Итог
+
+Что вы узнали:
+
+| Что узнали | Как проверить |
+|---|---|
+| `lab-up.sh` поднимает реестр, кластер и дополнения за 2–3 минуты | строка `== готово` |
+| Узлы — контейнеры Docker, четыре штуки | `docker ps` |
+| Узлы видят реестр как `localhost:5001` | `hosts.toml` в узле |
+| Metrics-server и Gateway работают | `kubectl top nodes`, `get gateway lab` |
+| Каждый узел видит все ресурсы хоста | `-o custom-columns` по `capacity` |
+
+#### Уборка
+
+Стенд нужен следующим работам, поэтому здесь ничего не удаляем. Полная уборка выполняется в конце работы 4 и после окончания курса.
+
+#### Вопросы для самопроверки
+
+1. Почему узел не может скачать образ с `localhost:5001` без дополнительного файла?
+
+<details><summary>Ответ</summary>
+
+Внутри контейнера-узла `localhost` — сам узел, а реестр работает в другом контейнере. Файл `hosts.toml` говорит containerd, что `localhost:5001` нужно искать по адресу `http://kind-registry:5000` в docker-сети.
+
+</details>
+
+2. Как отличить сбой подъёма в Docker от сбоя в кластере?
+
+<details><summary>Ответ</summary>
+
+Начните с `docker ps`: пять контейнеров должны работать. Если их меньше, проблема в Docker или в скрипте. Если контейнеры есть, а `kubectl get nodes` не отвечает или показывает NotReady, проблема в кластере: смотрите `docker logs lab-control-plane` и `journalctl -u kubelet` внутри узла.
+
+</details>
+
+3. Что значит `PROGRAMMED True` у Gateway?
+
+<details><summary>Ответ</summary>
+
+Контроллер Envoy Gateway принял конфигурацию и запустил прокси, который слушает порт 80. Без этого состояния `curl` к `:8088` получит `Connection refused`.
+
+</details>
+
+### Лабораторная работа 3. Демо-приложение orders-api и PostgreSQL
+
+**Цель.** Собрать образ orders-api, отправить его в реестр стенда и развернуть приложение вместе с PostgreSQL в namespace `orders`. Приложение служит демонстрационной нагрузкой для лабораторных работ всех частей.
+
+**Что понадобится.**
+
+- Работающий стенд из работы 2.
+- Доступ в интернет: образы `python:3.12-slim` и `postgres:17.6-alpine`, пакет `psycopg` с PyPI.
+- Около 200 МБ диска.
+- Около 25 минут.
+
+**Схема опыта.** orders-api — небольшой HTTP-сервис на Python. Он читает заказы из PostgreSQL и отвечает на пробы готовности. Запрос идёт от хоста через Gateway.
+
+```
+curl orders.localhost:8088 ─► NodePort 30080 ─► Envoy ─► HTTPRoute orders-api
+                                                              │
+                                  Service orders-api (80) ◄───┘
+                                       │  2 пода
+                                       ▼
+                           orders-api :8000 ─► Service postgres (headless)
+                                                       │
+                                             StatefulSet postgres-0 + PVC 1 Gi
+```
+
+Схема показывает путь запроса. Данные лежат в PVC на диске узла; поэтому они переживают перезапуск пода.
+
+**Риски.** Работа собирает образ на хосте и создаёт объекты в кластере.
+
+- **Что меняется:** локальный образ Docker `localhost:5001/orders-api:2.0`, каталог `~/lab/k8s/orders-api`, namespace `orders` с подами, Secret, PVC и HTTPRoute.
+- **Надолго ли:** до `lab-down.sh --purge`. Namespace `orders` остальные работы не удаляют.
+- **Безопасность:** пароль PostgreSQL лежит в манифесте открытым текстом, он учебный. Контейнер orders-api работает от пользователя 10001, не от root.
+- **Влияние на систему:** около 600 МиБ памяти подов и 1 ГиБ тома; хост и другие кластеры не затрагиваются.
+- **Откат:** `kubectl delete ns orders` и `docker image rm localhost:5001/orders-api:2.0`.
+
+#### Шаг 1. Создать код приложения
+
+Создаём каталоги и файл `app/main.py`. Сервис отвечает на шесть путей; таблица после кода перечисляет их. Переменные окружения управляют его поведением.
 
 ```bash
 mkdir -p ~/lab/k8s/orders-api/{app,k8s} && cd ~/lab/k8s/orders-api
@@ -162,10 +819,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 VERSION = os.environ.get("APP_VERSION", "dev")
-DATABASE_URL = os.environ.get("DATABASE_URL")          # из Secret; без него — данные в памяти
-CONFIG_FILE = os.environ.get("CONFIG_FILE", "/etc/orders/config.json")   # из ConfigMap (том)
-STARTUP_DELAY = float(os.environ.get("STARTUP_DELAY", "0"))   # имитация медленного старта (02-5)
-SHUTDOWN_DELAY = float(os.environ.get("SHUTDOWN_DELAY", "0")) # сколько ещё обслуживать после SIGTERM
+# без DATABASE_URL (из Secret) данные хранятся в памяти
+DATABASE_URL = os.environ.get("DATABASE_URL")
+# файл из ConfigMap, смонтированный томом
+CONFIG_FILE = os.environ.get("CONFIG_FILE", "/etc/orders/config.json")
+# имитация медленного старта: пока идёт задержка, порт закрыт (02-5)
+STARTUP_DELAY = float(os.environ.get("STARTUP_DELAY", "0"))
+# сколько ещё обслуживать запросы после SIGTERM (02-5)
+SHUTDOWN_DELAY = float(os.environ.get("SHUTDOWN_DELAY", "0"))
 STATIC_ORDERS = [{"id": 1, "item": "book", "qty": 2}, {"id": 2, "item": "pen", "qty": 5}]
 state = {"ready": False, "terminating": False}
 
@@ -177,9 +838,13 @@ def db():
 
 def init_db():
     with db() as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS orders (id serial PRIMARY KEY, item text NOT NULL, qty int NOT NULL)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS orders "
+            "(id serial PRIMARY KEY, item text NOT NULL, qty int NOT NULL)")
         if conn.execute("SELECT count(*) FROM orders").fetchone()[0] == 0:
-            conn.cursor().executemany("INSERT INTO orders (item, qty) VALUES (%s, %s)", [("book", 2), ("pen", 5)])
+            conn.cursor().executemany(
+                "INSERT INTO orders (item, qty) VALUES (%s, %s)",
+                [("book", 2), ("pen", 5)])
 
 
 def get_orders():
@@ -215,6 +880,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlparse(self.path)
+        pod = os.environ.get("HOSTNAME", "")
         try:
             if url.path == "/health":                 # liveness: процесс жив и отвечает
                 self._send(200, {"status": "ok"})
@@ -227,18 +893,23 @@ class Handler(BaseHTTPRequestHandler):
                             conn.execute("SELECT 1")
                     self._send(200, {"ready": True})
             elif url.path == "/version":
-                self._send(200, {"version": VERSION, "pod": os.environ.get("HOSTNAME", "")})
+                self._send(200, {"version": VERSION, "pod": pod})
             elif url.path == "/api/orders":
                 orders = get_orders()
-                self._send(200, {"orders": orders, "total_items": sum(o["qty"] for o in orders),
-                                 "pod": os.environ.get("HOSTNAME", "")})
+                self._send(200, {
+                    "orders": orders,
+                    "total_items": sum(o["qty"] for o in orders),
+                    "pod": pod})
             elif url.path == "/config":
-                self._send(200, {"env_FEATURE_DISCOUNT": os.environ.get("FEATURE_DISCOUNT"), "file": read_config()})
+                self._send(200, {
+                    "env_FEATURE_DISCOUNT": os.environ.get("FEATURE_DISCOUNT"),
+                    "file": read_config()})
             elif url.path == "/work":
                 ms = int(parse_qs(url.query).get("ms", ["100"])[0])
                 t = time.perf_counter()
                 burn(ms)
-                self._send(200, {"cpu_ms": ms, "wall_ms": round((time.perf_counter() - t) * 1000)})
+                wall = round((time.perf_counter() - t) * 1000)
+                self._send(200, {"cpu_ms": ms, "wall_ms": wall})
             else:
                 self._send(404, {"error": "not found"})
         except Exception as e:                        # БД недоступна и т. п.
@@ -270,13 +941,18 @@ def main():
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     server.daemon_threads = True
 
+    def stop_later():
+        time.sleep(SHUTDOWN_DELAY)
+        server.shutdown()
+
     def on_sigterm(signum, frame):
         print(f"SIGTERM: not ready, serving {SHUTDOWN_DELAY:g}s more", flush=True)
         state["terminating"] = True
-        threading.Thread(target=lambda: (time.sleep(SHUTDOWN_DELAY), server.shutdown()), daemon=True).start()
+        threading.Thread(target=stop_later, daemon=True).start()
 
     signal.signal(signal.SIGTERM, on_sigterm)
-    print(f"orders-api {VERSION} listening on :{port} db={'yes' if DATABASE_URL else 'no'}", flush=True)
+    print(f"orders-api {VERSION} listening on :{port} db={'yes' if DATABASE_URL else 'no'}",
+          flush=True)
     threading.Thread(target=startup, daemon=True).start()
     server.serve_forever()
     server.server_close()
@@ -286,7 +962,36 @@ def main():
 if __name__ == "__main__":
     main()
 E
+```
 
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `mkdir -p …/{app,k8s}` | каталоги для кода и манифестов |
+| `touch app/__init__.py` | сделать `app` пакетом Python |
+| `cat > app/main.py <<'E' … E` | записать код; кавычки у `'E'` отключают подстановки |
+
+Что умеет приложение:
+
+| Путь | Что отвечает | Где используется |
+|---|---|---|
+| `/health` | 200, пока процесс жив | liveness (02-5) |
+| `/ready` | 200, если старт закончен и БД отвечает | readiness (02-5), Service (03-2) |
+| `/api/orders` | заказы из PostgreSQL и имя пода | сквозной запрос |
+| `/version` | версия и имя пода | rollout (02-2), canary (03-4) |
+| `/config` | переменная `FEATURE_DISCOUNT` и файл конфига | ConfigMap (04-1) |
+| `/work?ms=N` | сжечь N мс CPU | троттлинг, HPA (05-1, 05-3) |
+
+Приложение читает переменные окружения: `DATABASE_URL` (из Secret), `STARTUP_DELAY` (секунды, пока порт закрыт, для startupProbe), `SHUTDOWN_DELAY` (секунды работы после SIGTERM, для корректной остановки). Ответ `/ready` равен 503 после SIGTERM: так под выходит из Service до остановки.
+
+Разбор результата: команда ничего не печатает. Проверьте, что файл создан: `ls app/`.
+
+#### Шаг 2. Собрать образ и отправить в реестр
+
+Пишем Dockerfile и зависимости, собираем образ и отправляем его в реестр стенда. Пользователь 10001 не root. Версия приложения передаётся аргументом сборки.
+
+```bash
 echo 'psycopg[binary]==3.2.10' > requirements.txt
 
 cat > Dockerfile <<'E'
@@ -307,17 +1012,47 @@ docker push localhost:5001/orders-api:2.0
 curl -s http://127.0.0.1:5001/v2/orders-api/tags/list
 ```
 
-Проверено (push):
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `psycopg[binary]==3.2.10` | драйвер PostgreSQL с готовым бинарником |
+| `USER 10001` | запускать процесс не от root |
+| `-t localhost:5001/orders-api:2.0` | имя образа: адрес реестра, имя, тег |
+| `--build-arg APP_VERSION=2.0` | версия, которую отдаёт `/version` |
+| `docker push …` | загрузить образ в реестр стенда |
+| `…/v2/orders-api/tags/list` | спросить у реестра, какие теги есть |
+
+Результат (push; сборка занимает около минуты, вывод сокращён):
 
 ```
 2.0: digest: sha256:ad4f8fd2cabaef73e735d9a623a3499270fd5f3a5d7f640719bfd0982e772465 size: 1991
+{"name":"orders-api","tags":["2.0"]}
 ```
 
-Ответ реестра — `{"name":"orders-api","tags":["2.0"]}` (проверено тем же запросом из сети kind к `kind-registry:5000`: песочница агента не видит `127.0.0.1` хоста, §5). Узлы тянут образ из реестра — проверено `docker exec lab-worker crictl pull localhost:5001/orders-api:2.0`.
+Разбор вывода:
 
-Дайджест у вас будет другим: он зависит от времени сборки и слоёв базового образа.
+1. `digest: sha256:…` — **дайджест** (digest), хэш содержимого образа. У вас он будет другой: он зависит от времени сборки и слоёв базового образа.
+2. `size: 1991` — размер манифеста образа в байтах, а не самого образа.
+3. Ответ реестра подтверждает тег `2.0`.
 
-### 4.2. PostgreSQL
+Проверяем, что узел тянет образ из реестра.
+
+```bash
+docker exec lab-worker crictl pull localhost:5001/orders-api:2.0
+```
+
+Результат (ожидаемый):
+
+```
+Image is up to date for sha256:…
+```
+
+Разбор вывода: узел достиг реестра по `hosts.toml` и получил образ. Фраза `Image is up to date` или `Pulled` одинаково говорит об успехе.
+
+#### Шаг 3. Развернуть PostgreSQL
+
+Создаём namespace `orders`, Secret с учётными данными, headless Service и StatefulSet. **StatefulSet** — контроллер для подов со стабильным именем и собственным томом (02-3). **Headless Service** (`clusterIP: None`) не получает виртуальный адрес; DNS возвращает адреса подов напрямую.
 
 ```bash
 cd ~/lab/k8s/orders-api/k8s
@@ -328,7 +1063,7 @@ metadata: {name: postgres, namespace: orders}
 type: Opaque
 stringData:
   POSTGRES_USER: orders
-  POSTGRES_PASSWORD: orders-lab-pass        # учебный пароль стенда; в проде — не в Git (04-1, 08-2)
+  POSTGRES_PASSWORD: orders-lab-pass        # учебный пароль стенда
   POSTGRES_DB: orders
   DATABASE_URL: postgresql://orders:orders-lab-pass@postgres:5432/orders
 ---
@@ -336,7 +1071,7 @@ apiVersion: v1
 kind: Service
 metadata: {name: postgres, namespace: orders}
 spec:
-  clusterIP: None                            # headless: DNS-имена postgres-0.postgres (02-3)
+  clusterIP: None                            # headless: DNS-имена postgres-0.postgres
   selector: {app: postgres}
   ports: [{name: pg, port: 5432}]
 ---
@@ -375,9 +1110,37 @@ kubectl apply -f postgres.yaml
 kubectl -n orders rollout status sts/postgres --timeout=180s
 ```
 
-Пароль лежит в манифесте открытым текстом — это учебный стенд. Как с секретами поступают по-настоящему — 04-1 и 08-2.
+Разбор ключей:
 
-### 4.3. orders-api, Service и маршрут
+| Часть манифеста | Значение |
+|---|---|
+| `stringData` | значения Secret в открытом виде; Kubernetes сам кодирует их в base64 |
+| `clusterIP: None` | headless Service: у него нет виртуального IP |
+| `envFrom: secretRef` | все ключи Secret становятся переменными контейнера |
+| `PGDATA` | подкаталог тома: корень тома содержит `lost+found` |
+| `readinessProbe: pg_isready` | под готов, когда PostgreSQL принимает соединения |
+| `limits: memory: 512Mi` | предел памяти; предела CPU нет |
+| `volumeClaimTemplates` | свой том 1 Gi на каждую реплику, класс `standard` |
+
+Результат (ожидаемый, сокращён):
+
+```
+namespace/orders created
+secret/postgres created
+service/postgres created
+statefulset.apps/postgres created
+…
+statefulset rolling update complete 1 pods at revision postgres-…
+```
+
+Разбор вывода:
+
+1. Три объекта из файла созданы за один `apply`.
+2. Последняя строка значит, что под `postgres-0` запущен и готов.
+
+#### Шаг 4. Развернуть orders-api, Service и маршрут
+
+Создаём ConfigMap с конфигом, Deployment из двух реплик, Service и HTTPRoute. Маршрут привязывает имя `orders.localhost` к Service через Gateway `lab`.
 
 ```bash
 cat > orders-api.yaml <<'E'
@@ -437,7 +1200,19 @@ kubectl -n orders rollout status deploy/orders-api --timeout=120s
 kubectl -n orders get pods,svc,pvc,httproute
 ```
 
-Проверено:
+Разбор ключей:
+
+| Часть манифеста | Значение |
+|---|---|
+| `replicas: 2` | две реплики приложения |
+| `secretKeyRef` | взять `DATABASE_URL` из Secret `postgres` |
+| `SHUTDOWN_DELAY: "5"` | после SIGTERM обслуживать запросы ещё 5 с |
+| `readinessProbe /ready` | под получает трафик, когда БД отвечает; проверка каждые 2 с |
+| `livenessProbe /health` | перезапуск, если процесс не отвечает; проверка каждые 10 с |
+| `parentRefs: lab` | привязать маршрут к Gateway `lab` |
+| `hostnames` | маршрут принимает запросы к `orders.localhost` |
+
+Результат (сокращён):
 
 ```
 NAME                              READY   STATUS    RESTARTS   AGE
@@ -449,89 +1224,298 @@ NAME                 TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)    AGE
 service/orders-api   ClusterIP   10.96.100.97   <none>        80/TCP     7m36s
 service/postgres     ClusterIP   None           <none>        5432/TCP   8m8s
 
-NAME                                    STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   ...
-persistentvolumeclaim/data-postgres-0   Bound    pvc-4c926342-30ed-4448-80b3-abbde6d0c56f   1Gi        RWO            standard       ...
+NAME                                    STATUS   VOLUME          CAPACITY   ACCESS MODES   …
+persistentvolumeclaim/data-postgres-0   Bound    pvc-4c926342…   1Gi        RWO            …
 
 NAME                                             HOSTNAMES              AGE
 httproute.gateway.networking.k8s.io/orders-api   ["orders.localhost"]   7m36s
 ```
 
-### 4.4. Сквозной запрос
+Разбор вывода:
+
+1. Три пода `Running`, `1/1`: оба orders-api прошли проверку готовности.
+2. Service `orders-api` имеет ClusterIP, а `postgres` — `None`: он headless.
+3. PVC `data-postgres-0` в состоянии `Bound`: local-path-provisioner создал том на узле.
+4. HTTPRoute принимает имя `orders.localhost`.
+
+#### Шаг 5. Выполнить сквозной запрос
+
+Отправляем запрос с хоста. Он проходит весь путь: порт 8088, Gateway, Service, под, PostgreSQL. Повторите команду несколько раз.
 
 ```bash
 curl -s http://orders.localhost:8088/api/orders
 ```
 
-curl сам резолвит любые имена `*.localhost` в `127.0.0.1`, правка `/etc/hosts` не нужна. Браузеры делают так же.
+Разбор команды:
 
-Ожидаемый результат:
+| Часть команды | Значение |
+|---|---|
+| `curl -s` | тихий режим, только тело ответа |
+| `orders.localhost:8088` | имя маршрута и порт входа стенда |
+| `/api/orders` | путь, который читает заказы из БД |
+
+Результат (длинная строка сокращена):
 
 ```
-{"orders": [{"id": 1, "item": "book", "qty": 2}, {"id": 2, "item": "pen", "qty": 5}], "total_items": 7, "pod": "orders-api-6d54d4c46b-fvq75"}
+{"orders": [{"id": 1, …}, {"id": 2, …}], "total_items": 7, "pod": "orders-api-…-fvq75"}
 ```
 
-⚠️ С хоста в среде агента не проверено: песочница агента работает в своём сетевом namespace и не видит `127.0.0.1` хоста. Тот же путь (NodePort 30080 узла control-plane → Envoy → orders-api → PostgreSQL) проверен из сети kind:
+Разбор вывода:
+
+1. Список `orders` пришёл из PostgreSQL: без `DATABASE_URL` приложение отдавало бы список из памяти.
+2. `total_items: 7` — сумма количеств: 2 книги и 5 ручек.
+3. Поле `pod` меняется между запросами: Service распределяет их между двумя репликами.
+
+Если с хоста ответа нет, повторите запрос изнутри сети kind. Это отделяет ошибку входа от ошибки приложения.
 
 ```bash
-docker exec lab-worker curl -s -H 'Host: orders.localhost' http://lab-control-plane:30080/api/orders
+docker exec lab-worker curl -s -H 'Host: orders.localhost' \
+  http://lab-control-plane:30080/api/orders
 ```
 
-Проверено — ответ выше, слово в слово, с данными из PostgreSQL. Повторите запрос несколько раз: поле `pod` меняется — Service распределяет запросы между двумя репликами.
+Разбор вывода: ответ тот же, что выше. Тогда проблема на пути от хоста до порта 8088 (§5).
 
-## 5. Как в курсе выполняются команды 🟢
+#### Итог
 
-- Все команды — с хоста: `kubectl` с контекстом `kind-lab`, `docker exec lab-<узел> …` — когда нужно посмотреть на узел изнутри.
-- Каждая лаба работает в своём namespace `lab-NN-M` и удаляет его в уборке. Namespace `orders` (сквозной сценарий) лабы не удаляют; если часть его меняет — в конце возвращает исходное состояние (`kubectl apply -f ~/lab/k8s/orders-api/k8s/`).
-- В выводах «проверено» имена подов, IP, UID и миллисекунды — с прогона автора. У вас будут другие, сверяйте структуру и порядок величин.
-- Агент выполнял `kubectl` из служебного контейнера в docker-сети kind (песочница не видит `127.0.0.1` хоста); у читателя те же команды работают с хоста. Отличаются только адреса в ошибках подключения: у агента `lab-control-plane:6443`, у вас `127.0.0.1:<порт>`.
+Что вы узнали:
 
-## 6. Если не поднялось 🟡
+| Что узнали | Как проверить |
+|---|---|
+| Образ из реестра стенда доступен узлам | `crictl pull` на узле |
+| StatefulSet создаёт PVC по шаблону | `kubectl -n orders get pvc` |
+| Запрос идёт Gateway → Service → под → БД | `curl http://orders.localhost:8088/api/orders` |
+| Поле `pod` показывает балансировку по репликам | несколько запросов подряд |
+| Пароль в манифесте — только для стенда | `stringData` в `postgres.yaml` |
 
-| Симптом | Причина | Что делать |
-|---|---|---|
-| `Bind for 0.0.0.0:8080 failed: port is already allocated` при `kind create cluster` | порт занят другим контейнером (у автора — `searxng` на 8080; поэтому стенд на 8088) | `docker ps --format '{{.Names}} {{.Ports}}'`; поменять `hostPort` в `lab-up.sh` и в командах курса |
-| `error getting credentials - err: exec: "docker-credential-desktop"` | в `~/.docker/config.json` прописан `credsStore` от Docker Desktop | убрать `credsStore` или запускать с `DOCKER_CONFIG=$(mktemp -d)` |
-| `too many open files` в логах kubelet/kube-proxy, узлы NotReady | мало `fs.inotify.max_user_instances` | §2, затем `bash kubernetes/lab/lab-down.sh --purge && bash kubernetes/lab/lab-up.sh` |
-| под в `ImagePullBackOff`, в событиях `dial tcp [::1]:5001: connect: connection refused` | в узле нет (или пустой) `/etc/containerd/certs.d/localhost:5001/hosts.toml`: `localhost` внутри узла — сам узел (проверено — так было, пока в скрипте не хватало `docker exec -i`) | перезапустить `lab-up.sh`; проверить `docker exec lab-worker cat /etc/containerd/certs.d/localhost:5001/hosts.toml` |
-| запрос к `:8088` висит до таймаута, а из пода через Service Envoy работает | `externalTrafficPolicy: Local` у Service Envoy: трафик NodePort на узел без пода Envoy kube-proxy отбрасывает (проверено: правило `has no local endpoints … DROP`) | в скрипте стоит `Cluster` через `EnvoyProxy`; если меняли — вернуть (разбор в 03-2) |
-| `curl … :8088` → `Connection refused` | Gateway не создан или не Programmed | `kubectl -n envoy-gateway-system get gateway lab`; повторить `lab-up.sh` |
-| orders-api `0/1 Running`, в логах `db not ready: …` | PostgreSQL не готов или неверный `DATABASE_URL` | `kubectl -n orders get pods`, `kubectl -n orders logs deploy/orders-api`; приложение пробует 60 с и выходит |
-| после перезагрузки машины `kubectl` → `connection refused` | узлы kind остановлены | `bash kubernetes/lab/lab-up.sh` — запустит узлы и дождётся apiserver |
-| `kubectl` ходит не в тот кластер | текущий контекст не `kind-lab` | `kubectl config use-context kind-lab` |
+#### Уборка
 
-## 7. Включить и выключить 🟢
-
-Стенд не нужно держать запущенным постоянно:
+Приложение нужно всем частям курса, поэтому остаётся в кластере. Если вы хотите вернуть его в исходное состояние после опытов в других частях, примените манифесты стенда заново.
 
 ```bash
-bash kubernetes/lab/lab-down.sh     # docker stop узлов и реестра; etcd, PVC, образы — сохраняются
-bash kubernetes/lab/lab-up.sh       # docker start, ожидание apiserver, проверка дополнений
+kubectl apply -f ~/lab/k8s/orders-api/k8s/
+kubectl -n orders get pods
 ```
 
-Проверено: в таблицу `orders` добавлена строка `lamp`, `lab-down.sh` → `lab-up.sh` за 51 с, поды перезапустились (`RESTARTS 1`), ответ:
+Разбор: первая команда восстанавливает объекты `orders` из файлов; вторая показывает, что три пода снова работают.
+
+#### Вопросы для самопроверки
+
+1. Почему у `postgres` Service нет ClusterIP?
+
+<details><summary>Ответ</summary>
+
+Это headless Service (`clusterIP: None`). DNS возвращает адреса подов напрямую, а под получает стабильное имя `postgres-0.postgres`. Для StatefulSet это обязательно (02-3).
+
+</details>
+
+2. Что произойдёт с данными, если удалить под `postgres-0`?
+
+<details><summary>Ответ</summary>
+
+Данные сохранятся. Они лежат в PVC `data-postgres-0` на диске узла. StatefulSet создаст под с тем же именем, и он подключит тот же том.
+
+</details>
+
+3. Зачем в `PGDATA` указан подкаталог `pgdata`?
+
+<details><summary>Ответ</summary>
+
+В корне нового тома есть каталог `lost+found`. PostgreSQL отказывается инициализировать непустой каталог, поэтому данные кладут в подкаталог.
+
+</details>
+
+4. Ответ orders-api пришёл, но поле `pod` не меняется. Что проверите?
+
+<details><summary>Ответ</summary>
+
+Количество готовых эндпоинтов: `kubectl -n orders get endpointslice`. Если готов только один под, весь трафик идёт на него. Причина обычно в провале проверки готовности у второго пода (`kubectl -n orders get pods`).
+
+</details>
+
+### Лабораторная работа 4. Выключить и включить стенд без потери данных
+
+**Цель.** Остановить стенд, снова запустить его и убедиться, что данные PostgreSQL, образы и объекты кластера сохранились. Вы также узнаете, чем `--purge` отличается от остановки.
+
+**Что понадобится.**
+
+- Стенд с orders-api из работы 3.
+- Около 10 минут.
+
+**Схема опыта.** Добавляем в таблицу заказов новую строку, останавливаем стенд и запускаем его. Если строка вернулась, данные пережили остановку.
 
 ```
-{"orders": [{"id": 1, "item": "book", "qty": 2}, {"id": 2, "item": "pen", "qty": 5}, {"id": 3, "item": "lamp", "qty": 1}], "total_items": 8, "pod": "orders-api-6d54d4c46b-ksf5v"}
+INSERT lamp ─► lab-down.sh ─► docker stop (узлы, реестр)  etcd, PVC, образы целы
+                                      │
+              curl видит lamp ◄─ lab-up.sh ◄─ docker start + ожидание apiserver
 ```
 
-## 8. Уборка
+Схема показывает цикл. Остановка не удаляет контейнеры, а запуск поднимает те же самые.
+
+**Риски.** Работа останавливает все контейнеры стенда.
+
+- **Что меняется:** контейнеры стенда на время остановятся; в таблицу `orders` добавится строка.
+- **Надолго ли:** на время опыта, около минуты; строку вы удалите в уборке.
+- **Безопасность:** не меняется.
+- **Влияние на систему:** освобождается около 2,5 ГиБ RAM на время остановки. Другие контейнеры Docker не затрагиваются. Состояние подов не сохраняется: после запуска они перезапускаются.
+- **Откат:** `lab-up.sh` возвращает стенд в рабочее состояние.
+
+#### Шаг 1. Добавить строку в базу
+
+Вставляем заказ напрямую в PostgreSQL. Команда выполняется в поде `postgres-0` клиентом `psql`.
 
 ```bash
-bash kubernetes/lab/lab-down.sh --purge        # кластер, реестр, том с образами, ~/lab/k8s (включая исходники orders-api)
-docker image rm kindest/node:v1.36.1 registry:2.8.3   # по желанию, ~1 ГБ
+kubectl -n orders exec postgres-0 -- \
+  psql -U orders -d orders -c "INSERT INTO orders (item, qty) VALUES ('lamp', 1);"
+curl -s http://orders.localhost:8088/api/orders
 ```
 
-`--purge` удаляет и `~/lab/k8s/orders-api` — если вы правили код, сохраните его заранее.
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `exec postgres-0 --` | выполнить команду в поде `postgres-0` |
+| `psql -U orders -d orders` | клиент PostgreSQL: пользователь и база `orders` |
+| `-c "INSERT …"` | выполнить один SQL-запрос и выйти |
+
+Результат (ожидаемый; длинная строка сокращена):
+
+```
+INSERT 0 1
+{"orders": [{"id": 1, …}, {"id": 2, …}, {"id": 3, "item": "lamp", …}], "total_items": 8, …}
+```
+
+Разбор вывода:
+
+1. `INSERT 0 1` — вставлена одна строка.
+2. В ответе три заказа; `total_items` равно 8.
+
+#### Шаг 2. Остановить и запустить стенд
+
+Останавливаем стенд скриптом без аргументов и запускаем снова. Смотрим время запуска.
+
+```bash
+bash kubernetes/lab/lab-down.sh
+docker ps --filter name=lab- --filter name=kind-registry
+time bash kubernetes/lab/lab-up.sh
+```
+
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `lab-down.sh` | `docker stop` узлов и реестра, без удаления |
+| `docker ps --filter …` | убедиться, что контейнеры остановлены |
+| `time … lab-up.sh` | запустить стенд и измерить время |
+
+Результат (ожидаемый начало; последняя строка — полный цикл у автора):
+
+```
+узлы kind и реестр остановлены, данные сохранены — запуск: bash kubernetes/lab/lab-up.sh
+CONTAINER ID   IMAGE   COMMAND   CREATED   STATUS   PORTS   NAMES
+…
+== готово
+```
+
+Разбор вывода:
+
+1. Скрипт сообщает, что данные сохранены.
+2. Пустой список `docker ps` значит, что контейнеры остановлены. Запуск `lab-up.sh` занял на машине автора 51 с, а не 2 мин 9 с, потому что кластер и образы уже есть.
+
+#### Шаг 3. Проверить, что данные на месте
+
+После запуска поды перезапускаются, а данные остаются. Проверяем под и повторяем сквозной запрос.
+
+```bash
+kubectl -n orders get pods
+curl -s http://orders.localhost:8088/api/orders
+```
+
+Разбор команд:
+
+| Часть команды | Значение |
+|---|---|
+| `get pods` | состояние подов после запуска |
+| `curl …/api/orders` | заказы из PostgreSQL |
+
+Результат (на машине автора, длинная строка сокращена):
+
+```
+{"orders": [{"id": 1, …}, {"id": 2, …}, {"id": 3, "item": "lamp", "qty": 1}], "total_items": 8, …}
+```
+
+Разбор вывода:
+
+1. Заказ `lamp` пережил остановку: PVC лежит на диске узла, а контейнеры узлов остановлены, но не удалены.
+2. Поды перезапустились (у автора `RESTARTS 1`): остановка узла перезапускает контейнеры. Состояние `Running` возвращается за несколько секунд.
+3. Поле `pod` в ответе другое, чем до остановки: имя пода у каждой реплики своё.
+
+#### Итог
+
+Что вы узнали:
+
+| Что узнали | Как проверить |
+|---|---|
+| `lab-down.sh` сохраняет etcd, PVC и образы | заказ `lamp` после `lab-up.sh` |
+| Повторный подъём быстрее первого | 51 с против 2 мин 9 с у автора |
+| Поды после остановки перезапускаются | колонка `RESTARTS` |
+| `--purge` удаляет всё, включая исходники | список в §3 |
+
+#### Уборка
+
+Удаляем тестовую строку и возвращаем таблицу в исходное состояние.
+
+```bash
+kubectl -n orders exec postgres-0 -- \
+  psql -U orders -d orders -c "DELETE FROM orders WHERE item = 'lamp';"
+curl -s http://orders.localhost:8088/api/orders
+```
+
+Результат (ожидаемый):
+
+```
+DELETE 1
+{"orders": [{"id": 1, …}, {"id": 2, …}], "total_items": 7, …}
+```
+
+Разбор вывода: `DELETE 1` — строка удалена, сумма вернулась к 7.
+
+Стенд остаётся для следующих частей. Полную уборку выполняйте только после окончания курса: она удаляет кластер, реестр и исходники orders-api. Если правили код, сохраните его заранее.
+
+```bash
+bash kubernetes/lab/lab-down.sh --purge
+docker image rm kindest/node:v1.36.1 registry:2.8.3
+```
+
+Разбор команд: первая команда удаляет кластер, контейнер реестра, том `kind-registry-data` и `~/lab/k8s`; вторая освобождает около 1 ГБ диска и необязательна. Чтобы вернуться к прежнему кластеру, переключите контекст: `kubectl config use-context <прежний>`.
+
+#### Вопросы для самопроверки
+
+1. Что сохраняет `lab-down.sh` без аргументов и что удаляет `--purge`?
+
+<details><summary>Ответ</summary>
+
+Без аргументов выполняется `docker stop`: контейнеры остаются, поэтому сохраняются etcd, тома PVC и образы в узлах. С флагом `--purge` удаляются кластер, реестр, том с образами и каталог `~/lab/k8s`.
+
+</details>
+
+2. Почему после `lab-up.sh` у подов `RESTARTS 1`?
+
+<details><summary>Ответ</summary>
+
+Остановка контейнера узла убивает все процессы в нём, включая контейнеры подов. После запуска kubelet запускает их заново, счётчик перезапусков растёт на единицу. Объекты подов при этом остаются те же.
+
+</details>
+
+3. Почему повторный подъём быстрее первого?
+
+<details><summary>Ответ</summary>
+
+Кластер и образы уже существуют. Скрипт только запускает контейнеры, ждёт apiserver и проверяет, что дополнения на месте. Создание кластера и скачивание образов пропускаются.
+
+</details>
 
 ---
 
-## Чеклист
+## → Дальше
 
-- [ ] `bash kubernetes/lab/lab-up.sh` закончился строкой `== готово`, все 4 узла `Ready`.
-- [ ] `kubectl top nodes` показывает цифры (metrics-server работает).
-- [ ] Образ `localhost:5001/orders-api:2.0` в реестре, поды orders-api и postgres `Running`, `1/1`.
-- [ ] `curl http://orders.localhost:8088/api/orders` возвращает заказы, поле `pod` меняется между запросами.
-- [ ] Знаю, как зайти на узел (`docker exec -it lab-worker bash`) и где на нём kubelet и containerd.
-- [ ] Умею выключить и включить стенд без потери данных.
-
-→ Следующая часть: **00-2. Инструменты** — kubectl по-взрослому (контексты, `-o jsonpath`/`custom-columns`, `explain`, `-v=8`, `--dry-run=server`, `diff`), `kubectl debug`, k9s, stern, kubectx/kubens, krew; что чем смотреть на узле — `crictl`, `journalctl`, `etcdctl`.
+Стенд поднят, демо-приложение отвечает через Gateway. Чтобы работать с ним уверенно, нужны инструменты: выбор формата вывода у kubectl, `explain`, повышение подробности логов, отладочный контейнер, `crictl` и `journalctl` на узле. Они не нужны для запуска стенда, но нужны для каждой следующей работы. Поэтому часть 00-2 идёт сразу после стенда и вводит карточки инструментов.
