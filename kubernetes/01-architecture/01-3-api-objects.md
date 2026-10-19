@@ -256,7 +256,7 @@ kubectl get cm <имя> -o jsonpath='{.metadata.deletionTimestamp} {.metadata.fi
 
 Группы, которые отдаёт сервер, видны через `kubectl get --raw /apis`, а список типов с группами, версиями и признаком namespace даёт `kubectl api-resources`. Поля объекта объясняет `kubectl explain`, например `kubectl explain deployment.spec.strategy`.
 
-Устаревшее API работает, но к каждому ответу сервер добавляет заголовок `Warning`, и kubectl его печатает. Обращения сервер считает в метрике `apiserver_requested_deprecated_apis`. Её метка `removed_release` показывает релиз, в котором версию удалят, а пустое значение значит, что дата не назначена. Эту метрику смотрят перед обновлением кластера (10-3).
+Устаревшее API работает, но к каждому ответу сервер добавляет заголовок `Warning`, и kubectl его печатает. Факт обращения сервер отмечает в метрике `apiserver_requested_deprecated_apis`. Её метка `removed_release` показывает релиз, в котором версию удалят, а пустое значение значит, что дата не назначена. Эту метрику смотрят перед обновлением кластера (10-3).
 
 ### Ревизии и события
 
@@ -428,7 +428,7 @@ otations":{},"name":"api","namespace":"lab-01-3"},"spec":{"r
 
 #### Шаг 2. Server-side apply и конфликт владельцев
 
-Команды создают Deployment `api2` через SSA от менеджера `kubectl`. Второй менеджер `hpa-like` пытается записать другое число реплик, сначала без force, потом с ним.
+Команды создают Deployment `api2` через SSA от менеджера `kubectl`, а затем второй менеджер `hpa-like` пытается записать другое число реплик без force.
 
 ```bash
 sed 's/name: api,/name: api2,/; s/app: api/app: api2/g' d1.yaml > d2.yaml
@@ -460,10 +460,10 @@ are the ways you can resolve this warning:
 Разбор:
 
 1. `conflict with "kubectl": .spec.replicas` — поле принадлежит менеджеру `kubectl`, а `hpa-like` пытается записать другое значение.
-2. Далее сервер перечисляет три выхода: забрать поле (`--force-conflicts`), убрать его из манифеста или совпасть со значением. Первый вариант проверим сейчас.
-3. Первая команда создания `api2` отработала без ошибки, поэтому вывод у неё обычный: `deployment.apps/api2 serverside-applied`. Эта строка ожидаемая.
+2. Дальше сервер перечисляет выходы: забрать поле ключом `--force-conflicts` или убрать его из манифеста; первый вариант проверим сейчас.
+3. Первая команда создала `api2` без ошибки и напечатала `deployment.apps/api2 serverside-applied`, в блоке эта строка опущена.
 
-Теперь забираем поле силой и смотрим владельцев.
+Теперь второй менеджер забирает поле силой, а мы смотрим, как изменились владельцы.
 
 ```bash
 kubectl apply --server-side --field-manager=hpa-like --force-conflicts -f d2b.yaml
@@ -489,12 +489,12 @@ kubectl get deploy api2 -o json --show-managed-fields \
 Разбор:
 
 1. `kubectl` потерял `f:replicas`: у него остались селектор и шаблон.
-2. `hpa-like` владеет `f:replicas`. Селектор и шаблон у него тоже, потому что они совпали со значениями `kubectl`, и поля стали общими.
+2. `hpa-like` владеет `f:replicas`, а ещё селектором и шаблоном: их значения совпали со значениями `kubectl`, и эти поля стали общими.
 3. Значение `replicas` теперь 4.
 
 #### Шаг 3. Что остаётся, если убрать поле из манифеста
 
-Убираем `replicas` из манифеста менеджера `kubectl` и применяем снова. У поля есть другой владелец, поэтому значение должно остаться.
+Убираем `replicas` из манифеста менеджера `kubectl` и применяем его снова. У поля есть другой владелец, поэтому значение должно остаться.
 
 ```bash
 grep -v replicas d2.yaml > d2c.yaml
@@ -513,9 +513,9 @@ kubectl get deploy api2 -o jsonpath='replicas={.spec.replicas}{"\n"}'
 replicas=4
 ```
 
-Разбор: значение осталось 4, потому что им владеет `hpa-like`. `kubectl` лишь отказался от своей доли.
+Разбор: значение осталось 4, потому что им владеет `hpa-like`, а `kubectl` лишь отказался от своей доли.
 
-Повторите опыт без второго менеджера: удалите `api2`, примените `d2.yaml`, затем `d2c.yaml`. Тогда у поля один владелец, и после отказа от него сервер удалит поле. Получится `replicas=1`: дефолт Deployment. Эти значения (`4` и `1`) сняты на стенде автора.
+Повторите опыт без второго менеджера: удалите `api2`, примените `d2.yaml`, затем `d2c.yaml`. Тогда у поля один владелец, и после отказа от него сервер удалит поле, поэтому получится `replicas=1` — значение по умолчанию у Deployment.
 
 #### Шаг 4. kubectl apply против HPA
 
@@ -575,7 +575,7 @@ HPA set replicas=3
 Разбор:
 
 1. HPA поднял `replicas` до 3 сам, через подресурс `scale`.
-2. `kubectl-client-side-apply` — запись от вашего `apply`. В ней есть `replicas`, потому что поле присутствует в файле.
+2. `kubectl-client-side-apply` — запись от вашего `apply`, и в ней есть `replicas`, потому что поле присутствует в файле.
 3. Запись `status` — обновления состояния Deployment.
 
 Теперь применяем тот же файл без единой правки и следим за числом реплик.
@@ -618,10 +618,10 @@ ScalingReplicaSet   Scaled up replica set shop-5bcf84c5cb from 1 to 3
 
 1. `shop configured` — `apply` изменил Deployment, хотя файл не менялся: он вернул `replicas: 1`.
 2. `1/1` почти 14 секунд — поды ушли, остался один.
-3. `3/3` на `t=+14s` — HPA вернул число реплик. Он синхронизируется раз в 15 с.
+3. `3/3` на `t=+14s` — HPA вернул число реплик на ближайшем цикле, а цикл у него раз в 15 с.
 4. События показывают тот же цикл: scale down до 1, `SuccessfulRescale` до 3, scale up.
 
-Обычный `apply` без правок убил два пода из трёх; 14 секунд сервис работал на одной реплике.
+Обычный `apply` без правок файла убил два пода из трёх, и 14 секунд сервис работал на одной реплике.
 
 #### Шаг 5. Исправление: убрать replicas и перейти на SSA
 
@@ -644,7 +644,7 @@ kubectl get deploy shop --show-managed-fields -o json \
 | второй `apply --server-side` | обычное повторное применение для проверки |
 | `replicas: (… != null)` | есть ли у менеджера поле `replicas` |
 
-Результат (первые две команды печатают `serverside-applied`, строки ожидаемые):
+Результат (строки `serverside-applied` от первых двух команд опущены):
 
 ```
 3
@@ -656,10 +656,10 @@ kubectl get deploy shop --show-managed-fields -o json \
 
 Разбор:
 
-1. `3` — число реплик осталось тем, что поставил HPA. Повторный `apply` его не тронул.
+1. `3` — число реплик осталось тем, что поставил HPA, и повторный `apply` его не тронул.
 2. `replicas: true` только у `kube-controller-manager` через `scale`: поле принадлежит HPA.
 3. У `kubectl` поля `replicas` нет — вы его больше не заявляете.
-4. `kubectl-last-applied` — след перехода с client-side apply. Он ничем не владеет.
+4. `kubectl-last-applied` — след перехода с client-side apply, который ничем не владеет.
 
 **Итог.**
 
@@ -679,7 +679,7 @@ kubectl delete hpa shop
 rm -f d1.yaml d2.yaml d2b.yaml d2c.yaml hpa.yaml
 ```
 
-Первая команда удаляет Deployment; поды `sleep` не обрабатывают SIGTERM, поэтому остановка занимает около 30 с. Вторая удаляет HPA. Третья чистит файлы в рабочем каталоге.
+Первая команда удаляет Deployment сразу, а их поды завершаются в фоне около 30 с: `sleep` не обрабатывает SIGTERM. Вторая команда удаляет HPA, третья чистит файлы в рабочем каталоге.
 
 **Вопросы для самопроверки.**
 
@@ -692,7 +692,7 @@ rm -f d1.yaml d2.yaml d2b.yaml d2c.yaml hpa.yaml
 <summary>Ответы</summary>
 
 1. Поле было в файле и в last-applied, значит, kubectl считал его своим и привёл к файлу. Правку через `scale` он не учитывает.
-2. Другой менеджер владеет полем с другим значением. Уберите поле из манифеста либо приведите значение к текущему. Force забирает поле силой.
+2. Другой менеджер владеет полем с другим значением. Без force поле убирают из манифеста либо приводят значение к текущему.
 3. Запись осталась от перехода с client-side apply. После SSA без `replicas` все поля либо перешли к менеджеру `kubectl`, либо принадлежат HPA, поэтому запись пуста.
 4. Обернуть поле в условие: если включён autoscaling, строку `replicas` не рендерить (07-1).
 
@@ -702,7 +702,7 @@ rm -f d1.yaml d2.yaml d2b.yaml d2c.yaml hpa.yaml
 
 **Цель.** Проследить цепочку владельцев Deployment, ReplicaSet и Pod и сравнить режимы `orphan` и `foreground`.
 
-**Что понадобится.** Стенд 00-1, namespace `lab-01-3`, образ `busybox:1.37`, файл `d1.yaml` из работы 1 (создайте заново командой из шага 1, если удалили).
+**Что понадобится.** Стенд 00-1, namespace `lab-01-3`, образ `busybox:1.37`; манифест `d1.yaml` шаг 1 создаёт заново.
 
 **Схема опыта.**
 
@@ -713,7 +713,7 @@ Deployment api ─► ReplicaSet ─► 3 пода
          RS остаётся с deletionTimestamp и finalizer, пока завершаются поды
 ```
 
-Схема 8. Режим orphan рвёт связь владельца с зависимыми. Режим foreground задерживает владельца, пока не уйдут зависимые.
+Схема 8. Режим orphan рвёт связь владельца с зависимыми, а режим foreground задерживает владельца, пока не уйдут зависимые.
 
 #### Шаг 1. Прочитать цепочку владельцев
 
@@ -733,18 +733,28 @@ spec:
       containers: [{name: web, image: busybox:1.37, command: ["sleep","infinity"]}]
 EOF
 kubectl apply -f d1.yaml && kubectl rollout status deploy/api
-kubectl get pods -l app=api -o jsonpath='{.items[0].metadata.ownerReferences}{"\n"}'
+kubectl get pods -l app=api -o jsonpath='{.items[0].metadata.ownerReferences}' | jq .
 ```
 
 | Часть команды | Значение |
 |---|---|
 | `rollout status` | дождаться готовности Deployment |
 | `items[0].metadata.ownerReferences` | ссылки на владельца первого пода |
+| `jq .` | разложить JSON по строкам |
 
 Результат (хвост с uid сокращён):
 
 ```
-[{"apiVersion":"apps/v1","blockOwnerDeletion":true,"controller":true,"kind":"ReplicaSet","name":"api-756bbf9595","uid":"76e68e0d-…"}]
+[
+  {
+    "apiVersion": "apps/v1",
+    "blockOwnerDeletion": true,
+    "controller": true,
+    "kind": "ReplicaSet",
+    "name": "api-756bbf9595",
+    "uid": "76e68e0d-…"
+  }
+]
 ```
 
 Разбор:
@@ -752,7 +762,7 @@ kubectl get pods -l app=api -o jsonpath='{.items[0].metadata.ownerReferences}{"\
 1. `kind: ReplicaSet`, `name: api-756bbf9595` — владелец пода.
 2. `controller: true` — этот ReplicaSet управляет подом.
 3. `blockOwnerDeletion: true` — при foreground-удалении владелец будет ждать этот под.
-4. Владелец ReplicaSet — Deployment `api`, это видно аналогичной командой для `rs`.
+4. Владелец самого ReplicaSet — Deployment `api`, это видно такой же командой для `rs`.
 
 #### Шаг 2. Удалить владельца с orphan
 
@@ -784,7 +794,7 @@ rs ownerRefs=""
 
 1. Deployment удалён, а ReplicaSet с тремя готовыми подами остался.
 2. Поды работают: удаление владельца их не затронуло.
-3. `ownerRefs=""` — у ReplicaSet нет владельца. Он стал «ничьим». Новый Deployment с тем же селектором может его подхватить.
+3. `ownerRefs=""` — у ReplicaSet нет владельца, он стал «ничьим», и новый Deployment с тем же селектором может его подхватить.
 
 #### Шаг 3. Удалить с foreground
 
@@ -792,8 +802,9 @@ rs ownerRefs=""
 
 ```bash
 kubectl delete rs -l app=api --cascade=foreground --wait=false
-kubectl get rs -l app=api \
-  -o jsonpath='finalizers={.items[0].metadata.finalizers} deletionTimestamp={.items[0].metadata.deletionTimestamp}{"\n"}'
+j='finalizers={.items[0].metadata.finalizers}'
+j+=' deletionTimestamp={.items[0].metadata.deletionTimestamp}{"\n"}'
+kubectl get rs -l app=api -o jsonpath="$j"
 kubectl get pods -l app=api
 ```
 
@@ -801,6 +812,7 @@ kubectl get pods -l app=api
 |---|---|
 | `--cascade=foreground` | владелец остаётся, пока не удалены зависимые |
 | `--wait=false` | не ждать завершения, вернуть управление сразу |
+| `j=…`, `j+=…` | собрать длинный шаблон jsonpath в переменной |
 | `metadata.finalizers` | список finalizer'ов у ReplicaSet |
 | `metadata.deletionTimestamp` | время, когда запрошено удаление |
 
@@ -815,9 +827,9 @@ api-756bbf9595-d2dmn   1/1   Terminating   0     3s
 
 1. `foregroundDeletion` — finalizer, поставленный API-сервером на время каскада.
 2. `deletionTimestamp` есть, а ReplicaSet ещё в API: он ждёт зависимых.
-3. Под в `Terminating` — отсюда виден порядок: сначала уходят поды, потом владелец.
+3. Под в `Terminating`, и отсюда виден порядок: сначала уходят поды, потом владелец.
 
-Проверим конец каскада. Ожидаемый результат: через 30–40 с ничего не осталось, потому что `sleep` в роли PID 1 игнорирует SIGTERM, и kubelet ждёт `terminationGracePeriodSeconds` (30 с) до SIGKILL (02-5).
+Конец каскада проверим через 40 секунд. Поды уходят около 30 с: `sleep` в роли PID 1 игнорирует SIGTERM, и kubelet ждёт `terminationGracePeriodSeconds` (30 с) до SIGKILL (02-5).
 
 ```bash
 sleep 40; kubectl get rs,pods -l app=api
@@ -844,7 +856,7 @@ kubectl delete deploy,rs -l app=api --ignore-not-found
 rm -f d1.yaml
 ```
 
-Команда удаляет остатки Deployment и ReplicaSet, если какой-то шаг не дошёл до конца, и файл манифеста.
+Первая команда удаляет остатки Deployment и ReplicaSet, если какой-то шаг не дошёл до конца, а вторая — файл манифеста.
 
 **Вопросы для самопроверки.**
 
@@ -855,9 +867,9 @@ rm -f d1.yaml
 <details>
 <summary>Ответы</summary>
 
-1. Режим по умолчанию — background. Deployment исчезает сразу, а сборщик мусора находит ReplicaSet и поды без владельца и удаляет их.
-2. При foreground владелец остаётся в API с `deletionTimestamp` и finalizer `foregroundDeletion`, пока не удалены зависимые с `blockOwnerDeletion`. При background владелец исчезает сразу.
-3. Deployment с изменённым селектором нельзя обновить на месте. Его удаляют с orphan, создают заново, и новый объект принимает работающие ReplicaSet и поды без простоя.
+1. Сработает режим по умолчанию — background: Deployment исчезает сразу, а сборщик мусора находит ReplicaSet и поды без владельца и удаляет их.
+2. При foreground владелец остаётся в API с `deletionTimestamp` и finalizer `foregroundDeletion`, пока не удалены зависимые с `blockOwnerDeletion`, а при background исчезает сразу.
+3. Селектор Deployment нельзя изменить на месте. Deployment удаляют с orphan и создают заново, а новый объект принимает работающие ReplicaSet и поды без простоя.
 
 </details>
 
@@ -875,18 +887,19 @@ rm -f d1.yaml
 Шаг 3: get cs, get endpoints ─► Warning ─► метрика apiserver_requested_deprecated_apis
 ```
 
-Схема 9. Три отдельных опыта с одной темой: у объекта есть служебные слои, которые обычная команда не видит.
+Схема 9. Три отдельных опыта с общей мыслью: у объекта есть служебные слои, которые обычная команда не видит.
 
 #### Шаг 1. Finalizer и удаление
 
-Команды создают ConfigMap, вешают на него finalizer и удаляют. Затем снимают finalizer.
+Команды создают ConfigMap, вешают на него finalizer и удаляют объект, не дожидаясь конца удаления.
 
 ```bash
 kubectl create cm guarded --from-literal=a=1
 kubectl patch cm guarded -p '{"metadata":{"finalizers":["example.com/cleanup"]}}'
 kubectl delete cm guarded --wait=false
-kubectl get cm guarded \
-  -o jsonpath='deletionTimestamp={.metadata.deletionTimestamp} finalizers={.metadata.finalizers}{"\n"}'
+j='deletionTimestamp={.metadata.deletionTimestamp}'
+j+=' finalizers={.metadata.finalizers}{"\n"}'
+kubectl get cm guarded -o jsonpath="$j"
 ```
 
 | Часть команды | Значение |
@@ -894,7 +907,7 @@ kubectl get cm guarded \
 | `create cm guarded` | создать ConfigMap с ключом `a` |
 | `patch … finalizers` | записать finalizer, у которого нет владельца |
 | `delete --wait=false` | не ждать: иначе команда зависнет |
-| `jsonpath='deletionTimestamp=…'` | показать время и список finalizer'ов |
+| `jsonpath="$j"` | показать время удаления и список finalizer'ов |
 
 Результат:
 
@@ -905,10 +918,10 @@ deletionTimestamp=2026-10-14T08:56:22Z finalizers=["example.com/cleanup"]
 
 Разбор:
 
-1. Сообщение `deleted` неточное: объект ещё в API. Команда выполнила своё дело, то есть поставила `deletionTimestamp`.
-2. Список finalizer'ов не пуст, и `deletionTimestamp` стоит. Объект ждёт очистки, которую никто не сделает: у `example.com/cleanup` нет контроллера.
+1. Сообщение `deleted` неточное: объект ещё в API, а команда лишь добилась установки `deletionTimestamp`.
+2. Список finalizer'ов не пуст, поэтому объект ждёт очистки, которую никто не сделает: у `example.com/cleanup` нет контроллера.
 
-Снимаем finalizer вручную. Так делают, когда владелец finalizer'а недоступен, а внешних ресурсов нет.
+Снимаем finalizer вручную, как делают, когда владелец finalizer'а недоступен, а внешних ресурсов за объектом нет.
 
 ```bash
 kubectl patch cm guarded --type=json -p '[{"op":"remove","path":"/metadata/finalizers"}]'
@@ -928,11 +941,11 @@ configmap/guarded patched
 Error from server (NotFound): configmaps "guarded" not found
 ```
 
-Разбор: после того как список опустел, API-сервер удалил объект сразу. Без `--wait=false` команда `delete` висела бы, пока кто-то не снимет finalizer.
+Разбор: когда список опустел, API-сервер сразу удалил объект. Без `--wait=false` команда `delete` висела бы, пока кто-то не снимет finalizer.
 
 #### Шаг 2. Подресурсы status и scale
 
-Команда создаёт Deployment с четырьмя репликами, пытается изменить его `status` обычным patch и читает подресурс `scale`.
+Команды создают Deployment с четырьмя репликами, пытаются изменить его `status` обычным patch и читают подресурс `scale`.
 
 ```bash
 kubectl create deployment api2 --image=busybox:1.37 --replicas=4 -- sleep infinity
@@ -950,7 +963,7 @@ kubectl get --raw /apis/apps/v1/namespaces/lab-01-3/deployments/api2/scale \
 | `get --raw …/scale` | прямой запрос к подресурсу scale |
 | `jq -c '{kind, spec, status}'` | компактный вывод трёх ключей |
 
-Результат (вывод `patch` и последней команды снят на стенде автора; остальные строки ожидаемые):
+Результат (строки `create` и `rollout status` опущены):
 
 ```
 deployment.apps/api2 patched (no change)
@@ -961,18 +974,19 @@ status.replicas=4
 Разбор:
 
 1. `patched (no change)` — сервер принял запрос и отбросил `status`: у Deployment есть подресурс `/status`, а обычная запись его не меняет.
-2. `status.replicas=4`, а не 99. Реальное число осталось у контроллера.
-3. Ответ `/scale` — маленький объект `Scale` с желаемым и фактическим числом реплик. Через него HPA масштабирует любой тип без знания его устройства.
+2. `status.replicas=4`, а не 99: фактическое число по-прежнему пишет контроллер.
+3. Ответ `/scale` — маленький объект `Scale` с желаемым и фактическим числом реплик. Через него HPA масштабирует любой тип, не зная его устройства; тот же объект покажет `kubectl get deploy api2 --subresource=scale -o json`.
 
 #### Шаг 3. Устаревшие API
 
-Команды обращаются к двум устаревшим API и затем читают метрику, которая их посчитала.
+Команды считают группы API, обращаются к двум устаревшим API и затем читают метрику, которая отметила эти обращения.
 
 ```bash
 kubectl get --raw /apis | jq '.groups | length'
 kubectl get cs
 kubectl -n orders get endpoints
-kubectl get --raw /metrics | grep '^apiserver_requested_deprecated_apis'
+kubectl get --raw /metrics | grep '^apiserver_requested_deprecated_apis' \
+  | sed 's/^apiserver_requested_deprecated_apis//'
 ```
 
 | Часть команды | Значение |
@@ -982,22 +996,23 @@ kubectl get --raw /metrics | grep '^apiserver_requested_deprecated_apis'
 | `get cs` | ComponentStatus, устаревший с 1.19 |
 | `-n orders get endpoints` | Endpoints, устаревшие с 1.33 |
 | `grep '^apiserver_…'` | оставить строки нужной метрики |
+| `sed 's/^…//'` | убрать имя метрики, чтобы строка стала короче |
 
-Результат (число групп снято на стенде автора, предупреждения и метрики тоже):
+Результат (сами объекты `cs` и `endpoints` опущены):
 
 ```
 24
 Warning: v1 ComponentStatus is deprecated in v1.19+
 Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointSlice
-apiserver_requested_deprecated_apis{group="",removed_release="",resource="componentstatuses",subresource="",version="v1"} 1
-apiserver_requested_deprecated_apis{group="",removed_release="",resource="endpoints",subresource="",version="v1"} 1
+{group="",removed_release="",resource="componentstatuses",subresource="",version="v1"} 1
+{group="",removed_release="",resource="endpoints",subresource="",version="v1"} 1
 ```
 
 Разбор:
 
-1. `24` — на стенде столько групп, включая CRD Gateway API и metrics-server. У вас число может отличаться.
-2. Строки `Warning` приходят с ответом сервера. Сами объекты команды тоже выведут, здесь они опущены.
-3. Метрика посчитала по одному обращению к `componentstatuses` и `endpoints`. Пустой `removed_release` значит, что дата удаления не назначена.
+1. `24` — столько групп на стенде вместе с CRD Gateway API и metrics-server, у вас число может отличаться.
+2. Строки `Warning` приходят в ответе сервера, kubectl только печатает их.
+3. Метрика — это gauge: значение 1 значит, что к `componentstatuses` и `endpoints` обращались с запуска API-сервера, а не число обращений. Пустой `removed_release` значит, что дата удаления не назначена.
 4. Для EndpointSlice вместо Endpoints смотрите 03-2.
 
 **Итог.**
@@ -1020,7 +1035,7 @@ kubectl delete ns lab-01-3
 kubectl get ns lab-01-3
 ```
 
-Первая команда удаляет Deployment. Вторая убирает рабочий каталог; `rmdir` не удалит каталог, если в нём остались файлы. Третья возвращает namespace по умолчанию. Четвёртая удаляет `lab-01-3`, последняя подтверждает это. Удаление может занять около 30 с по той же причине, что в работе 2.
+Первая команда удаляет Deployment, а вторая — рабочий каталог; `rmdir` откажется удалять каталог, если в нём остались файлы. Третья возвращает namespace по умолчанию, четвёртая удаляет `lab-01-3`. Удаление namespace ждёт завершения подов, поэтому может занять около 30 с, как в работе 2. Последняя команда должна ответить `NotFound`.
 
 **Вопросы для самопроверки.**
 
@@ -1032,10 +1047,10 @@ kubectl get ns lab-01-3
 <details>
 <summary>Ответы</summary>
 
-1. Команда выполнила своё действие: поставила `deletionTimestamp`. Физически объект удаляется, когда список finalizer'ов опустеет.
-2. Очистка не выполнится, и диск останется. Он продолжит расходовать деньги, хотя объекта в кластере нет.
-3. Права на spec и status разделяются. Пользователь не подделывает status, а контроллер пишет только его и не трогает spec.
-4. Метрика `apiserver_requested_deprecated_apis` показывает, какие версии вызывали. Какой именно клиент, видно в аудит-логе (10-3).
+1. Команда выполнила своё действие — поставила `deletionTimestamp`, а физически объект удаляется, когда список finalizer'ов опустеет.
+2. Очистка не выполнится, и диск останется: он продолжит расходовать деньги, хотя объекта в кластере уже нет.
+3. Чтобы разделить права: пользователь не подделает status, а контроллер пишет только его и не трогает spec.
+4. Метрика `apiserver_requested_deprecated_apis` показывает, какие версии вызывали, а какой именно клиент — видно в аудит-логе (06-4).
 
 </details>
 
@@ -1043,4 +1058,4 @@ kubectl get ns lab-01-3
 
 ## → Дальше
 
-Мы разобрали объект: поля metadata, владение полями, ссылки на владельца, finalizer и подресурсы. Модуль 02 использует это сразу: Deployment создаёт ReplicaSet и ставит ссылки на владельца, а ReplicaSet создаёт поды. Но начинать нужно с самого младшего объекта — пода. Поэтому следующая часть, 02-1, разбирает под: его фазы, init-контейнеры, sidecar и коды выхода. Deployment, ReplicaSet и обновления идут уже после неё, в 02-2.
+Модуль 02 сразу опирается на устройство объекта: Deployment создаёт ReplicaSet и ставит ссылки на владельца, а ReplicaSet создаёт поды. Начинать нужно с самого младшего объекта цепочки, поэтому следующая часть, 02-1, разбирает под — единицу, которую все контроллеры создают и удаляют. Deployment, ReplicaSet и обновления идут после неё, в 02-2.

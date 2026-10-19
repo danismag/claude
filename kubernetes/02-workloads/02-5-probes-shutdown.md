@@ -1,149 +1,364 @@
-# 02-5. Probes и graceful shutdown
+# 02-5. Probes и завершение пода
 
-> Модуль 2 «Workloads» · часть 5 из 5 · 🟢🟡🔴 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд 00-1 (Gateway `lab`)
+> Модуль 02 «Workloads» · часть 5 из 5 · ~1,5 ч чтения + ~1,5 ч лабы · Нужно: стенд 00-1 (контекст `kind-lab`, Gateway `lab`, образ `orders-api:2.0` в реестре стенда), доступ узлов к образам `python:3.12-slim`, `busybox:1.37` и `postgres:17.6-alpine` · Опирается на: 02-1 (условие Ready, back-off, коды выхода), 02-2 (rollout)
+
+## Где мы на карте
+
+Эта часть закрывает модуль 02. В 02-1 мы разобрали условие `Ready` и перезапуски контейнеров, в 02-2 — как Deployment заменяет поды. Теперь выясним, кто решает, что под жив, готов или может принять трафик, и что происходит с подом при удалении. Эти два вопроса определяют, видят ли клиенты ошибки при каждой выкатке.
+
+Дальше Service и Gateway (03-2, 03-4) берут адреса только у Ready-подов, а PodDisruptionBudget (05-5) считает только их. Поэтому качество проб влияет на всё, что стоит выше пода.
+
+```
+02-1  Pod            условие Ready, back-off, коды выхода
+        │
+02-2  Deployment     заменяет поды и ждёт Ready у новых
+        │
+02-5  (эта часть)    пробы решают Ready и перезапуск;
+        │            завершение решает, что видят клиенты при замене
+        ▼
+03-2  Service        отправляет трафик только на Ready-поды
+05-5  PDB            считает здоровыми только Ready-поды
+```
+
+Схема 1. Место части в курсе: пробы и остановка пода находятся между жизненным циклом пода и всем, что направляет к нему трафик.
 
 ---
 
-## Зачем это DevOps-у
+## 1. Какую задачу решают пробы и остановка
 
-«Каждый деплой даёт всплеск 502», «медленно стартующий сервис уходит в CrashLoop», «БД моргнула на минуту — все поды API перезапустились, и восстановление заняло десять минут» — это три классические ошибки с probes и завершением подов. Они не видны на тестовом стенде без нагрузки и проявляются в проде, поэтому их любят на собеседованиях: «чем liveness отличается от readiness», «почему нельзя проверять БД в liveness», «как сделать деплой без ошибок».
+Пробы впускают трафик в под, когда он готов, а корректная остановка выводит трафик из пода раньше, чем он закроется. Разберём, что kubelet знает без проб, какие вопросы задают три пробы и почему остановка относится к той же теме.
 
-В сквозном сценарии: orders-api за Envoy Gateway, 4 реплики, 4 потока клиентов; считаем ошибки при `rollout restart` в трёх вариантах — без graceful shutdown, с `preStop`, с задержкой в приложении.
+### Что kubelet знает без проб
+
+Без проб kubelet видит только то, что процесс контейнера существует. Процесс может висеть в цикле, ждать блокировки или ещё не открыть порт, а под всё равно остаётся `Running` и получает трафик. **Проба** (probe) — периодическая проверка контейнера, которую выполняет kubelet и по результату которой меняет состояние пода. Пробы сообщают три вещи: приложение запустилось, оно живо, оно готово принимать запросы.
+
+### Три пробы — три вопроса
+
+У каждой пробы свой вопрос и своя реакция на отказ.
+
+- **startupProbe** (проба запуска) — закончился ли старт. Пока она не прошла, две другие пробы не работают. Если она провалилась нужное число раз, контейнер убивают.
+- **livenessProbe** (проба живости) — не завис ли процесс. Провал означает перезапуск контейнера.
+- **readinessProbe** (проба готовности) — можно ли слать трафик прямо сейчас. Провал убирает под из списка адресов Service, а контейнер остаётся работать.
+
+Реакции разные, поэтому ошибка в выборе пробы стоит по-разному. Лишний провал liveness перезапускает здоровый процесс, а лишний провал readiness только временно снимает под с трафика.
+
+### Остановка пода — часть той же задачи
+
+Rolling update, scale down, drain узла и вытеснение начинают с удаления старого пода. Клиенты в этот момент ещё ходят в него, и если под закроет порт раньше, чем балансировщики узнают об удалении, запросы получат отказ. Поэтому остановка решает обратную задачу: убрать трафик из пода до того, как под исчезнет. Для этого в Kubernetes есть три инструмента: сигнал SIGTERM, хук preStop и срок остановки grace period.
 
 ---
 
-## 1. Три пробы 🟢
+## 2. Как устроены пробы и остановка
 
-| Проба | Вопрос | Не прошла → |
-|---|---|---|
-| **startupProbe** | приложение уже запустилось? | пока не прошла — liveness и readiness не выполняются; провалилась `failureThreshold` раз — контейнер убит (как liveness) |
-| **livenessProbe** | процесс жив и не завис? | контейнер **перезапускается** |
-| **readinessProbe** | можно слать трафик? | под убирается из endpoints Service (и из Gateway); контейнер не трогают |
+Пробы выполняет kubelet по расписанию, а остановка запускает две параллельные цепочки действий. Сначала разберём пробы, затем остановку.
 
-Виды проверок: `httpGet` (2xx/3xx — успех), `tcpSocket` (порт принимает соединение), `exec` (код 0), `grpc` (gRPC Health Checking Protocol).
+### Кто и как проверяет
 
-Дефолты (проверено, `kubectl get pod … -o jsonpath='{.spec.containers[0].livenessProbe}'` на поде, где задан только путь):
+Пробы выполняет **kubelet** узла, на котором работает под, а не API-сервер и не контроллер. Для каждой пробы каждого контейнера kubelet ведёт отдельный цикл и записывает результат в статус пода. В пробе выбирают один из четырёх способов проверки:
 
-```
-{"failureThreshold":3,"httpGet":{"path":"/health","port":"http","scheme":"HTTP"},"periodSeconds":10,"successThreshold":1,"timeoutSeconds":1}
-```
-
-| Параметр | Дефолт | Ловушка |
-|---|---|---|
-| `initialDelaySeconds` | 0 | вместо большого `initialDelaySeconds` используйте startupProbe |
-| `periodSeconds` | 10 | реакция readiness на сбой — до `period × failureThreshold` = 30 с |
-| `timeoutSeconds` | **1** | ответ дольше 1 секунды — провал; под нагрузкой (GC, троттлинг, 05-1) liveness начинает убивать живые поды |
-| `failureThreshold` | 3 | |
-| `successThreshold` | 1 | для liveness и startup может быть только 1 |
-| `terminationGracePeriodSeconds` у пробы | из пода | можно задать короче для убийства по liveness |
-
-Проверено: liveness на ручку, которая отвечает 1,5 с (`/work?ms=1500`), при `timeoutSeconds: 1`:
+- **httpGet** — HTTP-запрос GET на порт пода; успех — код ответа от 200 до 399.
+- **tcpSocket** — попытка открыть TCP-соединение; успех — соединение установлено.
+- **exec** — запуск команды внутри контейнера без shell; успех — код выхода 0.
+- **grpc** — вызов gRPC Health Checking Protocol; порт указывают числом.
 
 ```
-slow-endpoint     0/1     CrashLoopBackOff   6 (32s ago)   4m4s
-20      Liveness probe failed: Get "http://10.244.2.80:8000/work?ms=1500": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+узел
+┌──────────────────────────────────────────────────────────────┐
+│  kubelet ── GET /health ──────────► под (IP пода : 8000)     │
+│     │                                                        │
+│     └── результат ► status пода (Ready, restartCount) ► API  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-Приложение живо — его убивают за медленный ответ.
+Схема 2. Проба идёт из kubelet прямо на IP пода, мимо Service и Gateway; результат kubelet отправляет в API-сервер.
 
-## 2. startupProbe и медленный старт 🟡
+### Параметры пробы
 
-orders-api с `STARTUP_DELAY=40` (40 с не открывает порт, как JVM-сервис с прогревом или приложение с миграциями на старте). Проверено, 4 минуты:
+Расписание пробы задают пять параметров, и у каждого есть значение по умолчанию.
 
-| Конфигурация | Результат |
-|---|---|
-| только liveness с дефолтами | `RESTARTS 3` за 4 минуты: liveness убивает после 3 провалов × 10 с; иногда новый экземпляр успевает за счёт сдвига первой пробы — сервис **то поднимается, то нет**. `Last State: Error/137` |
-| startupProbe `periodSeconds: 2, failureThreshold: 60` (до 120 с на старт) + та же liveness | `RESTARTS 0`, Ready через 42 с после старта |
+- `initialDelaySeconds` — пауза перед первой проверкой, по умолчанию 0 с.
+- `periodSeconds` — интервал между проверками, по умолчанию 10 с.
+- `timeoutSeconds` — сколько ждать ответ, по умолчанию 1 с.
+- `failureThreshold` — сколько провалов подряд считать отказом, по умолчанию 3.
+- `successThreshold` — сколько успехов подряд считать восстановлением, по умолчанию 1; для liveness и startup допустимо только 1.
 
-Почему код 137, а не 143: пока приложение «стартует» (`time.sleep` до установки обработчика сигналов), SIGTERM для процесса с PID 1 **игнорируется ядром** (для PID 1 в namespace действия сигналов по умолчанию не работают) — kubelet ждёт grace period и шлёт SIGKILL. Подробнее о PID 1 — `git-docker` 02-4.
+Из этих чисел складывается время реакции: kubelet признаёт контейнер неисправным примерно через `periodSeconds × failureThreshold`, то есть за 30 с при значениях по умолчанию. Отдельно у liveness и startup можно задать собственный `terminationGracePeriodSeconds`: это срок остановки контейнера, которого убивает именно эта проба. У readiness такого поля нет, потому что она контейнер не убивает.
 
-Правило: startupProbe — с запасом на худший старт (`period × failureThreshold`), liveness — короткая и дешёвая, после startupProbe.
+### Порядок проб и реакция на провал
 
-## 3. Readiness: кто на неё смотрит 🟡
+Три пробы работают в строгом порядке.
 
-Readiness — единственный сигнал «слать ли трафик». От неё зависят:
-
-- EndpointSlice (`conditions.ready`) → kube-proxy на всех узлах, Envoy Gateway, Ingress-контроллеры, mesh;
-- `rollout status` и `maxUnavailable` у Deployment (02-2), `minReadySeconds`;
-- PDB (05-4) — считает только Ready-поды;
-- DNS headless Service (02-3).
-
-Что проверять в readiness: «могу ли я сейчас обслужить запрос» — прогрет кэш, загружена конфигурация, открыт пул к **обязательным** зависимостям. orders-api: `/ready` → 503 до окончания старта, при недоступной БД и после SIGTERM.
-
-## 4. Liveness, которая проверяет БД, — каскад 🔴
-
-Liveness отвечает на вопрос «надо ли **перезапустить** процесс». Перезапуск не поможет, если не работает БД, — но liveness с проверкой БД именно это и сделает, причём со всеми подами сразу.
-
-Проверено: два Deployment'а по 2 реплики, PostgreSQL выключен на 60 с:
-
-| | `readiness-only` (liveness `/health`) | `liveness-db` (liveness `/ready` — проверяет БД) |
-|---|---|---|
-| во время простоя БД | `0/1 Running`, `RESTARTS 0` — выпали из Service | `0/1 CrashLoopBackOff`, `RESTARTS 3` за минуту |
-| после возвращения БД | Ready через **3 с** | Ready через **20 с**, `RESTARTS 4` |
-
-20 секунд — это back-off после трёх рестартов. Простой БД на 10 минут дал бы паузы до 5 минут (02-1), и сервис поднимался бы ещё минуты после того, как БД вернулась. Плюс каждый рестарт — холодный старт, сброс кэшей, всплеск соединений к только что поднявшейся БД («thundering herd»).
-
-Правило: **liveness проверяет только сам процесс** (отвечает ли HTTP-сервер, не завис ли event loop), без внешних зависимостей. Зависимости — в readiness, и то только обязательные (иначе каскад readiness: 01-2, кейс).
-
-## 5. Graceful shutdown: что происходит при удалении пода 🟡🔴
-
-Удаление пода (rollout, scale down, drain, eviction) запускает **два параллельных** процесса:
+1. Пока startupProbe не прошла, liveness и readiness не выполняются.
+2. После первого успеха startupProbe больше не запускается.
+3. Liveness и readiness идут параллельно до конца жизни контейнера.
+4. Провал startup (после `failureThreshold` повторов) или liveness убивает контейнер, а дальше действуют `restartPolicy` и back-off из 02-1.
+5. Провал readiness ставит `Ready=False`, контейнер не трогают.
 
 ```
-kubectl delete pod / rollout          apiserver ставит deletionTimestamp
-          │
-          ├──► kubelet:                         ├──► EndpointSlice-контроллер:
-          │    1. preStop (если есть)           │    под → ready=false / удалён из slice
-          │    2. SIGTERM в PID 1               │         │
-          │    3. ждёт до terminationGrace…     │         ├─► kube-proxy на каждом узле переписывает правила
-          │       (30 с, включая preStop)       │         ├─► Envoy Gateway получает xDS-обновление
-          │    4. SIGKILL                       │         └─► Ingress / mesh / внешний LB
+время ──────────────────────────────────────────────────────────►
+старт контейнера
+  │◄─ startupProbe ─►│◄──────── livenessProbe  каждые 10 с ────────►
+  │  (liveness и     │◄──────── readinessProbe каждые 10 с ────────►
+  │   readiness      │
+  │   молчат)        └─ первый успех startup: под может стать Ready
 ```
 
-Ветки не синхронизированы. Если приложение по SIGTERM сразу закрывает порт, а kube-proxy и Envoy ещё не узнали об удалении — запросы уходят в закрытый порт: `Connection refused`, у Envoy — 503. Эта гонка и есть «502 при каждом деплое».
+Схема 3. Startup закрывает окно старта, а затем две другие пробы работают параллельно; пример с периодом по умолчанию.
 
-Замер (лаба, шаг 2): `rollout restart` 4 реплик за 30 с нагрузки, два пути — через Gateway (Envoy) и напрямую через Service (kube-proxy):
+### Кто читает условие Ready
+
+Условие `Ready` служит единственным сигналом «слать ли трафик», и его читают многие компоненты.
+
+- **EndpointSlice** — объект со списком адресов подов Service (03-2); контроллер ставит адресу `ready=true` по условию пода, а kube-proxy и Gateway отправляют трафик только на такие адреса.
+- **Deployment** — `rollout status`, `maxUnavailable` и `minReadySeconds` считают только Ready-поды (02-2).
+- **PodDisruptionBudget** — считает здоровыми только Ready-поды (05-5).
+- **Headless Service** — DNS по умолчанию возвращает только Ready-адреса (03-3).
+
+### Завершение пода: две цепочки
+
+Удаление пода запускает две независимые цепочки. Первая — работа kubelet с контейнерами, вторая — обновление списков адресов у всех, кто направляет трафик в под. API-сервер не удаляет объект сразу: он ставит **deletionTimestamp** (метку времени удаления) и срок остановки, а сам объект исчезает после подтверждения от kubelet.
+
+```
+kubectl delete / rollout / drain ─► API-сервер ставит deletionTimestamp
+       │
+       ├─► цепочка 1: kubelet                 ├─► цепочка 2: адреса
+       │   1. хук preStop (если задан)        │   контроллер EndpointSlice:
+       │   2. SIGTERM в PID 1 контейнера      │   ready=false, terminating=true
+       │   3. ожидание конца grace period     │     ├─► kube-proxy на каждом узле
+       │   4. SIGKILL                         │     ├─► Envoy Gateway
+       │                                      │     └─► внешний балансировщик
+       └─ шаги 1-4 укладываются в terminationGracePeriodSeconds (30 с)
+```
+
+Схема 4. Левая цепочка останавливает процесс, правая — убирает трафик; между ними нет синхронизации.
+
+Шаги первой цепочки такие. **Хук preStop** (lifecycle hook) — действие, которое kubelet выполняет перед SIGTERM; оно бывает трёх видов: команда `exec`, запрос `httpGet` и пауза `sleep`. **SIGTERM** — сигнал «завершись», который приложение может перехватить и закончить работу аккуратно. **SIGKILL** — сигнал, который перехватить нельзя. **Grace period** — срок от начала остановки до SIGKILL, задаётся полем `terminationGracePeriodSeconds`, по умолчанию 30 с. Хук preStop входит в этот срок. Если хук ещё идёт, когда срок вышел, kubelet даёт контейнеру ещё 2 с. Контейнеры пода kubelet останавливает параллельно, а нативные sidecar — после основных (02-1).
+
+### Гонка между цепочками
+
+Цепочки не ждут друг друга. Если приложение по SIGTERM сразу закрывает порт, а kube-proxy и Envoy ещё не получили новый список адресов, часть запросов уходит в закрытый порт. Через Service это `Connection refused`, а у Envoy — ответ 503. Эта гонка и есть «всплеск ошибок на каждом деплое»: окно длится секунды, зато повторяется при каждом rollout, scale down и drain.
+
+---
+
+## 3. Как управлять пробами и остановкой
+
+Пробы и хуки задают в манифесте контейнера. Главная работа здесь — выбрать, что проверяет каждая проба, и подобрать время остановки.
+
+### Как задать пробы
+
+В манифесте все три пробы стоят на уровне контейнера, и обычно они проверяют разные пути приложения.
+
+```yaml
+containers:
+- name: api
+  ports: [{name: http, containerPort: 8000}]
+  startupProbe:
+    httpGet: {path: /health, port: http}
+    periodSeconds: 2
+    failureThreshold: 60
+  livenessProbe:
+    httpGet: {path: /health, port: http}
+    periodSeconds: 10
+    timeoutSeconds: 3
+  readinessProbe:
+    httpGet: {path: /ready, port: http}
+    periodSeconds: 2
+```
+
+Фрагмент манифеста: startup даёт на старт до 120 с (2 с × 60), liveness проверяет только процесс, readiness опрашивает путь `/ready` каждые 2 с. Порт указан именем из `ports`, поэтому проба переживёт смену номера. Путь с символом `?` в однострочном YAML берут в кавычки, иначе разбор ломается. Поле `host` в `httpGet` и `tcpSocket` не задают: профиль Baseline стандартов Pod Security с версии 1.34 такие поды отклоняет (06-3).
+
+### Что проверять каждой пробой
+
+Правило одно: каждая проба отвечает только на свой вопрос.
+
+- **Startup** получает запас на худший старт: `periodSeconds × failureThreshold` должно быть больше самого долгого старта. Для приложения, которое стартует 40 с, достаточно 2 × 60 = 120 с.
+- **Liveness** проверяет только сам процесс: отвечает ли HTTP-сервер, не завис ли цикл событий. Путь должен быть лёгким и не ходить во внешние зависимости, а `timeoutSeconds` стоит поднять выше самого медленного нормального ответа.
+- **Readiness** проверяет, может ли приложение обслужить запрос сейчас: прогрет ли кэш, загружена ли конфигурация, открыт ли пул соединений к обязательным зависимостям.
+
+У orders-api так и сделано: `/health` отвечает 200, пока жив процесс, а `/ready` отдаёт 503 до конца старта, при недоступной базе и после SIGTERM.
+
+### Как убрать гонку при остановке
+
+Есть три способа, и их сочетают.
+
+1. **preStop sleep.** kubelet сначала ждёт заданное время, потом шлёт SIGTERM; за эту паузу потребители адресов успевают убрать под. Встроенное действие `sleep` не требует бинарника `sleep` в образе, поэтому работает и в образах без shell (distroless).
+2. **Задержка в приложении.** По SIGTERM приложение перестаёт отдавать 200 на readiness, продолжает обслуживать запросы N секунд и только потом закрывает порт. Так сделан orders-api: переменная `SHUTDOWN_DELAY` задаёт N.
+3. **Достаточный grace period.** `terminationGracePeriodSeconds` должен быть не меньше суммы preStop, времени на завершение текущих запросов и запаса.
+
+Пример действия `sleep` и запасного варианта для образа с shell:
+
+```yaml
+lifecycle:
+  preStop:
+    sleep: {seconds: 5}
+# вариант с командой; нужен бинарник sleep в образе:
+#   preStop:
+#     exec: {command: ["sleep", "5"]}
+```
+
+Первый вариант стал stable в Kubernetes 1.34, там же разрешили `seconds: 0`. Если в образе нет `sleep`, команда `exec` не запустится, kubelet запишет событие `FailedPreStopHook` и сразу перейдёт к SIGTERM, то есть защита молча пропадёт (лабораторная работа 2, шаг 4).
+
+### Что делает приложение по SIGTERM
+
+Задержка в приложении работает, когда код выполняет четыре действия по порядку.
+
+1. Перевести readiness в 503, чтобы EndpointSlice пометил адрес неготовым.
+2. Продолжать принимать запросы ещё N секунд, пока балансировщики обновляются.
+3. Закрыть listener и дождаться завершения текущих запросов.
+4. Закрывать keepalive-соединения: отвечать с заголовком `Connection: close`, иначе прокси продолжит слать запросы по старому соединению.
+
+orders-api упрощён: он выполняет шаги 1 и 2, затем останавливает сервер и не дожидается запросов, которые идут в этот момент. Для учебного стенда этого достаточно, в промышленном коде нужны все четыре шага.
+
+### Как подобрать время
+
+Паузу preStop выбирают по самому медленному потребителю адресов. kube-proxy и Envoy обновляют правила за секунды, а внешним облачным балансировщикам нужны десятки секунд: смотрите интервал проверок в настройках своего провайдера. На стенде пауза в 5 с убрала ошибки в трёх замерах из четырёх, а в четвёртом через Service осталось две ошибки. Значит, пауза должна быть с запасом, а проверять её нужно нагрузкой.
+
+Срок остановки считают так: `terminationGracePeriodSeconds` ≥ preStop + самый долгий запрос + запас. Например, preStop 25 с при сроке по умолчанию в 30 с оставляет приложению 5 с до SIGKILL.
+
+---
+
+## 4. Как увидеть состояние
+
+Состояние проб видно в описании пода, в событиях и в статусе, а остановку оценивают по статусу пода и по ошибкам клиента.
+
+### Проба в описании пода
+
+Команда `kubectl describe pod <имя>` показывает для каждой пробы способ, путь и расписание. В строках `Liveness`, `Readiness` и `Startup` стоят значения `delay`, `timeout`, `period`, `#success`, `#failure`. Сырой объект даёт `kubectl get pod <имя> -o jsonpath='{.spec.containers[0].livenessProbe}'`: в нём видны и подставленные значения по умолчанию (лабораторная работа 3, шаг 1). Результат проб отражают колонка `READY` в `kubectl get pods` и условия `ContainersReady` и `Ready` в `status.conditions` (02-1 §2).
+
+### События проб
+
+Каждый провал пробы kubelet записывает событием `Unhealthy`, а убийство контейнера по liveness — событием `Killing`. Текст события называет причину: `context deadline exceeded` значит таймаут, `statuscode: 503` — ответ приложения, `connection refused` — закрытый порт. Повторяющиеся события склеиваются в одну запись со счётчиком. События хранятся 1 ч, поэтому смотреть их нужно сразу (02-1 §4). Счётчики проб по всему узлу kubelet отдаёт в метрике `prober_probe_total` (11-1).
+
+### Завершающийся под
+
+Удаляемый под в колонке STATUS показывает `Terminating`, а в его метаданных есть `deletionTimestamp` и `deletionGracePeriodSeconds`. Адрес такого пода в EndpointSlice получает условия `ready=false` и `terminating=true`. Если по этим признакам под давно удаляется, а процесс жив, смотрят, обрабатывает ли PID 1 сигнал SIGTERM (§5).
+
+### Ошибки клиента
+
+Корректность остановки видна только снаружи, потому что отказ рождается на пути запроса, а не в самом поде. Нагрузочный клиент считает коды ответов и ошибки соединения и фиксирует окно ошибок: время от первой до последней. Клиент работает через Gateway и напрямую через Service, поэтому видно, какой потребитель адресов отстаёт (лабораторные работы 1 и 2). В журнале пода остаётся строка о получении SIGTERM, а код выхода показывает, как закончилась остановка: 0 или 143 — аккуратно, 137 — по SIGKILL после grace period (02-1 §4).
+
+---
+
+## 5. Что ломается и как найти причину
+
+Здесь пять типовых поломок. У каждой своя причина, а общий порядок поиска собран в последнем подразделе.
+
+### Liveness убивает здоровый процесс
+
+Liveness с настройками по умолчанию убивает живое приложение в двух случаях: ответ дольше `timeoutSeconds` (1 с) или старт дольше трёх проверок. В первом случае приложение просто медленно отвечает. Проверка пути, который отвечает 1,5 с, при `timeoutSeconds: 1` довела под до `CrashLoopBackOff` с шестью перезапусками за 4 минуты (лабораторная работа 3).
+
+Во втором случае приложение 40 с не открывает порт. Только с liveness по умолчанию контейнер получил 3 перезапуска за 4 минуты, потому что проверки на 0, 10 и 20 с провалились, и kubelet его убил. Со startupProbe (период 2 с, 60 повторов) перезапусков не было, под стал Ready через 42 с. Код выхода убитого контейнера — 137, а не 143: пока приложение «стартует» и не поставило обработчик сигналов, процесс с PID 1 игнорирует SIGTERM, и kubelet дожидается конца grace period (02-1 §4).
+
+### Liveness с зависимостью — каскад
+
+Liveness, которая проверяет базу данных, превращает сбой базы в сбой всего сервиса. Перезапуск приложения базу не починит, а проба перезапустит все поды сразу. Лабораторная работа 4 показала разницу при остановке базы на 60 с.
+
+- **Liveness на `/health`** (`readiness-only`) — поды выпали из Service (`0/1 Running`), перезапусков 0, после возврата базы стали Ready за 3 с.
+- **Liveness на `/ready`** (`liveness-db`) — `CrashLoopBackOff`, 3 перезапуска за минуту, после возврата базы Ready через 20 с и 4 перезапуска.
+
+Разница — пауза back-off, которая растёт с каждым падением до потолка 300 с (02-1 §2), поэтому долгий простой базы растянул бы восстановление ещё сильнее. К этому добавляются холодный старт каждого пода и всплеск подключений к только что поднявшейся базе. Так же опасна readiness, которая зависит от необязательной зависимости: когда та пропадает, все поды сразу неготовы, и Service остаётся без адресов.
+
+### Ошибки при каждой остановке
+
+Приложение, которое закрывает порт сразу по SIGTERM, даёт ошибки на каждом rollout. Замер: `rollout restart` четырёх реплик за 30 с нагрузки, четыре потока клиентов, около 5100–5600 запросов на путь (лабораторные работы 1 и 2).
 
 | Вариант | Через Gateway | Через Service |
 |---|---|---|
-| **A**: приложение закрывается сразу по SIGTERM (`SHUTDOWN_DELAY=0`), без preStop | 10 и 19 ошибок (два прогона): `503: 17`, `TimeoutError: 2` | 12 и 7: `Connection refused: 3`, `timed out: 4` |
-| **B**: `preStop: {sleep: {seconds: 5}}` | 0 и 0 | 2 и 0 (разовые `URLError` в первом прогоне) |
-| **C**: приложение после SIGTERM 5 с продолжает обслуживать и отдаёт readiness 503 (`SHUTDOWN_DELAY=5`), без preStop | 0 | 0 |
+| A: порт закрыт сразу, без preStop | 10 и 19 ошибок | 12 и 7 ошибок |
+| B: preStop sleep 5 | 0 и 0 | 2 и 0 |
+| C: приложение держит порт 5 с | 0 | 0 |
 
-Ошибок мало в абсолютных цифрах (~0,2–0,4%), но это **на каждом деплое** и при каждом scale down HPA — а в проде с сотнями RPS это сотни ошибок.
+В варианте A через Gateway ответы 503 и таймауты, через Service — `Connection refused` и таймауты. Ошибок немного, от 0,1 до 0,4 % запросов, но они повторяются на каждом деплое, на каждом scale down автомасштабирования и на каждом drain. Таблица показывает прогоны автора (в A и B по два), и ваши числа будут другими.
 
-### Как убрать гонку
+### Под завершается 30 секунд
 
-1. **preStop sleep** — kubelet сначала спит, потом шлёт SIGTERM; за это время все потребители endpoints успевают убрать под. С 1.33 есть нативное действие (stable) — не нужен `sleep` в образе (distroless):
-   ```yaml
-   lifecycle:
-     preStop:
-       sleep: {seconds: 5}
-   ```
-   Для образов без `sleep` и кластеров старше — `exec: {command: ["sleep", "5"]}` (нужен бинарник в образе).
-2. **Задержка в приложении** — по SIGTERM перестать отвечать 200 на readiness, продолжать обслуживать N секунд, затем закрыть listener и дождаться текущих запросов (как orders-api с `SHUTDOWN_DELAY`).
-3. **`terminationGracePeriodSeconds`** ≥ preStop + время завершения запросов + запас. preStop **входит** в grace period: preStop 25 с при дефолтных 30 с оставляет приложению 5 с.
+Под, который удаляется ровно 30 с, не обрабатывает SIGTERM. Если PID 1 не поставил обработчик, ядро игнорирует для него сигнал, и kubelet ждёт конец grace period и шлёт SIGKILL. На стенде под с обработчиком (`trap … exit 0`) удалился за 2,1 с, а под с `sleep infinity` в роли PID 1 — за 30,8 с. Признак в статусе — `exitCode: 137` и `reason: Error`, без `OOMKilled`.
 
-Сколько ждать: время распространения изменений endpoints — секунды (kube-proxy `minSyncPeriod` 1 с, xDS у Envoy — около секунды), но внешние балансировщики облака перечитывают цели с интервалом проверок 10–30 с. Для сервисов за облачным LB — 10–15 с preStop и/или `externalTrafficPolicy` с health-check'ами (03-2).
+Типичные причины: shell-обёртка запускает программу без `exec` и сама остаётся PID 1, программа не ставит обработчик, либо образ не содержит init-процесса. Лечение: `exec` в entrypoint, обработчик SIGTERM в коде или init-процесс вроде tini. Каждый такой под на 30 с задерживает rollout, drain и scale down.
 
-### Grace period и SIGKILL 🟡
+### Порядок поиска причины
 
-Проверено: под, чей PID 1 обрабатывает SIGTERM (`trap … exit 0`), удалён за 2,1 с; под с `sleep infinity` в роли PID 1 (сигнал игнорируется) — за **30,8 с**, после SIGKILL. Каждый такой под задерживает rollout, drain и scale down на 30 секунд. Признак в статусе — `exitCode: 137, reason: Error` (не OOMKilled).
+Для любой проблемы с пробами или остановкой действует один порядок.
+
+1. Смотреть события `kubectl describe pod`: `Unhealthy`, `Killing`, `BackOff`, `FailedPreStopHook`.
+2. Прочитать текст события: таймаут, код ответа и отказ соединения указывают на разное.
+3. Повторить проверку вручную изнутри пода (`kubectl exec`, `wget` или `curl`) и сравнить время ответа с `timeoutSeconds`.
+4. Сверить код выхода: 137 вместе с событием `Unhealthy` значит убийство по пробе, а без него — SIGKILL после grace period.
+5. Проверить адреса в EndpointSlice (03-2): `ready=false` указывает на readiness, а не на сеть.
 
 ---
 
-## 🔧 Лаба
+## 6. Пределы и значения по умолчанию
 
-### Шаг 0. Подготовка
+Ниже собраны числа этой части; версия стенда — Kubernetes 1.36.
+
+### Пробы
+
+- Параметры по умолчанию: `initialDelaySeconds` 0, `periodSeconds` 10, `timeoutSeconds` 1, `failureThreshold` 3, `successThreshold` 1.
+- Для liveness и startup `successThreshold` может быть только 1.
+- Успех `httpGet` — код от 200 до 399; для `grpc` порт задают числом.
+- Время реакции — около `periodSeconds × failureThreshold`, то есть 30 с по умолчанию.
+- Проба идёт на IP пода с узла и не проходит через Service.
+
+### Остановка
+
+- `terminationGracePeriodSeconds` — 30 с, если не задано другое; значение входит и в preStop.
+- Просроченный хук preStop получает ещё 2 с.
+- `kubectl delete --now` задаёт срок 1 с, а `--force --grace-period=0` снимает объект без подтверждения kubelet: для StatefulSet это опасно (02-3).
+- Хук `sleep` — stable с 1.34, `seconds: 0` разрешён с того же релиза.
+- Поле `lifecycle.stopSignal`, которое меняет SIGTERM на другой сигнал, появилось в 1.33 как alpha; его статус в 1.36 проверяйте по документации до использования.
+
+### Что не покрыто
+
+Пробы нативных sidecar-контейнеров описаны в 02-1: readiness sidecar не задерживает старт основного контейнера, а startup задерживает. Остановка узла (graceful node shutdown) относится к обслуживанию узлов (10-4). Остановка пода при вытеснении и drain проходит по тому же пути, что описан выше, а ограничения на число одновременных остановок задаёт PodDisruptionBudget (05-5).
+
+---
+
+## Лабораторные работы
+
+Работы идут на стенде 00-1 в namespace `lab-02-5`. Все они выполняются внутри кластера kind. На хосте меняются две вещи: текущий namespace контекста `kind-lab` в `~/.kube/config` и каталог `~/lab/k8s/02-5`. Уборка последней работы возвращает namespace `default` и удаляет каталог. Работы 1 и 2 идут подряд на одном приложении, работы 3 и 4 независимы.
+
+Образы `busybox:1.37`, `python:3.12-slim` и `postgres:17.6-alpine` узлы тянут из Docker Hub. Если он недоступен, положите образы в реестр стенда, как описано в начале лабораторных 02-1, и замените имена в манифестах.
+
+Кластер готовят один раз: выбирают контекст, создают namespace и каталог для файлов.
 
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-02-5
 kubectl config set-context --current --namespace=lab-02-5
+mkdir -p ~/lab/k8s/02-5
+```
+
+Первая команда выбирает кластер стенда, вторая создаёт namespace, третья делает его текущим, а четвёртая создаёт каталог для файлов работ.
+
+### Лабораторная работа 1. Ошибки при выкатке без graceful shutdown
+
+**Цель.** Измерить, сколько ошибок получают клиенты при `rollout restart`, когда приложение закрывает порт сразу по SIGTERM, и увидеть, что ошибки приходят по двум путям: через Gateway и через Service.
+
+**Что понадобится.** Стенд 00-1 с Gateway `lab`, образ `localhost:5001/orders-api:2.0`, образ `python:3.12-slim`, namespace `lab-02-5`.
+
+**Схема опыта.**
+
+```
+client (под, 4 потока)
+   ├──► Gateway (Envoy) ──► HTTPRoute ──► Service orders-api ─┐
+   └──────────────────────────────────► Service orders-api ──┤ (kube-proxy)
+                                                             ▼
+                              orders-api x4, SHUTDOWN_DELAY=0, без preStop
+rollout restart на 30-й секунде нагрузки ► смотрим ошибки на обоих путях
+```
+
+Схема 5. Два пути к одним подам: через Envoy и напрямую через kube-proxy; у каждого потребителя адресов своё время обновления.
+
+#### Шаг 1. Развернуть orders-api за Service и Gateway
+
+Команда создаёт Deployment из 4 реплик, Service и маршрут через Gateway `lab` и ждёт готовности.
+
+```bash
 kubectl apply -f - <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: orders-api, namespace: lab-02-5}
+metadata: {name: orders-api}
 spec:
   replicas: 4
   selector: {matchLabels: {app: orders-api}}
@@ -160,14 +375,14 @@ spec:
 ---
 apiVersion: v1
 kind: Service
-metadata: {name: orders-api, namespace: lab-02-5}
+metadata: {name: orders-api}
 spec:
   selector: {app: orders-api}
   ports: [{name: http, port: 80, targetPort: http}]
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
-metadata: {name: orders-api, namespace: lab-02-5}
+metadata: {name: orders-api}
 spec:
   parentRefs: [{name: lab, namespace: envoy-gateway-system}]
   hostnames: ["lab025.localhost"]
@@ -176,77 +391,394 @@ EOF
 kubectl rollout status deploy/orders-api
 ```
 
-Клиент — `load.py` из 02-2 (шаг 0) с двумя дополнениями: третий аргумент — заголовок `Host`, и в ошибке печатается причина. Возьмите файл из 02-2 и замените в нём две строки:
+| Часть манифеста | Значение |
+|---|---|
+| `replicas: 4` | четыре пода, чтобы замена шла волнами |
+| `SHUTDOWN_DELAY=0` | приложение закрывает порт сразу по SIGTERM |
+| `readinessProbe … periodSeconds: 2` | проверка `/ready` каждые 2 с |
+| `parentRefs … lab` | привязка маршрута к Gateway стенда |
+| `hostnames: lab025.localhost` | имя, по которому клиент придёт через Gateway |
+
+Результат (стандартные сообщения kubectl):
+
+```
+deployment.apps/orders-api created
+service/orders-api created
+httproute.gateway.networking.k8s.io/orders-api created
+deployment "orders-api" successfully rolled out
+```
+
+Разбор:
+
+1. Три первых строки — созданные объекты: Deployment, Service и HTTPRoute.
+2. Последняя строка значит, что все четыре пода прошли readiness. Перед ней `rollout status` может печатать строки `Waiting for…`.
+3. В манифесте нет `lifecycle` и `terminationGracePeriodSeconds`, поэтому остановка идёт без хука и со сроком 30 с.
+
+#### Шаг 2. Создать клиент нагрузки
+
+Команда записывает клиент в файл, создаёт под `client` и копирует файл в него. Клиент в четыре потока шлёт запросы на `/version`, считает коды ответов и ошибки и печатает окно ошибок: время от первой до последней.
 
 ```bash
-sed -i 's|^dur = float(sys.argv\[1\]).*|&\nhost = sys.argv[3] if len(sys.argv) > 3 else None|' /tmp/load.py
-sed -i 's|            with urllib.request.urlopen(url, timeout=2) as r:|            req = urllib.request.Request(url, headers={"Host": host} if host else {})\n            with urllib.request.urlopen(req, timeout=2) as r:|' /tmp/load.py
-sed -i 's|stats\[type(e).__name__\] += 1; errs|stats[type(e).__name__ + ":" + str(getattr(e, "reason", e))[:40]] += 1; errs|' /tmp/load.py
+cat > ~/lab/k8s/02-5/load.py <<'EOF'
+import sys, time, urllib.request, collections, threading
+dur = float(sys.argv[1]); url = sys.argv[2]
+host = sys.argv[3] if len(sys.argv) > 3 else None
+stats = collections.Counter(); errs = []; t_end = time.time() + dur
+def worker():
+    while time.time() < t_end:
+        try:
+            req = urllib.request.Request(url, headers={"Host": host} if host else {})
+            with urllib.request.urlopen(req, timeout=2) as r:
+                r.read(); stats[r.status] += 1
+        except urllib.error.HTTPError as e:
+            stats[e.code] += 1; errs.append(time.time())
+        except Exception as e:
+            reason = str(getattr(e, "reason", e))[:40]
+            stats[type(e).__name__ + ":" + reason] += 1; errs.append(time.time())
+        time.sleep(0.02)
+threads = [threading.Thread(target=worker) for _ in range(4)]
+[t.start() for t in threads]; [t.join() for t in threads]
+total = sum(stats.values()); errors = total - stats[200]
+win = f"{max(errs) - min(errs):.1f}s" if errs else "0s"
+line = f"requests={total} ok={stats[200]} errors={errors} error_window={win}"
+print(line + (f" detail={dict(stats)}" if errors else ""))
+EOF
 kubectl run client --image=python:3.12-slim --command -- sleep infinity
 kubectl wait --for=condition=Ready pod/client
-kubectl cp /tmp/load.py client:/tmp/load.py
-GW=$(kubectl -n envoy-gateway-system get svc -l gateway.envoyproxy.io/owning-gateway-name=lab -o jsonpath='{.items[0].metadata.name}').envoy-gateway-system
+kubectl cp ~/lab/k8s/02-5/load.py client:/tmp/load.py
+GW=$(kubectl -n envoy-gateway-system get svc \
+  -l gateway.envoyproxy.io/owning-gateway-name=lab \
+  -o jsonpath='{.items[0].metadata.name}').envoy-gateway-system
 kubectl exec client -- python /tmp/load.py 3 http://$GW/version lab025.localhost
 ```
 
-Проверено: `requests=544 ok=544 errors=0`.
+| Часть команды | Значение |
+|---|---|
+| `load.py 3 http://… lab025.localhost` | нагрузка 3 с, адрес, заголовок `Host` для маршрута |
+| `timeout=2` в клиенте | запрос дольше 2 с считается ошибкой |
+| `errs` и `error_window` | моменты ошибок и разброс между первой и последней |
+| `GW=$(kubectl … get svc -l …)` | имя Service, который Envoy Gateway создал для Gateway `lab` |
+| `kubectl cp … client:/tmp/load.py` | копия клиента внутрь пода |
 
-### Шаг 1. Функция замера
+Результат:
+
+```
+requests=544 ok=544 errors=0 error_window=0s
+```
+
+Разбор:
+
+1. За 3 с четыре потока сделали 544 запроса, и все вернули 200.
+2. `errors=0` — до выкатки путь через Gateway чист, поэтому ошибки дальше вызовет именно остановка подов.
+
+#### Шаг 3. Замерить rollout без graceful shutdown
+
+Функция `run` запускает две нагрузки по 30 с, через 3 с перезапускает все поды и печатает итог по каждому пути. Нагрузка через Service идёт прямо на имя `orders-api`, то есть через kube-proxy.
 
 ```bash
 run() {
-  kubectl exec client -- python /tmp/load.py 30 http://$GW/version lab025.localhost > /tmp/gw.txt &
-  kubectl exec client -- python /tmp/load.py 30 http://orders-api/version > /tmp/svc.txt &
+  kubectl exec client -- python /tmp/load.py 30 http://$GW/version lab025.localhost \
+    > ~/lab/k8s/02-5/gw.txt &
+  kubectl exec client -- python /tmp/load.py 30 http://orders-api/version \
+    > ~/lab/k8s/02-5/svc.txt &
   sleep 3; kubectl rollout restart deploy/orders-api; kubectl rollout status deploy/orders-api
-  wait; echo "$1"; echo "  via gateway: $(cat /tmp/gw.txt)"; echo "  via service: $(cat /tmp/svc.txt)"
+  wait; echo "$1"
+  echo "  via gateway: $(cat ~/lab/k8s/02-5/gw.txt)"
+  echo "  via service: $(cat ~/lab/k8s/02-5/svc.txt)"
 }
-```
-
-### Шаг 2. Три варианта завершения
-
-```bash
 run "A: SHUTDOWN_DELAY=0, no preStop"
-
-kubectl patch deploy orders-api --type=json -p '[{"op":"add","path":"/spec/template/spec/containers/0/lifecycle","value":{"preStop":{"sleep":{"seconds":5}}}}]'
-kubectl rollout status deploy/orders-api; sleep 5
-run "B: SHUTDOWN_DELAY=0, preStop sleep 5"
-
-kubectl patch deploy orders-api --type=json -p '[{"op":"remove","path":"/spec/template/spec/containers/0/lifecycle"},{"op":"replace","path":"/spec/template/spec/containers/0/env/0/value","value":"5"}]'
-kubectl rollout status deploy/orders-api; sleep 5
-run "C: SHUTDOWN_DELAY=5"
 ```
 
-Проверено (прогоны A и B повторялись дважды):
+| Часть команды | Значение |
+|---|---|
+| `… > gw.txt &` | нагрузка через Gateway идёт в фоне, вывод в файл |
+| `… > svc.txt &` | нагрузка через Service идёт параллельно |
+| `sleep 3; rollout restart` | выкатка начинается, когда обе нагрузки уже идут |
+| `rollout status` | ждать, пока все четыре новых пода станут Ready |
+| `wait` | дождаться конца обеих нагрузок |
+
+Результат (второй прогон автора; строки `via …` перенесены, `rollout status` выше них опущен):
 
 ```
 A: SHUTDOWN_DELAY=0, no preStop
-  via gateway: requests=5108 ok=5098 errors=10 error_window=2.9s detail={200: 5098, 503: 6, 'TimeoutError': 4}
-  via service: requests=5099 ok=5087 errors=12 error_window=9.5s detail={200: 5087, 'ConnectionResetError': 3, 'URLError': 9}
-A2 via gateway: requests=5287 ok=5268 errors=19 error_window=3.1s detail={200: 5268, 503: 17, 'TimeoutError:timed out': 2}
-A2 via service: requests=5280 ok=5273 errors=7 error_window=2.1s detail={200: 5273, 'URLError:[Errno 111] Connection refused': 3, 'URLError:timed out': 4}
-B: SHUTDOWN_DELAY=0, preStop sleep 5
-  via gateway: requests=5468 ok=5468 errors=0 error_window=0s
-  via service: requests=5476 ok=5474 errors=2 error_window=14.0s detail={200: 5474, 'URLError': 2}
-B2: preStop sleep 5 (repeat)
+  via gateway: requests=5287 ok=5268 errors=19 error_window=3.1s
+    detail={200: 5268, 503: 17, 'TimeoutError:timed out': 2}
+  via service: requests=5280 ok=5273 errors=7 error_window=2.1s
+    detail={200: 5273, 'URLError:[Errno 111] Connection refused': 3, 'URLError:timed out': 4}
+```
+
+В первом прогоне автора было 10 ошибок через Gateway (`503`: 6, таймаутов: 4) и 12 через Service. Ваши числа будут другими, но ошибки появятся на обоих путях.
+
+Разбор:
+
+1. Через Gateway ошибок 19 из 5287, то есть 0,36 %: Envoy отвечает `503`, когда под уже закрыл порт, а список адресов ещё старый.
+2. Через Service видны `Connection refused`: kube-proxy ещё направляет пакеты в порт, который закрыт.
+3. `timed out` — запрос принят закрывающимся сервером и не обслужен за 2 с; это предположение о механике, а не прямое наблюдение.
+4. `error_window` 2–3 с — время, за которое потребители адресов догоняют удаление пода.
+5. Приложение здорово, все поды Ready: ошибки порождает только порядок остановки.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Приложение, закрывающее порт по SIGTERM, даёт ошибки на каждом rollout | шаг 3, `errors` |
+| Потребители адресов отстают от удаления на секунды | шаг 3, `error_window` |
+| Через Gateway приходят 503, через Service — отказ соединения | шаг 3, `detail` |
+
+**Уборка.** Объекты нужны в работе 2, поэтому оставьте их. Если вы останавливаетесь здесь, выполните уборку работы 2.
+
+**Вопросы для самопроверки.**
+
+1. Почему readiness-проба с периодом 2 с не защищает от этих ошибок?
+2. Чем ошибки через Gateway отличаются от ошибок через Service и почему?
+3. Что показывает `error_window`?
+
+<details>
+<summary>Ответы</summary>
+
+1. Readiness реагирует на отказ уже после провала, а удаление пода начинается сразу с SIGTERM. Список адресов обновляется параллельно и с задержкой, поэтому приложение закрывает порт раньше.
+2. Через Gateway приходит ответ 503 от Envoy, через Service — отказ соединения от kube-proxy и ядра. У каждого потребителя свой список адресов и своё время обновления.
+3. Время от первой до последней ошибки в одной нагрузке. Оно оценивает, сколько секунд потребители адресов отстают от удаления пода.
+
+</details>
+
+### Лабораторная работа 2. Grace period и preStop sleep
+
+**Цель.** Убрать ошибки двумя способами, preStop sleep и задержкой в приложении, измерить срок остановки процесса, который не обрабатывает SIGTERM, и проверить, что `exec sleep` не работает в образе без бинарника.
+
+**Что понадобится.** Объекты работы 1 (Deployment, Service, HTTPRoute, под `client`, переменная `GW`, функция `run`), образ `busybox:1.37`. Шаг 4 использует образ `registry.k8s.io/pause:3.10`.
+
+**Схема опыта.**
+
+```
+Шаг 1: Deployment + lifecycle.preStop.sleep 5   ► run  ► ошибки?
+Шаг 2: SHUTDOWN_DELAY=5, без preStop            ► run  ► ошибки?
+Шаг 3: polite (trap SIGTERM) и stubborn (sleep) ► время удаления
+Шаг 4: nosleep-exec и nosleep-native            ► событие FailedPreStopHook
+```
+
+Схема 6. Четыре опыта: два способа убрать гонку, цена игнорируемого SIGTERM и разница между `exec` и встроенным `sleep`.
+
+#### Шаг 1. Добавить preStop sleep
+
+Команда добавляет в контейнер хук `preStop` с паузой 5 с, ждёт новую выкатку и повторяет замер. Дополнительные 5 с перед замером нужны, чтобы новые поды успели стать Ready.
+
+```bash
+kubectl patch deploy orders-api --type=json -p '[
+  {"op":"add","path":"/spec/template/spec/containers/0/lifecycle",
+   "value":{"preStop":{"sleep":{"seconds":5}}}}]'
+kubectl rollout status deploy/orders-api; sleep 5
+run "B: SHUTDOWN_DELAY=0, preStop sleep 5"
+```
+
+| Часть команды | Значение |
+|---|---|
+| `--type=json` | патч в формате JSON Patch: список операций |
+| `"op":"add"` | добавить поле `lifecycle` к первому контейнеру |
+| `preStop … sleep … seconds: 5` | встроенная пауза 5 с перед SIGTERM |
+| `sleep 5` | дать новым подам стабилизироваться |
+| `run "B: …"` | замер из работы 1 |
+
+Результат (повторный прогон автора, строки перенесены):
+
+```
+B: SHUTDOWN_DELAY=0, preStop sleep 5 (repeat)
   via gateway: requests=5469 ok=5469 errors=0 error_window=0s
   via service: requests=5656 ok=5656 errors=0 error_window=0s
+```
+
+В первом прогоне автора через Gateway было 0 ошибок, а через Service 2 (`URLError`).
+
+Разбор:
+
+1. Приложение то же самое, и оно по-прежнему закрывает порт сразу по SIGTERM. Изменилась только пауза перед SIGTERM.
+2. За 5 с Envoy и kube-proxy успевают убрать под из списков, поэтому SIGTERM приходит в под, на который трафик уже не идёт.
+3. Две ошибки в первом прогоне напоминают: 5 с хватает не всегда, запас подбирают замером.
+
+#### Шаг 2. Задержка в приложении вместо хука
+
+Команда убирает хук и включает задержку в приложении: после SIGTERM orders-api отдаёт на `/ready` ответ 503, но ещё 5 с обслуживает запросы.
+
+```bash
+kubectl patch deploy orders-api --type=json -p '[
+  {"op":"remove","path":"/spec/template/spec/containers/0/lifecycle"},
+  {"op":"replace","path":"/spec/template/spec/containers/0/env/0/value","value":"5"}]'
+kubectl rollout status deploy/orders-api; sleep 5
+run "C: SHUTDOWN_DELAY=5 (app keeps serving after SIGTERM, readiness 503)"
+```
+
+| Часть команды | Значение |
+|---|---|
+| `"op":"remove"` | убрать `lifecycle`, то есть preStop |
+| `env/0/value → "5"` | `SHUTDOWN_DELAY=5`: 5 с обслуживания после SIGTERM |
+| `run "C: …"` | тот же замер |
+
+Результат (строки перенесены):
+
+```
 C: SHUTDOWN_DELAY=5 (app keeps serving after SIGTERM, readiness 503)
   via gateway: requests=5477 ok=5477 errors=0 error_window=0s
   via service: requests=5652 ok=5652 errors=0 error_window=0s
 ```
 
-### Шаг 3. Grace period
+Разбор:
+
+1. Ошибок нет на обоих путях, как и в варианте B.
+2. Теперь пауза живёт в приложении: оно переводит `/ready` в 503 и продолжает отвечать, пока адреса обновляются.
+3. Этот способ требует кода в приложении, а preStop работает с любым образом. На практике их сочетают: приложение перестаёт быть готовым, а хук даёт запас.
+
+#### Шаг 3. Измерить срок остановки
+
+Команда создаёт два пода: `polite` ловит SIGTERM и выходит, `stubborn` запускает `sleep infinity` как PID 1 без обработчика. Функция `del` удаляет под и печатает, сколько заняло удаление.
 
 ```bash
 kubectl run stubborn --image=busybox:1.37 -- sleep infinity
-kubectl run polite --image=busybox:1.37 -- sh -c 'trap "echo got TERM; exit 0" TERM; while true; do sleep 1; done'
+kubectl run polite --image=busybox:1.37 -- \
+  sh -c 'trap "echo got TERM; exit 0" TERM; while true; do sleep 1; done'
 kubectl wait --for=condition=Ready pod/stubborn pod/polite
-for p in polite stubborn; do s=$(date +%s%N); kubectl delete pod $p; echo "$p deleted in $(( ($(date +%s%N)-s)/1000000 )) ms"; done
+del() {
+  s=$(date +%s%N); kubectl delete pod "$1" -o name > /dev/null
+  awk -v ns=$(( $(date +%s%N) - s )) -v p="$1" \
+    'BEGIN{printf "%s deleted in %.1f s\n", p, ns/1e9}'
+}
+del polite; del stubborn
 ```
 
-Проверено: polite удалён за 2,1 с, stubborn — за 30,8 с.
+| Часть команды | Значение |
+|---|---|
+| `trap "echo got TERM; exit 0" TERM` | при SIGTERM напечатать строку и выйти с кодом 0 |
+| `sleep infinity` | PID 1 без обработчика сигнала |
+| `kubectl delete pod … -o name` | удалить под и ждать его исчезновения |
+| `date +%s%N` | время в наносекундах до и после удаления |
+| `awk … ns/1e9` | перевести наносекунды в секунды |
 
-### Шаг 4. startupProbe и таймаут пробы
+Результат (значения прогона автора; у вас сотые доли секунды другие):
+
+```
+polite deleted in 2.1 s
+stubborn deleted in 30.8 s
+```
+
+Разбор:
+
+1. `polite` остановился за 2,1 с: оболочка выполняет `trap` после текущего `sleep 1`, и остальное время занимает остановка контейнера.
+2. `stubborn` удалялся 30,8 с, то есть весь grace period (30 с) плюс накладные расходы.
+3. `sleep` в роли PID 1 не ставит обработчик SIGTERM, ядро игнорирует сигнал, и kubelet ждёт конца срока и шлёт SIGKILL.
+4. Те же 30 с получает каждый такой под при rollout, drain и scale down.
+
+#### Шаг 4. Хук exec против встроенного sleep
+
+Эту работу вы выполняете сами, результаты в ней — ожидаемые. Образ `pause` не содержит бинарника `sleep`. Команда создаёт два пода с одинаковой паузой 5 с: один делает её командой `exec`, другой встроенным действием, а затем удаляет оба.
+
+```bash
+docker exec lab-worker crictl images | grep pause
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata: {name: nosleep-exec}
+spec:
+  containers:
+  - name: app
+    image: registry.k8s.io/pause:3.10
+    lifecycle:
+      preStop:
+        exec: {command: ["sleep", "5"]}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: nosleep-native}
+spec:
+  containers:
+  - name: app
+    image: registry.k8s.io/pause:3.10
+    lifecycle:
+      preStop:
+        sleep: {seconds: 5}
+EOF
+kubectl wait --for=condition=Ready pod/nosleep-exec pod/nosleep-native
+del nosleep-exec; del nosleep-native
+kubectl get events --field-selector reason=FailedPreStopHook \
+  -o custom-columns=POD:.involvedObject.name,MSG:.message
+```
+
+| Часть команды | Значение |
+|---|---|
+| `docker exec lab-worker crictl images` | какие образы `pause` есть на узле (тег подставьте свой) |
+| `exec: {command: [sleep, "5"]}` | хук запускает бинарник из образа |
+| `sleep: {seconds: 5}` | встроенная пауза, образу бинарник не нужен |
+| `reason=FailedPreStopHook` | события об ошибках хука |
+
+Ожидаемый результат (сообщение сокращено):
+
+```
+nosleep-exec deleted in 1.x s
+nosleep-native deleted in 5.x s
+POD           MSG
+nosleep-exec  Exec lifecycle hook ([sleep 5]) for Container "app" in Pod … failed - error: … 
+              exec: "sleep": executable file not found in $PATH …
+```
+
+Разбор:
+
+1. `nosleep-exec` удалился почти сразу: хук не запустился, и kubelet перешёл к SIGTERM без паузы.
+2. Событие `FailedPreStopHook` называет причину: бинарника `sleep` нет в `$PATH`.
+3. `nosleep-native` удалялся около 5 с: встроенная пауза выполнилась без файла в образе.
+4. Пауза, которая молча не сработала, возвращает ошибки из работы 1, поэтому после смены образа на минимальный проверяйте событие.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Пауза перед SIGTERM убирает гонку | шаг 1, `errors=0` |
+| Задержка в приложении даёт тот же эффект | шаг 2, `errors=0` |
+| Процесс без обработчика SIGTERM держит под весь grace period | шаг 3, 30,8 с |
+| Встроенный `sleep` работает в образе без бинарника, `exec sleep` — нет | шаг 4, событие |
+
+**Уборка.** Удаляем объекты работ 1 и 2, файлы замера и функции оболочки.
+
+```bash
+kubectl delete deploy,svc,httproute orders-api
+kubectl delete pod client nosleep-exec nosleep-native --now --ignore-not-found
+rm -f ~/lab/k8s/02-5/gw.txt ~/lab/k8s/02-5/svc.txt
+unset -f run del
+```
+
+**Вопросы для самопроверки.**
+
+1. Почему preStop sleep убирает ошибки, хотя код приложения не менялся?
+2. Чем вариант C требовательнее варианта B?
+3. Сколько времени остаётся приложению до SIGKILL, если preStop длится 25 с, а срок остановки по умолчанию?
+4. Почему `stubborn` удалялся 30,8 с, а не 30,0 с?
+
+<details>
+<summary>Ответы</summary>
+
+1. Хук задерживает SIGTERM, а за эту паузу Envoy и kube-proxy успевают убрать адрес пода. Порт закрывается, когда трафик уже ушёл.
+2. Вариант C требует кода в приложении: переключение readiness в 503 и обслуживание после SIGTERM. Хук работает с любым образом.
+3. 5 с: срок в 30 с считается от начала остановки, и preStop в него входит.
+4. К сроку в 30 с добавляется время, за которое kubelet посылает SIGKILL, runtime останавливает контейнер и API-сервер удаляет объект.
+
+</details>
+
+### Лабораторная работа 3. startupProbe и таймаут пробы
+
+**Цель.** Сравнить поведение медленно стартующего приложения без startupProbe и с ней и увидеть, как liveness с таймаутом по умолчанию убивает медленный, но живой процесс.
+
+**Что понадобится.** Namespace `lab-02-5`, образ `localhost:5001/orders-api:2.0`. Работа идёт около 5 минут, из них 4 минуты ожидания.
+
+**Схема опыта.**
+
+```
+slow-no-startup  STARTUP_DELAY=40, только liveness (по умолчанию)   ► рестарты
+slow-startup     STARTUP_DELAY=40, startupProbe 2 с x 60            ► 0 рестартов
+slow-endpoint    liveness на /work?ms=1500, timeoutSeconds=1        ► CrashLoopBackOff
+```
+
+Схема 7. Три пода рядом: два с медленным стартом и один с медленным ответом.
+
+#### Шаг 1. Создать три пода и прочитать значения по умолчанию
+
+Команда создаёт три пода и показывает, какие значения kubelet подставил в liveness первого.
 
 ```bash
 kubectl apply -f - <<'EOF'
@@ -286,35 +818,215 @@ spec:
       periodSeconds: 5
 EOF
 kubectl get pod slow-no-startup -o jsonpath='{.spec.containers[0].livenessProbe}{"\n"}'
+```
+
+| Часть манифеста | Значение |
+|---|---|
+| `STARTUP_DELAY=40` | приложение 40 с не открывает порт |
+| `startupProbe … 2 с × 60` | на старт до 120 с |
+| `livenessProbe: {httpGet: …}` | в пробе задан только путь, остальное по умолчанию |
+| `path: "/work?ms=1500"` | ручка тратит 1,5 с CPU; кавычки нужны из-за `?` |
+| `periodSeconds: 5` | у `slow-endpoint` проверка каждые 5 с |
+
+Результат (одна строка, здесь перенесена):
+
+```
+{"failureThreshold":3,"httpGet":{"path":"/health","port":"http","scheme":"HTTP"},
+ "periodSeconds":10,"successThreshold":1,"timeoutSeconds":1}
+```
+
+Разбор:
+
+1. В манифесте был только путь, а `failureThreshold` 3, `periodSeconds` 10, `successThreshold` 1 и `timeoutSeconds` 1 подставлены по умолчанию.
+2. `timeoutSeconds: 1` — главное число для `slow-endpoint`: ответ дольше секунды считается провалом.
+3. Три провала подряд с периодом 10 с — это около 30 с до убийства, что меньше 40 с старта.
+
+#### Шаг 2. Сравнить состояние через 4 минуты
+
+Команда ждёт 240 с и показывает три пода.
+
+```bash
 sleep 240
 kubectl get pods slow-no-startup slow-startup slow-endpoint
-kubectl get events --field-selector involvedObject.name=slow-endpoint,reason=Unhealthy -o custom-columns=COUNT:.count,MSG:.message | tail -1
-kubectl get pod slow-no-startup -o jsonpath='lastState={.status.containerStatuses[0].lastState.terminated.reason}/{.status.containerStatuses[0].lastState.terminated.exitCode}{"\n"}'
-kubectl delete pod slow-no-startup slow-startup slow-endpoint --now
 ```
 
-Проверено (`path` с `?` в YAML — в кавычках, иначе flow-mapping не парсится):
+Результат:
 
 ```
+NAME              READY   STATUS             RESTARTS      AGE
 slow-no-startup   1/1     Running            3 (60s ago)   4m
 slow-startup      1/1     Running            0             4m
 slow-endpoint     0/1     CrashLoopBackOff   6 (32s ago)   4m4s
-20      Liveness probe failed: Get "http://10.244.2.80:8000/work?ms=1500": context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+```
+
+Разбор:
+
+1. `slow-no-startup` — 3 перезапуска: liveness убивала приложение раньше, чем оно открыло порт. Иногда новый экземпляр успевает, и под «то работает, то нет».
+2. `slow-startup` — 0 перезапусков: пока startupProbe не прошла, liveness молчит, а запас 120 с больше 40 с старта.
+3. `slow-endpoint` — `CrashLoopBackOff` и 6 перезапусков, хотя приложение здорово.
+4. В скобках после `RESTARTS` — время последнего перезапуска.
+
+#### Шаг 3. Прочитать причину убийства
+
+Команда показывает последнее событие `Unhealthy` у `slow-endpoint` и причину завершения прежнего запуска у `slow-no-startup`, затем удаляет поды.
+
+```bash
+kubectl get events --field-selector involvedObject.name=slow-endpoint,reason=Unhealthy \
+  -o custom-columns=COUNT:.count,MSG:.message | tail -1
+kubectl get pod slow-no-startup \
+  -o jsonpath='lastState={.status.containerStatuses[0].lastState.terminated.reason}/{.status.containerStatuses[0].lastState.terminated.exitCode}{"\n"}'
+kubectl delete pod slow-no-startup slow-startup slow-endpoint --now
+```
+
+| Часть команды | Значение |
+|---|---|
+| `--field-selector … reason=Unhealthy` | события провалов пробы для одного пода |
+| `-o custom-columns=COUNT:…,MSG:…` | число повторов и текст события |
+| `tail -1` | оставить последнюю строку без заголовка |
+| `lastState.terminated` | состояние прежнего запуска контейнера |
+| `delete … --now` | удалить без ожидания grace period |
+
+Результат (первая строка перенесена):
+
+```
+20      Liveness probe failed: Get "http://10.244.2.80:8000/work?ms=1500":
+        context deadline exceeded (Client.Timeout exceeded while awaiting headers)
 lastState=Error/137
 ```
 
-### Шаг 5. Liveness на БД
+Разбор:
+
+1. Событие записано 20 раз: за 4 минуты проба проваливалась каждые 5 с.
+2. `context deadline exceeded` — сервер не ответил за `timeoutSeconds`; это таймаут, а не код ответа.
+3. `Error/137` — прежний запуск `slow-no-startup` убит SIGKILL: пока приложение ждало, процесс с PID 1 не успел поставить обработчик SIGTERM, и kubelet дождался конца grace period (02-1 §4).
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Liveness с настройками по умолчанию убивает медленный старт | `slow-no-startup`, 3 перезапуска |
+| startupProbe даёт запас на старт без ослабления liveness | `slow-startup`, 0 перезапусков |
+| Таймаут 1 с убивает живой, но медленный путь | `slow-endpoint`, событие `Unhealthy` |
+| Код 137 говорит об убийстве SIGKILL | `lastState=Error/137` |
+
+**Уборка.** Поды удалены на шаге 3, остальных объектов работа не создавала.
+
+**Вопросы для самопроверки.**
+
+1. Какой запас на старт у `slow-startup` и хватает ли его?
+2. Что изменить в `slow-endpoint`, чтобы проба перестала убивать под?
+3. Почему у `slow-no-startup` код 137, а не 143?
+
+<details>
+<summary>Ответы</summary>
+
+1. 2 с × 60 = 120 с, это втрое больше 40 с старта; запас хватает.
+2. Поднять `timeoutSeconds` выше 1,5 с или, лучше, проверять лёгкий путь `/health`, который отвечает мгновенно и не делает тяжёлой работы.
+3. Пока приложение ждало, оно не ставило обработчик SIGTERM, а PID 1 без обработчика сигнал игнорирует. kubelet дожидался конца grace period и слал SIGKILL (137).
+
+</details>
+
+### Лабораторная работа 4. Liveness на базе данных
+
+**Цель.** Воспроизвести каскад: остановить базу на 60 с и сравнить Deployment с liveness на `/health` и с liveness на `/ready`, которая проверяет базу.
+
+**Что понадобится.** Namespace `lab-02-5`, образы `localhost:5001/orders-api:2.0` и `postgres:17.6-alpine`. PostgreSQL здесь работает на `emptyDir`, без тома, поэтому данные теряются при пересоздании пода.
+
+**Схема опыта.**
+
+```
+PostgreSQL (StatefulSet, emptyDir)
+   ▲                               ▲
+   │ DATABASE_URL                  │ DATABASE_URL
+readiness-only x2               liveness-db x2
+ liveness  ► /health             liveness  ► /ready  (проверяет БД)
+ readiness ► /ready              readiness ► /ready
+scale sts postgres 0 на 60 с ► scale 1 ► кто быстрее станет 1/1
+```
+
+Схема 8. Два Deployment'а различаются одной строкой: путём liveness.
+
+#### Шаг 1. Развернуть PostgreSQL
+
+Команда создаёт Secret с учебными реквизитами, headless Service и StatefulSet без тома.
 
 ```bash
-kubectl delete deploy orders-api
-# PostgreSQL этого namespace — на emptyDir, без PVC
-sed 's/namespace: orders/namespace: lab-02-5/' ~/lab/k8s/orders-api/k8s/postgres.yaml \
-  | sed '/volumeClaimTemplates:/,$d' \
-  | sed 's|        volumeMounts: \[{name: data, mountPath: /var/lib/postgresql/data}\]|&\n      volumes: [{name: data, emptyDir: {}}]|' \
-  | kubectl apply -f -
-kubectl rollout status sts/postgres
-for v in readiness-only liveness-db; do LP=/health; [ $v = liveness-db ] && LP=/ready
-kubectl apply -f - <<EOF
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata: {name: postgres}
+stringData:
+  POSTGRES_USER: orders
+  POSTGRES_PASSWORD: orders-lab-pass
+  POSTGRES_DB: orders
+  DATABASE_URL: postgresql://orders:orders-lab-pass@postgres:5432/orders
+---
+apiVersion: v1
+kind: Service
+metadata: {name: postgres}
+spec:
+  clusterIP: None
+  selector: {app: postgres}
+  ports: [{name: pg, port: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: postgres}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:17.6-alpine
+        envFrom: [{secretRef: {name: postgres}}]
+        env: [{name: PGDATA, value: /var/lib/postgresql/data/pgdata}]
+        ports: [{name: pg, containerPort: 5432}]
+        readinessProbe:
+          exec: {command: ["pg_isready", "-U", "orders", "-d", "orders"]}
+          periodSeconds: 5
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {memory: 512Mi}
+        volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+      volumes: [{name: data, emptyDir: {}}]
+EOF
+kubectl rollout status sts/postgres --timeout=180s
+```
+
+| Часть манифеста | Значение |
+|---|---|
+| `Secret postgres` | учётные данные и `DATABASE_URL` для приложения; пароль учебный |
+| `clusterIP: None` | headless Service: имя `postgres` указывает на под |
+| `volumes: emptyDir` | том живёт, пока жив под; PVC не нужен |
+| `readinessProbe … pg_isready` | проверка командой внутри контейнера |
+
+Результат (стандартные сообщения kubectl):
+
+```
+secret/postgres created
+service/postgres created
+statefulset.apps/postgres created
+partitioned roll out complete: 1 new pods have been updated...
+```
+
+Разбор:
+
+1. Три первых строки — созданные объекты.
+2. Последняя строка `rollout status` говорит, что под `postgres-0` запущен и готов; точный текст зависит от версии kubectl.
+3. База готова, когда проходит `pg_isready`: это readiness-проба вида `exec`.
+
+#### Шаг 2. Создать два Deployment'а
+
+Цикл создаёт два Deployment'а по 2 реплики: у `readiness-only` liveness идёт на `/health`, у `liveness-db` — на `/ready`.
+
+```bash
+for v in readiness-only liveness-db; do
+  LP=/health; [ $v = liveness-db ] && LP=/ready
+  kubectl apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: $v}
@@ -334,116 +1046,118 @@ spec:
 EOF
 done
 kubectl rollout status deploy/readiness-only; kubectl rollout status deploy/liveness-db
-kubectl scale sts postgres --replicas=0; sleep 60
-kubectl get pods -l 'app in (readiness-only,liveness-db)'
-kubectl scale sts postgres --replicas=1; kubectl rollout status sts/postgres
-kubectl get pods -l 'app in (readiness-only,liveness-db)' -w     # засеките, кто быстрее станет 1/1
 ```
 
-Проверено: таблица в §4.
+| Часть команды | Значение |
+|---|---|
+| `LP=/health; [ … ] && LP=/ready` | выбрать путь liveness для каждого Deployment |
+| `<<EOF` без кавычек | оболочка подставляет `$v` и `$LP` в манифест |
+| `DATABASE_URL … secretKeyRef` | приложение берёт адрес базы из Secret |
+| `livenessProbe … periodSeconds: 5` | проверка каждые 5 с, отказ после 3 провалов |
 
-### Уборка
+Результат (стандартные сообщения kubectl):
+
+```
+deployment "readiness-only" successfully rolled out
+deployment "liveness-db" successfully rolled out
+```
+
+Разбор: оба Deployment'а работают и подключены к базе, а различие скрыто в одном поле: путь liveness. Пока база здорова, различия нет.
+
+#### Шаг 3. Остановить базу на 60 секунд
+
+Эту работу вы выполняете сами, результаты в ней — ожидаемые. Команда останавливает базу, ждёт минуту и показывает поды.
+
+```bash
+kubectl scale sts postgres --replicas=0
+sleep 60
+kubectl get pods -l 'app in (readiness-only,liveness-db)'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `scale sts postgres --replicas=0` | остановить базу: приложения теряют соединение |
+| `sleep 60` | подождать, пока liveness накопит провалы |
+| `-l 'app in (…)'` | выбрать поды обоих Deployment'ов |
+
+Ожидаемый результат (имена и возраст у вас другие):
+
+```
+NAME                 READY   STATUS             RESTARTS   AGE
+liveness-db-…        0/1     CrashLoopBackOff   3          …
+liveness-db-…        0/1     CrashLoopBackOff   3          …
+readiness-only-…     0/1     Running            0          …
+readiness-only-…     0/1     Running            0          …
+```
+
+Разбор:
+
+1. У `readiness-only` поды `0/1 Running`, перезапусков 0: readiness сняла их с трафика, а процесс жив.
+2. У `liveness-db` `CrashLoopBackOff` и около 3 перезапусков за минуту: liveness на `/ready` провалилась из-за базы, и kubelet убивал контейнеры.
+3. Базу перезапуск не починил, поэтому все поды `liveness-db` пострадали разом.
+
+#### Шаг 4. Вернуть базу и сравнить восстановление
+
+Команда запускает базу и следит за подами, чтобы заметить, кто быстрее вернётся в `1/1`. Остановить наблюдение можно сочетанием Ctrl+C.
+
+```bash
+kubectl scale sts postgres --replicas=1
+kubectl rollout status sts/postgres
+kubectl get pods -l 'app in (readiness-only,liveness-db)' -w
+```
+
+| Часть команды | Значение |
+|---|---|
+| `scale sts postgres --replicas=1` | вернуть базу |
+| `rollout status sts/postgres` | дождаться готовности базы |
+| `get pods … -w` | наблюдать за сменой состояний |
+
+Ожидаемый результат по записям прогона автора:
+
+| Deployment | Ready после возврата базы | Перезапуски |
+|---|---|---|
+| `readiness-only` | через 3 с | 0 |
+| `liveness-db` | через 20 с | 4 |
+
+Разбор:
+
+1. `readiness-only` вернулся за 3 с: ближайшая проверка `/ready` увидела живую базу.
+2. `liveness-db` вернулся за 20 с и накопил 4 перезапуска: часть времени ушла на паузу back-off перед очередным запуском.
+3. Чем дольше простой базы, тем дольше пауза (потолок 300 с, 02-1 §2), и тем медленнее восстановление.
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Liveness на зависимость перезапускает все поды при её сбое | шаг 3, `liveness-db` |
+| Readiness только снимает под с трафика, процесс не трогает | шаг 3, `readiness-only` |
+| Каскад замедляет восстановление после сбоя | шаг 4, 3 с против 20 с |
+
+**Уборка.** Удаляем namespace со всем содержимым, возвращаем namespace по умолчанию и убираем файлы работ.
 
 ```bash
 kubectl config set-context --current --namespace=default
 kubectl delete ns lab-02-5
-rm -f /tmp/gw.txt /tmp/svc.txt
+rm -rf ~/lab/k8s/02-5
 ```
 
----
+**Вопросы для самопроверки.**
 
-## 🔥 Кейс из прода: «каждый деплой — всплеск 502»
+1. Почему `liveness-db` восстанавливается медленнее, если база вернулась для обоих одновременно?
+2. Что должна проверять liveness у orders-api?
+3. Что случится, если у `readiness-only` readiness тоже зависит от базы и база падает?
 
-**Контекст.** orders-api, 12 реплик за Ingress-контроллером, 400 RPS. На каждом деплое и при каждом scale down HPA — 50–200 ответов 502/503 в логах Ingress за 5–10 секунд. Readiness настроена, rollout `maxUnavailable: 0`. Команда считала это «нормой Kubernetes».
+<details>
+<summary>Ответы</summary>
 
-**Разбор.**
-1. Ошибки только у запросов, попавших в поды в состоянии `Terminating` (сопоставили IP upstream в логах Ingress с подами).
-2. Приложение (Go, `http.Server`) по SIGTERM сразу вызывало `Shutdown()` — listener закрыт мгновенно. Ingress-контроллер узнавал об удалении пода из EndpointSlice через ~1 с и ещё держал пул keepalive-соединений к старому поду.
-3. Воспроизвели на стенде — шаг 2, вариант A: 503 от Envoy и `Connection refused` через Service.
+1. После убийств kubelet выдерживает паузу back-off перед запуском контейнера, а она растёт с каждым падением. `readiness-only` не перезапускался и вернулся при первой удачной проверке.
+2. Только сам процесс: путь `/health`, который отвечает 200, пока живёт HTTP-сервер. База проверяется в readiness.
+3. Поды станут неготовыми, Service останется без адресов, и запросы будут получать отказ, но перезапусков не будет. Для сервиса, который без базы ничего не умеет, это ожидаемо; для сервиса с необязательной зависимостью — отказ там, где можно было работать.
 
-**Фикс.**
-- `preStop: {sleep: {seconds: 10}}` (у Ingress за облачным LB — запас на обновление его целей) и `terminationGracePeriodSeconds: 40`.
-- В приложении по SIGTERM: readiness → 503, ещё 5 с обслуживать, затем `Shutdown(ctx)` с таймаутом 25 с на текущие запросы; закрытие keepalive-соединений (`Connection: close` в ответах после SIGTERM).
-- Проверка в CI на нагрузочном стенде: rollout под нагрузкой, ошибок — 0 (как вариант B/C лабы).
-
-**Что запомнить.**
-- Удаление пода и удаление его из endpoints идут параллельно — без задержки гонка неизбежна.
-- preStop sleep входит в `terminationGracePeriodSeconds`.
-- «Ошибки при деплое» — не норма, а отсутствие graceful shutdown.
+</details>
 
 ---
 
-## 💼 Вопросы с собеседования
+## → Дальше
 
-### 🟢 Junior
-
-**1. Чем liveness отличается от readiness?**
-Liveness не прошла — контейнер перезапускается. Readiness не прошла — под убирается из endpoints (трафик не идёт), контейнер работает. Liveness — «процесс жив?», readiness — «готов обслуживать запросы?».
-
-**2. Зачем startupProbe?**
-Для медленно стартующих приложений: пока она не прошла, liveness и readiness не выполняются. Даёт приложению время на старт (`period × failureThreshold`), не ослабляя liveness на всё время работы.
-
-**3. Какие дефолты у пробы?**
-`periodSeconds: 10`, `timeoutSeconds: 1`, `failureThreshold: 3`, `successThreshold: 1`, `initialDelaySeconds: 0`. Таймаут в 1 секунду — частая причина ложных рестартов под нагрузкой.
-
-### 🟡 Middle
-
-**4. Почему нельзя проверять БД в liveness?**
-Перезапуск приложения не починит БД; при её сбое liveness перезапустит все поды сразу, они уйдут в CrashLoopBackOff с растущими паузами и поднимутся позже, чем вернулась БД (на стенде: 20 с против 3 с при простое БД в минуту), с холодными кэшами и шквалом подключений. Зависимости — в readiness.
-
-**5. Что происходит при удалении пода?**
-deletionTimestamp → параллельно: kubelet выполняет preStop, шлёт SIGTERM, ждёт до `terminationGracePeriodSeconds` (30 с, включая preStop), затем SIGKILL; контроллер EndpointSlice убирает под из endpoints, kube-proxy и балансировщики обновляют правила. Порядок между ветками не гарантирован.
-
-**6. Откуда 502 при rolling update и как их убрать?**
-Приложение закрывает порт по SIGTERM раньше, чем kube-proxy/Ingress/Envoy убрали под из балансировки. Лечение: preStop sleep 5–10 с (или задержка в приложении: readiness 503 + продолжить обслуживание), достаточный grace period, корректное завершение текущих запросов и keepalive.
-
-### 🔴 Senior
-
-**7. Как подобрать preStop и terminationGracePeriodSeconds?**
-preStop — не меньше времени распространения изменений endpoints до всех балансировщиков: секунды для kube-proxy и Envoy, 10–30 с для облачных LB с health-check'ами. Grace period ≥ preStop + максимальная длительность запроса/дренажа соединений + запас. Проверять rollout'ом под нагрузкой с подсчётом ошибок.
-
-**8. Под удаляется 30 секунд. Почему?**
-PID 1 не обрабатывает SIGTERM: shell-обёртка без `exec`, `sleep` или приложение без обработчика (для PID 1 действия сигналов по умолчанию не применяются); kubelet ждёт grace period и шлёт SIGKILL (exit 137). Решения: `exec` в entrypoint, tini/`--init`, обработчик сигналов; `shareProcessNamespace` меняет PID 1 на pause.
-
-**9. Liveness убивает поды под нагрузкой. Что проверяете?**
-Таймаут пробы (дефолт 1 с) против p99 ручки под нагрузкой; CPU-троттлинг (05-1) и паузы GC; не делает ли liveness тяжёлую работу или ходит в зависимости. Решение: лёгкий отдельный эндпоинт без зависимостей, таймаут 3–5 с, `failureThreshold` повыше; liveness вообще не обязательна, если процесс сам падает при зависании.
-
----
-
-## ⚠️ Подводные камни
-
-- `timeoutSeconds: 1` по умолчанию — медленная ручка в liveness убивает живой сервис.
-- Liveness с проверкой БД/зависимостей — каскадный рестарт всех подов при сбое зависимости.
-- Без startupProbe медленный старт даёт «плавающий» CrashLoop.
-- Без preStop/задержки в приложении — ошибки на каждом rollout и scale down.
-- preStop входит в grace period; preStop 30 с при дефолтном grace оставляет приложению 0 с.
-- `preStop: exec: sleep` не работает в distroless — используйте `preStop: sleep:` (1.33+).
-- PID 1 игнорирует SIGTERM без обработчика — 30 с на каждое удаление и exit 137.
-- `?` в пути пробы в flow-YAML (`{path: /work?ms=1}`) ломает парсинг — кавычки.
-- Readiness, зависящая от необязательной зависимости, выводит из строя весь сервис.
-
----
-
-## Чеклист
-
-- [ ] Объясню назначение трёх проб и их дефолты.
-- [ ] Настрою startupProbe для медленного старта.
-- [ ] Объясню каскад от liveness на БД и воспроизведу его.
-- [ ] Нарисую параллельные ветки удаления пода и найду гонку.
-- [ ] Уберу ошибки при rollout preStop'ом или задержкой в приложении и докажу это замером.
-- [ ] Найду причину «под удаляется 30 секунд».
-
----
-
-## Задание со звёздочкой
-
-Перенесите graceful shutdown в сквозной сценарий и докажите его на внешнем пути:
-
-1. В `~/lab/k8s/orders-api/k8s/orders-api.yaml` добавьте `preStop: {sleep: {seconds: 5}}`, `terminationGracePeriodSeconds: 20`, startupProbe и уберите зависимость liveness от чего-либо, кроме процесса.
-2. Запустите нагрузку на `http://orders.localhost:8088/api/orders` с хоста (цикл `curl -s -o /dev/null -w '%{http_code}\n'`) и сделайте `kubectl -n orders rollout restart deploy/orders-api` 5 раз подряд. Посчитайте не-200.
-3. Повторите со `SHUTDOWN_DELAY=0` и без preStop. Разница?
-4. Добавьте `?sleep=` в `/work` (длинный запрос 3 с) и проверьте, дожидается ли приложение текущих запросов при остановке. Что нужно поменять в orders-api, чтобы дожидалось?
-
----
-
-→ Следующая часть: **03-1. Сеть подов и CNI** — модуль «Сеть»: у каждого пода свой IP, маршруты между узлами kind, veth и tcpdump на узле, MTU и оверлеи, исчерпание podCIDR; со ссылками на курс `networks`.
+Этой частью модуль 02 закончен: поды умеют сообщать о готовности, перезапускаться и уходить без потерь для клиентов. Трафик находит под по адресу из списка EndpointSlice, и мы выяснили, что этот список обновляется с задержкой в секунды. Откуда у пода берётся IP и как пакет доходит до него через узлы и сетевой плагин, разбирает 03-1, и она идёт следующей потому, что без сети пода нельзя понять ни Service, ни Gateway. После неё 03-2 вернётся к тому, как kube-proxy превращает список адресов в правила на узле.
