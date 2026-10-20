@@ -807,6 +807,7 @@ certificate.cert-manager.io/shop-localhost-tls condition met
 
 ```bash
 kubectl -n envoy-gateway-system patch gateway lab --type=json -p '[
+  {"op":"test","path":"/spec/listeners/1/name","value":"https-shop"},
   {"op":"remove","path":"/spec/listeners/1"},
   {"op":"remove","path":"/metadata/annotations/cert-manager.io~1cluster-issuer"}]'
 kubectl -n envoy-gateway-system delete certificate shop-localhost-tls --ignore-not-found
@@ -820,7 +821,7 @@ rm -rf ~/lab/k8s/03-5
 curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders
 ```
 
-Разбор: последняя команда должна вернуть `200`, значит, приложение стенда отвечает через Gateway. Работа 2 начинается с пустого namespace, поэтому уборку выполняйте полностью. Удаление CRD удаляет и все Certificate кластера, поэтому делайте это только на стенде.
+Разбор: операция `test` проверяет, что под номером 1 стоит именно `https-shop`; если порядок listener другой, патч не применится целиком и ничего не удалит. Последняя команда должна вернуть `200`, значит, приложение стенда отвечает через Gateway. Работа 2 начинается с пустого namespace, поэтому уборку выполняйте полностью. Удаление CRD удаляет и все Certificate кластера, поэтому делайте это только на стенде.
 
 **Вопросы для самопроверки.**
 
