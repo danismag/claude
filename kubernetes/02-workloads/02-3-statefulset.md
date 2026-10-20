@@ -1,6 +1,6 @@
 # 02-3. StatefulSet
 
-> Модуль 02 «Workloads» · часть 3 из 5 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд 00-1 (контекст `kind-lab`, PostgreSQL в namespace `orders`), kubectl из 00-2, доступ узлов к образам `busybox:1.37` и `python:3.12-slim` · Опирается на: 02-1 (под), 02-2 (Deployment и ReplicaSet), 01-3 (API-объекты)
+> Модуль 02 «Workloads» · часть 3 из 5 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд 00-1 (контекст `kind-lab`, PostgreSQL в namespace `orders`), kubectl из 00-2, образ `localhost:5001/busybox:1.37` в реестре стенда (02-1), доступ узлов к образу `python:3.12-slim` · Опирается на: 02-1 (под), 02-2 (Deployment и ReplicaSet), 01-3 (API-объекты)
 
 ## Где мы на карте
 
@@ -306,7 +306,7 @@ StatefulSet подходит, когда достаточно имён и дис
 
 ## Лабораторные работы
 
-Работы идут на стенде 00-1 в namespace `lab-02-3`. Удаление namespace (01-1) удаляет всё, что в нём создано. Файлы работ лежат в `~/lab/k8s/02-3/`. Образ `busybox:1.37` узлы тянут из Docker Hub; если он недоступен, положите его в реестр стенда по инструкции из 02-1 и замените имя образа на `localhost:5001/busybox:1.37`.
+Работы идут на стенде 00-1 в namespace `lab-02-3`. Удаление namespace (01-1) удаляет всё, что в нём создано. Файлы работ лежат в `~/lab/k8s/02-3/`. Образ `localhost:5001/busybox:1.37` общий для стенда: его кладут в реестр командами из подготовки к лабораторным 02-1.
 
 Кластер готовят один раз: выбирают контекст стенда, создают namespace и каталог для файлов.
 
@@ -331,7 +331,7 @@ mkdir -p ~/lab/k8s/02-3
 
 **Цель.** Увидеть, как StatefulSet создаёт поды по порядку, выдаёт им PVC и DNS-имена и возвращает пересозданному поду то же имя и тот же том.
 
-**Что понадобится.** Стенд 00-1, namespace `lab-02-3`, образы `busybox:1.37` и `python:3.12-slim`, PostgreSQL в namespace `orders` (для шага 6).
+**Что понадобится.** Стенд 00-1, namespace `lab-02-3`, образы `localhost:5001/busybox:1.37` и `python:3.12-slim`, PostgreSQL в namespace `orders` (для шага 6).
 
 **Схема опыта.**
 
@@ -371,7 +371,7 @@ spec:
       terminationGracePeriodSeconds: 2
       containers:
       - name: web
-        image: busybox:1.37
+        image: localhost:5001/busybox:1.37
         env: [{name: VERSION, value: v1}]
         command:
         - sh
@@ -472,7 +472,7 @@ data-web-2   Bound
 ```bash
 k run dns --image=python:3.12-slim --restart=Never --command -- sh -c \
   'getent ahostsv4 web | awk "{print \$1}" | sort -u; getent hosts web-1.web'
-k run dns-bb --image=busybox:1.37 --restart=Never --command -- nslookup web-1.web
+k run dns-bb --image=localhost:5001/busybox:1.37 --restart=Never --command -- nslookup web-1.web
 sleep 15
 k logs dns
 k logs dns-bb
@@ -617,7 +617,7 @@ k delete pvc --all
 
 **Цель.** Проверить, что происходит с PVC при уменьшении числа подов, при возврате и при удалении StatefulSet. Затем изменить политику хранения и сравнить время запуска при `OrderedReady` и `Parallel`.
 
-**Что понадобится.** Манифест из шага 1 работы 1, namespace `lab-02-3`, образ `busybox:1.37`.
+**Что понадобится.** Манифест из шага 1 работы 1, namespace `lab-02-3`, образ `localhost:5001/busybox:1.37`.
 
 **Схема опыта.**
 
@@ -780,7 +780,7 @@ echo "OrderedReady: $(( $(date +%s)-t0 ))s"
 | `$(( $(date +%s)-t0 ))` | вычислить прошедшие секунды |
 | `delete pvc --all` | убрать диски, чтобы оба запуска стартовали с нуля |
 
-Результат (на стенде автора):
+Пример результата:
 
 - Parallel: 8 с, все три пода созданы в одну секунду.
 - OrderedReady: 14 с.
@@ -830,7 +830,7 @@ rm -f ~/lab/k8s/02-3/sts-par.yaml
 
 **Цель.** Обновить один под через partition. Затем сломать выкат, вернуть шаблон и исправить застрявший под вручную. В конце проверить обновление пачками через `maxUnavailable`.
 
-**Что понадобится.** Манифест из шага 1 работы 1, namespace `lab-02-3`, образ `busybox:1.37`.
+**Что понадобится.** Манифест из шага 1 работы 1, namespace `lab-02-3`, образ `localhost:5001/busybox:1.37`.
 
 **Схема опыта.**
 
@@ -1014,7 +1014,7 @@ spec:
       terminationGracePeriodSeconds: 2
       containers:
       - name: web
-        image: busybox:1.37
+        image: localhost:5001/busybox:1.37
         env: [{name: VERSION, value: v1}]
         command: ["sh", "-c", "sleep 8; httpd -f -p 80 -h /tmp"]
         readinessProbe: {tcpSocket: {port: 80}, periodSeconds: 1}

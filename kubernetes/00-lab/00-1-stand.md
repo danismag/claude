@@ -89,7 +89,7 @@
 
 ### Узел как контейнер
 
-В кластере один **control plane** (управляющий узел, где работают API-сервер, etcd, scheduler и controller-manager) и три **worker** (рабочих узла, на которых запускаются поды). Узлы называются `lab-control-plane`, `lab-worker`, `lab-worker2` и `lab-worker3`.
+В кластере один **control plane** (плоскость управления: компоненты, которые хранят описания объектов и принимают решения) и три **worker** (рабочих узла, на которых запускаются поды). API-сервер, etcd, scheduler и controller-manager работают на узле `lab-control-plane`. Узлы называются `lab-control-plane`, `lab-worker`, `lab-worker2` и `lab-worker3`.
 
 На узел заходят командой `docker exec -it lab-worker bash`, и внутри доступны привычные инструменты узла. Это `crictl`, `journalctl -u kubelet`, `iptables-save` и каталог `/etc/kubernetes/manifests` со static pods (01-2).
 

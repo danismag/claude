@@ -1,6 +1,6 @@
 # 02-4. DaemonSet, Job, CronJob
 
-> Модуль 02 «Workloads» · часть 4 из 5 · ~1,5 ч чтения + ~1,5 ч лабы (из них около 4 мин ожидания CronJob) · Нужно: стенд 00-1 (контекст `kind-lab`), kubectl из 00-2, доступ узлов к образу `busybox:1.37` · Опирается на: 01-2 (taints и tolerations), 02-1 (под, `restartPolicy`, sidecar), 02-2 (Deployment)
+> Модуль 02 «Workloads» · часть 4 из 5 · ~1,5 ч чтения + ~1,5 ч лабы (из них около 4 мин ожидания CronJob) · Нужно: стенд 00-1 (контекст `kind-lab`), kubectl из 00-2, образ `localhost:5001/busybox:1.37` в реестре стенда (02-1) · Опирается на: 01-2 (taints и tolerations), 02-1 (под, `restartPolicy`, sidecar), 02-2 (Deployment)
 
 ## Где мы на карте
 
@@ -182,7 +182,7 @@ CronJob backup  ──(10:00)──►  Job backup-29866200  ──►  Pod
 - `Ignore` — не считать попытку в `backoffLimit`, создать замену;
 - `Count` — считать как обычно.
 
-Типичная пара правил: код 42 («ошибка конфигурации, повтор бесполезен») — `FailJob`, а условие `DisruptionTarget` (выселение при drain или вытеснении) — `Ignore`. Тогда плановое обслуживание узлов не тратит попытки.
+Типичная пара правил: код 42 («ошибка конфигурации, повтор бесполезен») — `FailJob`, а условие `DisruptionTarget` (выселение при drain или вытеснение более важным подом) — `Ignore`. Тогда плановое обслуживание узлов не тратит попытки.
 
 **backoffLimitPerIndex** (предел повторов на индекс, стабилен с 1.33) считает неудачи отдельно для каждого индекса Indexed Job. Упавший индекс не останавливает остальные: Job доделает всё, что можно, и в конце отметит провал, если хотя бы один индекс не выполнен. Провалившиеся индексы лежат в `status.failedIndexes`, успешные — в `status.completedIndexes`. Поле `maxFailedIndexes` задаёт порог: когда провалившихся индексов становится больше, Job обрывается сразу. При заданном `backoffLimitPerIndex` общий `backoffLimit` по умолчанию становится практически бесконечным (2147483647).
 
@@ -321,7 +321,7 @@ CronJob backup  ──(10:00)──►  Job backup-29866200  ──►  Pod
 
 Работы идут на стенде 00-1 в namespace `lab-02-4`. Удаление namespace (01-1) удаляет всё созданное в нём. Хост работы не меняют, а кластер меняет только четвёртая работа (cordon узла), и перед ней стоит блок «Риски».
 
-Образ `busybox:1.37` узлы тянут из Docker Hub. Если он недоступен, положите образ в реестр стенда по инструкции из начала лабораторных 02-1 и подставьте `localhost:5001/busybox:1.37` в манифесты. Кластер готовят один раз:
+Образ `localhost:5001/busybox:1.37` общий для стенда: его кладут в реестр командами из подготовки к лабораторным 02-1. Кластер готовят один раз:
 
 ```bash
 kubectl config use-context kind-lab
@@ -335,7 +335,7 @@ k() { kubectl -n lab-02-4 "$@"; }
 
 **Цель.** Увидеть, как Job повторяет упавшие поды, чем лимит времени отличается от лимита попыток, как `podFailurePolicy` обрывает бесполезные повторы и как работает параллельный Indexed Job.
 
-**Что понадобится.** Стенд 00-1, namespace `lab-02-4`, образ `busybox:1.37`, около 5 минут.
+**Что понадобится.** Стенд 00-1, namespace `lab-02-4`, образ `localhost:5001/busybox:1.37`, около 5 минут.
 
 **Схема опыта.**
 
@@ -365,7 +365,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: job
-        image: busybox:1.37
+        image: localhost:5001/busybox:1.37
         command: ["sh", "-c", "date +%T; exit 1"]
 ---
 apiVersion: batch/v1
@@ -378,7 +378,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: job
-        image: busybox:1.37
+        image: localhost:5001/busybox:1.37
         command: ["sleep", "60"]
 ---
 apiVersion: batch/v1
@@ -397,7 +397,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: job
-        image: busybox:1.37
+        image: localhost:5001/busybox:1.37
         command: ["sh", "-c", "echo bad config; exit 42"]
 ---
 apiVersion: batch/v1
@@ -412,7 +412,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: job
-        image: busybox:1.37
+        image: localhost:5001/busybox:1.37
         command: ["sh", "-c", "echo index=$JOB_COMPLETION_INDEX; sleep 3"]
 ---
 apiVersion: batch/v1
@@ -425,7 +425,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: job
-        image: busybox:1.37
+        image: localhost:5001/busybox:1.37
         command: ["true"]
 EOF
 ```
@@ -577,7 +577,7 @@ k delete job --all
 
 **Цель.** Увидеть три поля Indexed Job: `backoffLimitPerIndex`, `successPolicy` и `podReplacementPolicy`.
 
-**Что понадобится.** Стенд 00-1, namespace `lab-02-4`, образ `busybox:1.37`, около 10 минут.
+**Что понадобится.** Стенд 00-1, namespace `lab-02-4`, образ `localhost:5001/busybox:1.37`, около 10 минут.
 
 **Схема опыта.**
 
@@ -610,7 +610,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: job
-        image: busybox:1.37
+        image: localhost:5001/busybox:1.37
         command: ["sh", "-c", "echo index=$JOB_COMPLETION_INDEX; exit $((JOB_COMPLETION_INDEX%2))"]
 EOF
 sleep 40
@@ -666,7 +666,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: job
-        image: busybox:1.37
+        image: localhost:5001/busybox:1.37
         command: ["sh", "-c", "[ \"$JOB_COMPLETION_INDEX\" = 1 ] && exit 42; exit 0"]
 EOF
 sleep 15
@@ -715,7 +715,7 @@ spec:
       terminationGracePeriodSeconds: 1
       containers:
       - name: job
-        image: busybox:1.37
+        image: localhost:5001/busybox:1.37
         command: ["sh", "-c", "[ \"$JOB_COMPLETION_INDEX\" = 0 ] && exit 0; sleep 300"]
 EOF
 sleep 20
@@ -763,7 +763,7 @@ spec:
       terminationGracePeriodSeconds: 20
       containers:
       - name: job
-        image: busybox:1.37
+        image: localhost:5001/busybox:1.37
         command: ["sleep", "3600"]
 ---
 apiVersion: batch/v1
@@ -777,7 +777,7 @@ spec:
       terminationGracePeriodSeconds: 20
       containers:
       - name: job
-        image: busybox:1.37
+        image: localhost:5001/busybox:1.37
         command: ["sleep", "3600"]
 EOF
 sleep 10
@@ -855,7 +855,7 @@ k delete job --all
 
 **Цель.** Увидеть, как `concurrencyPolicy` ведёт себя с зависшим запуском, и убедиться, что `timeZone` меняет время запуска, а не часы внутри контейнера.
 
-**Что понадобится.** Стенд 00-1, namespace `lab-02-4`, образ `busybox:1.37`, около 10 минут, из них 3 минуты ожидания.
+**Что понадобится.** Стенд 00-1, namespace `lab-02-4`, образ `localhost:5001/busybox:1.37`, около 10 минут, из них 3 минуты ожидания.
 
 **Схема опыта.**
 
@@ -886,7 +886,7 @@ spec:
           restartPolicy: Never
           containers:
           - name: backup
-            image: busybox:1.37
+            image: localhost:5001/busybox:1.37
             command: ["sh", "-c", "echo backup started; sleep 3600"]
 ---
 apiVersion: batch/v1
@@ -902,7 +902,7 @@ spec:
           restartPolicy: Never
           containers:
           - name: backup
-            image: busybox:1.37
+            image: localhost:5001/busybox:1.37
             command: ["sh", "-c", "echo backup started; sleep 3600"]
 ---
 apiVersion: batch/v1
@@ -919,7 +919,7 @@ spec:
           restartPolicy: Never
           containers:
           - name: backup
-            image: busybox:1.37
+            image: localhost:5001/busybox:1.37
             command: ["sh", "-c", "date; echo ok"]
 EOF
 ```
@@ -1076,7 +1076,7 @@ k delete job --all
 
 **Цель.** Увидеть, почему DaemonSet не встаёт на control-plane без toleration, какие tolerations контроллер добавляет сам и что DaemonSet не мешает `cordon`.
 
-**Что понадобится.** Стенд 00-1 с четырьмя узлами (control-plane и три worker'а), namespace `lab-02-4`, образ `busybox:1.37`, около 10 минут.
+**Что понадобится.** Стенд 00-1 с четырьмя узлами (control-plane и три worker'а), namespace `lab-02-4`, образ `localhost:5001/busybox:1.37`, около 10 минут.
 
 **Схема опыта.**
 
@@ -1107,7 +1107,7 @@ spec:
       terminationGracePeriodSeconds: 1
       containers:
       - name: agent
-        image: busybox:1.37
+        image: localhost:5001/busybox:1.37
         command: ["sh", "-c", "echo agent v1 on $NODE; sleep infinity"]
         env: [{name: NODE, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}]
         resources: {requests: {cpu: 10m, memory: 16Mi}}

@@ -1,6 +1,6 @@
 # 04-2. Хранилище: PV, PVC, StorageClass, CSI
 
-> Модуль 04 «Конфигурация и данные» · часть 2 из 3 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд 00-1 (контекст `kind-lab`, StorageClass `standard`), доступ узлов к образу `busybox:1.37`, docker на хосте для лабораторных работ 1, 3 и 4 · Опирается на: 01-2 (kubelet и монтирование), 01-3 (finalizers), 02-3 (PVC у StatefulSet)
+> Модуль 04 «Конфигурация и данные» · часть 2 из 3 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд 00-1 (контекст `kind-lab`, StorageClass `standard`), образ `localhost:5001/busybox:1.37` в реестре стенда (02-1), docker на хосте для лабораторных работ 1, 3 и 4 · Опирается на: 01-2 (kubelet и монтирование), 01-3 (finalizers), 02-3 (PVC у StatefulSet)
 
 ## Где мы на карте
 
@@ -339,7 +339,7 @@ parameters: {iops: "6000", throughput: "200Mi"}
 
 Работы идут на стенде 00-1 в namespace `lab-04-2`, а манифесты подаются через stdin, поэтому каталог `~/lab/k8s/04-2/` создавать не нужно. Конфигурацию хоста и узлов работы не меняют. Но они занимают место на диске узла (работы 1 и 4), закрывают узел для планирования (работа 2) и останавливают узел kind (работа 3). Поэтому у этих работ есть блок «Риски». Лабораторные 1 и 4 заглядывают на диск узла командой `docker exec`, поэтому docker на хосте должен быть доступен.
 
-Узлы тянут образ `busybox:1.37` из Docker Hub. Если он недоступен, положите образ в реестр стенда (02-1) и замените имя на `localhost:5001/busybox:1.37`.
+Образ `localhost:5001/busybox:1.37` общий для стенда: его кладут в реестр командами из подготовки к лабораторным 02-1.
 
 Кластер готовят один раз: выбирают контекст стенда и создают namespace для всех работ.
 
@@ -366,7 +366,7 @@ k() { kubectl -n lab-04-2 "$@"; }
 **Что понадобится.**
 
 - Стенд 00-1 и namespace `lab-04-2` из подготовки.
-- Образ `busybox:1.37`.
+- Образ `localhost:5001/busybox:1.37`.
 - Docker на хосте: работа заглядывает на диск узла.
 
 **Схема опыта.**
@@ -466,7 +466,7 @@ spec:
   terminationGracePeriodSeconds: 1
   containers:
   - name: c
-    image: busybox:1.37
+    image: localhost:5001/busybox:1.37
     command: ["sh", "-c", "echo $(hostname) >> /data/log; sleep infinity"]
     volumeMounts: [{name: d, mountPath: /data}]
   volumes:
@@ -579,7 +579,7 @@ k delete pvc data
 **Что понадобится.**
 
 - Стенд 00-1 и namespace `lab-04-2` из подготовки.
-- Образ `busybox:1.37`.
+- Образ `localhost:5001/busybox:1.37`.
 
 **Схема опыта.**
 
@@ -608,7 +608,7 @@ spec:
   ${2:+nodeName: $2}
   containers:
   - name: c
-    image: busybox:1.37
+    image: localhost:5001/busybox:1.37
     command: ["sh", "-c", "echo \$(hostname) >> /data/log; sleep infinity"]
     volumeMounts: [{name: d, mountPath: /data}]
   volumes:
@@ -704,7 +704,7 @@ spec:
   nodeSelector: {kubernetes.io/hostname: $N2}
   containers:
   - name: c
-    image: busybox:1.37
+    image: localhost:5001/busybox:1.37
     command: ["sleep", "infinity"]
     volumeMounts: [{name: d, mountPath: /data}]
   volumes:
@@ -751,7 +751,7 @@ metadata: {name: moved}
 spec:
   containers:
   - name: c
-    image: busybox:1.37
+    image: localhost:5001/busybox:1.37
     command: ["sleep", "infinity"]
     volumeMounts: [{name: d, mountPath: /data}]
   volumes:
@@ -841,7 +841,7 @@ k delete pvc data rwop
 **Что понадобится.**
 
 - Стенд 00-1 и namespace `lab-04-2` из подготовки.
-- Образ `busybox:1.37`.
+- Образ `localhost:5001/busybox:1.37`.
 - Docker на хосте и терминал, где `docker` работает без sudo.
 - Около 5 минут простоя узла.
 
@@ -892,7 +892,7 @@ spec:
   nodeSelector: {kubernetes.io/hostname: $NODE}
   containers:
   - name: c
-    image: busybox:1.37
+    image: localhost:5001/busybox:1.37
     command: ["sh", "-c", "echo alive > /data/state; sleep infinity"]
     volumeMounts: [{name: d, mountPath: /data}]
   volumes:
@@ -924,7 +924,7 @@ metadata: {name: second}
 spec:
   containers:
   - name: c
-    image: busybox:1.37
+    image: localhost:5001/busybox:1.37
     command: ["sleep", "infinity"]
     volumeMounts: [{name: d, mountPath: /data}]
   volumes:
@@ -1025,7 +1025,7 @@ docker start $NODE 2>/dev/null; kubectl get nodes
 **Что понадобится.**
 
 - Стенд 00-1 и namespace `lab-04-2` из подготовки.
-- Образ `busybox:1.37`.
+- Образ `localhost:5001/busybox:1.37`.
 - Docker на хосте.
 
 **Схема опыта.**
@@ -1058,7 +1058,7 @@ spec:
   terminationGracePeriodSeconds: 1
   containers:
   - name: c
-    image: busybox:1.37
+    image: localhost:5001/busybox:1.37
     command: ["sleep", "infinity"]
     volumeMounts: [{name: d, mountPath: /data}]
   volumes:
@@ -1131,7 +1131,7 @@ spec:
   terminationGracePeriodSeconds: 1
   containers:
   - name: c
-    image: busybox:1.37
+    image: localhost:5001/busybox:1.37
     command: ["sh", "-c", "echo precious > /data/file; sleep infinity"]
     volumeMounts: [{name: d, mountPath: /data}]
   volumes:
@@ -1204,7 +1204,7 @@ spec:
   terminationGracePeriodSeconds: 1
   containers:
   - name: c
-    image: busybox:1.37
+    image: localhost:5001/busybox:1.37
     command: ["sleep", "infinity"]
     volumeMounts: [{name: d, mountPath: /data}]
   volumes:

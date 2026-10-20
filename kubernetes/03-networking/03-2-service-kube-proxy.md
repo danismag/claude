@@ -350,7 +350,7 @@ kubectl get endpointslice -l kubernetes.io/service-name=<svc> -o json | jq -c \
 
 ### Диапазоны ClusterIP: ServiceCIDR
 
-Адреса ClusterIP берутся из диапазона, который задаёт флаг `--service-cluster-ip-range` API-сервера. С версии 1.33 (GA) диапазон хранится в объектах API: **ServiceCIDR** описывает сети, а **IPAddress** фиксирует каждый выданный адрес. Стартовый объект называется `kubernetes`. Если диапазон кончился, администратор добавляет второй объект, и перезапускать kube-apiserver не нужно.
+Адреса ClusterIP берутся из диапазона, который задаёт флаг `--service-cluster-ip-range` API-сервера. С версии 1.33 (GA) диапазон хранится в объектах API: **ServiceCIDR** описывает сети, а **IPAddress** фиксирует каждый выданный адрес. Стартовый объект называется `kubernetes`. Если диапазон кончился, администратор добавляет второй объект, и перезапускать API-сервер не нужно.
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -1232,7 +1232,7 @@ kube-proxy берёт эндпоинты с `serving: true`, пока они п�
 **Риски.** Работа меняет конфигурацию kube-proxy всего кластера стенда.
 
 - **Что меняется:** ConfigMap `kube-proxy` в `kube-system` и режим на четырёх узлах; kube-proxy перезапускается по очереди.
-- **Надолго ли:** на время работы; шаг 5 возвращает режим, уборка проверяет его. Аннотация `last-applied-configuration`, которую добавит `k apply`, останется в ConfigMap; она безвредна.
+- **Надолго ли:** на время работы; шаг 5 возвращает режим, уборка проверяет его. Аннотация `last-applied-configuration`, которую добавит `kubectl apply`, останется в ConfigMap; она безвредна.
 - **Безопасность:** привилегии те же, что у администратора кластера; привилегированных контейнеров нет.
 - **Влияние на систему:** затрагивает все namespace стенда, включая `orders` и вход через Envoy; при перезапуске правила на узле пересобираются секунды, установленные соединения сохраняются в conntrack. Если ядро хоста старше 5.13, kube-proxy в режиме nftables не поднимет правила, и Service перестанут работать во всём кластере до отката.
 - **Откат:** шаг 5; если kube-proxy не стартует, выполните команды шага 5 сразу: они возвращают `mode: iptables` и перезапускают DaemonSet. Проверка — строка `Using iptables Proxier` в журнале kube-proxy.
@@ -1301,7 +1301,7 @@ mode: iptables
 ```bash
 kubectl -n kube-system get cm kube-proxy -o json \
   | jq '.data["config.conf"] |= sub("mode: iptables"; "mode: nftables")' \
-  | k apply -f -
+  | kubectl apply -f -
 kubectl -n kube-system rollout restart ds/kube-proxy
 kubectl -n kube-system rollout status ds/kube-proxy
 kubectl -n kube-system logs ds/kube-proxy | grep -i 'Using'
@@ -1310,7 +1310,7 @@ kubectl -n kube-system logs ds/kube-proxy | grep -i 'Using'
 | Часть команды | Значение |
 |---|---|
 | `jq '… \|= sub(…)'` | заменить строку режима в тексте конфигурации |
-| `k apply -f -` | записать изменённый ConfigMap обратно |
+| `kubectl apply -f -` | записать изменённый ConfigMap обратно |
 | `rollout restart ds/kube-proxy` | перезапустить kube-proxy на всех узлах |
 | `logs ds/kube-proxy` | журнал одного из подов kube-proxy |
 | `grep -i 'Using'` | строка о выбранном режиме |
@@ -1408,7 +1408,7 @@ pod/client condition met
 ```bash
 kubectl -n kube-system get cm kube-proxy -o json \
   | jq '.data["config.conf"] |= sub("mode: nftables"; "mode: iptables")' \
-  | k apply -f -
+  | kubectl apply -f -
 kubectl -n kube-system rollout restart ds/kube-proxy
 kubectl -n kube-system rollout status ds/kube-proxy
 docker exec lab-worker sh -c 'nft list tables | grep kube-proxy; \
