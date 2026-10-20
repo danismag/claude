@@ -247,7 +247,6 @@ kubectl delete clusterissuer selfsigned lab-ca
 helm -n cert-manager uninstall cert-manager
 kubectl delete ns cert-manager
 kubectl get crd -o name | grep cert-manager.io | xargs kubectl delete
-kubectl config set-context --current --namespace=default
 kubectl delete ns lab-03-5 --ignore-not-found
 rm -rf ~/lab/k8s/03-5
 curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders
