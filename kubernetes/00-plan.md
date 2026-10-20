@@ -307,3 +307,86 @@ A шпаргалки (kubectl, Helm, Kustomize, argocd, crictl, etcdctl, kubeadm
 - [x] Способ размещения и проверки практики — вариант А «только текст» (2026-10-19)
 - [ ] Производство всех частей — идёт
 - [ ] Согласование готового курса → слияние в `main`
+
+---
+
+## 9. Навигация
+
+Все части и приложения курса по порядку чтения; заголовок — из файла части.
+
+- [00-1. Стенд курса](00-lab/00-1-stand.md)
+- [00-2. Инструменты](00-lab/00-2-tools.md)
+
+- [Производство курса: статус и как продолжить](00-production/README.md)
+- [Задание писателю приложений курса Kubernetes](00-production/brief-appendix.md)
+- [Задание писателю части модуля 12 «Собеседование»](00-production/brief-interview.md)
+- [Задание ревьюеру модуля курса Kubernetes](00-production/brief-module.md)
+- [Задание ревьюеру части курса Kubernetes](00-production/brief-reviewer.md)
+- [Задание писателю части курса Kubernetes (переработка в новый формат)](00-production/brief-writer.md)
+- [Модуль 01](00-production/module-notes.md)
+- [Исследование охвата курса Kubernetes (2026-10-19)](00-production/research-coverage.md)
+- [Изменения Kubernetes 1.31 → 1.36 и экосистемы для курса (исследование 2026-10-19)](00-production/research-k8s-changes.md)
+- [Инструменты ведущего агента](00-production/tools.md)
+
+- [01-1. Control plane и путь запроса](01-architecture/01-1-control-plane.md)
+- [01-2. Узел: kubelet, CRI, CNI, kube-proxy](01-architecture/01-2-node.md)
+- [01-3. API-объекты и kubectl под капотом](01-architecture/01-3-api-objects.md)
+
+- [02-1. Pod](02-workloads/02-1-pod.md)
+- [02-2. Deployment и стратегии выкатки](02-workloads/02-2-deployment.md)
+- [02-3. StatefulSet](02-workloads/02-3-statefulset.md)
+- [02-4. DaemonSet, Job, CronJob](02-workloads/02-4-daemonset-job-cronjob.md)
+- [02-5. Probes и завершение пода](02-workloads/02-5-probes-shutdown.md)
+
+- [03-1. Сеть подов и CNI](03-networking/03-1-pod-network-cni.md)
+- [03-2. Service и kube-proxy](03-networking/03-2-service-kube-proxy.md)
+- [03-3. DNS в кластере](03-networking/03-3-dns.md)
+- [03-4. Gateway API](03-networking/03-4-gateway-api.md)
+- [03-5. TLS и миграция с Ingress](03-networking/03-5-tls-ingress-migration.md)
+- [03-6. NetworkPolicy](03-networking/03-6-networkpolicy.md)
+
+- [04-1. ConfigMap и Secret](04-config-storage/04-1-configmap-secret.md)
+- [04-2. Хранилище: PV, PVC, StorageClass, CSI](04-config-storage/04-2-storage.md)
+- [04-3. Бэкап и восстановление данных](04-config-storage/04-3-backup-restore.md)
+
+- [05-1. CPU, память и QoS](05-resources-scheduling/05-1-cpu-memory-qos.md)
+- [05-2. Ресурсы пода и квоты](05-resources-scheduling/05-2-pod-resources-quotas.md)
+- [05-3. Планировщик](05-resources-scheduling/05-3-scheduler.md)
+- [05-4. Автомасштабирование](05-resources-scheduling/05-4-autoscaling.md)
+- [05-5. Прерывания и выселение](05-resources-scheduling/05-5-disruptions-eviction.md)
+
+- [06-1. Аутентификация и RBAC](06-access-security/06-1-authn-rbac.md)
+- [06-2. Изоляция контейнера](06-access-security/06-2-container-isolation.md)
+- [06-3. Pod Security и admission-политики](06-access-security/06-3-pod-security-admission.md)
+- [06-4. Аудит и политика образов](06-access-security/06-4-audit-image-policy.md)
+
+- [07-1. Helm: чарты и релизы](07-packaging/07-1-helm.md)
+- [07-2. Чужие чарты](07-packaging/07-2-helm-third-party.md)
+- [07-3. Kustomize](07-packaging/07-3-kustomize.md)
+
+- [08-1. Argo CD](08-gitops/08-1-argocd.md)
+- [08-2. GitOps в масштабе](08-gitops/08-2-gitops-at-scale.md)
+
+- [09-1. CRD и операторы](09-extending/09-1-crd-operators.md)
+- [09-2. Admission webhooks и finalizers](09-extending/09-2-webhooks-finalizers.md)
+
+- [10-1. Сборка кластера: kubeadm, PKI, TLS bootstrap, HA control plane](10-cluster-ops/10-1-cluster-build.md)
+- [10-2. etcd](10-cluster-ops/10-2-etcd.md)
+- [10-3. Обновление кластера](10-cluster-ops/10-3-cluster-upgrade.md)
+- [10-4. Сертификаты и обслуживание узлов](10-cluster-ops/10-4-certs-node-maintenance.md)
+
+- [11-1. Наблюдаемость кластера](11-troubleshooting/11-1-cluster-observability.md)
+- [11-2. Под не работает](11-troubleshooting/11-2-pod-not-working.md)
+- [11-3. Сеть и DNS по слоям](11-troubleshooting/11-3-network-dns.md)
+- [11-4. Узел и control plane](11-troubleshooting/11-4-node-control-plane.md)
+
+- [12-1. Банк вопросов](12-interview/12-1-question-bank.md)
+- [12-2. Тренажёры «сломай и почини»](12-interview/12-2-break-fix-trainers.md)
+- [12-3. System design на Kubernetes](12-interview/12-3-system-design.md)
+- [12-4. Матрица самопроверки, план повторения, контрольная](12-interview/12-4-self-check-matrix.md)
+
+- [Приложение A. Шпаргалки](appendix/A-cheatsheets.md)
+- [Приложение B. Manjaro и Ubuntu](appendix/B-manjaro-vs-ubuntu.md)
+- [Приложение C. Стенд и расширения](appendix/C-lab-stand.md)
+- [Приложение D. Глоссарий RU/EN](appendix/D-glossary.md)
+- [Приложение E. Что читать](appendix/E-reading-list.md)
