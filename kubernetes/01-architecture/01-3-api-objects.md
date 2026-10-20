@@ -330,14 +330,14 @@ kubectl get cm <имя> -o jsonpath='{.metadata.deletionTimestamp} {.metadata.fi
 
 ## Лабораторные работы
 
-Работы идут на стенде 00-1 в namespace `lab-01-3`, а файлы лежат в `~/lab/k8s/01-3`. На хосте меняется только namespace по умолчанию у контекста `kind-lab` в `~/.kube/config`, и уборка последней работы его возвращает. Namespace `orders` работы читают, но не меняют. Образ `busybox:1.37` узлы тянут из Docker Hub; если он недоступен, положите его в реестр стенда по схеме из начала лабораторных работ 00-2 под именем `localhost:5001/lab-01-3/busybox:1.37`.
+Работы идут на стенде 00-1 в namespace `lab-01-3`, а файлы лежат в `~/lab/k8s/01-3`. Хост не меняется: контекст `kind-lab` и `~/.kube/config` остаются прежними, а namespace работ задаёт функция `k`. Namespace `orders` работы читают, но не меняют. Образ `busybox:1.37` узлы тянут из Docker Hub; если он недоступен, положите его в реестр стенда по схеме из начала лабораторных работ 00-2 под именем `localhost:5001/lab-01-3/busybox:1.37`.
 
 Подготовку выполните один раз перед первой работой.
 
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-01-3
-kubectl config set-context --current --namespace=lab-01-3
+k() { kubectl -n lab-01-3 "$@"; }
 mkdir -p ~/lab/k8s/01-3 && cd ~/lab/k8s/01-3
 ```
 
@@ -345,15 +345,17 @@ mkdir -p ~/lab/k8s/01-3 && cd ~/lab/k8s/01-3
 
 1. `use-context kind-lab` выбирает кластер стенда.
 2. `create ns lab-01-3` создаёт namespace для работ.
-3. `set-context --current --namespace=lab-01-3` делает его текущим для kubectl.
+3. `k() { kubectl -n lab-01-3 "$@"; }` определяет **функцию shell** (shell function) `k`: она запускает `kubectl -n lab-01-3` и передаёт ей остальные аргументы.
 4. `mkdir -p … && cd …` создаёт рабочий каталог и переходит в него.
+
+Функция живёт только в этом терминале, поэтому в новом терминале определите её снова.
 
 ### Лабораторная работа 1. Client-side и server-side apply, конфликт владельцев
 
-**Риски.** Работа меняет кластер стенда и одну настройку kubectl на хосте.
+**Риски.** Работа меняет только кластер стенда.
 
-- **Что меняется:** создаются Deployment `api`, `api2`, `shop` и HPA `shop` в `lab-01-3`; в `~/.kube/config` меняется namespace по умолчанию (подготовка выше).
-- **Надолго ли:** до уборки; namespace по умолчанию возвращает уборка работы 3.
+- **Что меняется:** создаются Deployment `api`, `api2`, `shop` и HPA `shop` в `lab-01-3`; `~/.kube/config` не меняется.
+- **Надолго ли:** до уборки; функцию `k` и namespace удаляет уборка работы 3.
 - **Безопасность:** привилегий не нужно, образ `busybox:1.37`.
 - **Влияние на систему:** до 12 подов `sleep` на стенде, нагрузка ничтожна; другие namespace не затрагиваются.
 - **Откат:** уборка в конце работы.
@@ -366,7 +368,7 @@ mkdir -p ~/lab/k8s/01-3 && cd ~/lab/k8s/01-3
 
 ```
 Шаг 1: apply (3) ─► scale (5) ─► apply (3)         файл побеждает
-Шаг 2: SSA kubectl (3) ─► SSA hpa-like (4)         конфликт ─► --force-conflicts
+Шаг 2: SSA kubectl (3) ─► SSA hpa-like (4)  конфликт ─► --force-conflicts
 Шаг 3: убрать replicas из манифеста                отказ от поля: 1 или остаётся 4
 Шаг 4: apply Deployment shop + HPA (min 3)         apply без изменений роняет поды
 Шаг 5: SSA без replicas                            поле у HPA, apply его не трогает
@@ -391,12 +393,12 @@ spec:
     spec:
       containers: [{name: web, image: busybox:1.37, command: ["sleep","infinity"]}]
 EOF
-kubectl apply -f d1.yaml
-kubectl scale deploy api --replicas=5
-kubectl get deploy api -o jsonpath='after scale: {.spec.replicas}{"\n"}'
-kubectl apply -f d1.yaml
-kubectl get deploy api -o jsonpath='after re-apply: {.spec.replicas}{"\n"}'
-kubectl get deploy api \
+k apply -f d1.yaml
+k scale deploy api --replicas=5
+k get deploy api -o jsonpath='after scale: {.spec.replicas}{"\n"}'
+k apply -f d1.yaml
+k get deploy api -o jsonpath='after re-apply: {.spec.replicas}{"\n"}'
+k get deploy api \
   -o jsonpath='{.metadata.annotations.kubectl\.kubernetes\.io/last-applied-configuration}' \
   | cut -c1-120 | fold -w 60; echo
 ```
@@ -433,8 +435,8 @@ otations":{},"name":"api","namespace":"lab-01-3"},"spec":{"r
 ```bash
 sed 's/name: api,/name: api2,/; s/app: api/app: api2/g' d1.yaml > d2.yaml
 sed 's/replicas: 3/replicas: 4/' d2.yaml > d2b.yaml
-kubectl apply --server-side -f d2.yaml
-kubectl apply --server-side --field-manager=hpa-like -f d2b.yaml
+k apply --server-side -f d2.yaml
+k apply --server-side --field-manager=hpa-like -f d2b.yaml
 ```
 
 | Часть команды | Значение |
@@ -466,8 +468,8 @@ are the ways you can resolve this warning:
 Теперь второй менеджер забирает поле силой, а мы смотрим, как изменились владельцы.
 
 ```bash
-kubectl apply --server-side --field-manager=hpa-like --force-conflicts -f d2b.yaml
-kubectl get deploy api2 -o json --show-managed-fields \
+k apply --server-side --field-manager=hpa-like --force-conflicts -f d2b.yaml
+k get deploy api2 -o json --show-managed-fields \
   | jq -c '.metadata.managedFields[]
       | {manager, operation, spec: (.fieldsV1."f:spec" // {} | keys)}'
 ```
@@ -498,8 +500,8 @@ kubectl get deploy api2 -o json --show-managed-fields \
 
 ```bash
 grep -v replicas d2.yaml > d2c.yaml
-kubectl apply --server-side -f d2c.yaml
-kubectl get deploy api2 -o jsonpath='replicas={.spec.replicas}{"\n"}'
+k apply --server-side -f d2c.yaml
+k get deploy api2 -o jsonpath='replicas={.spec.replicas}{"\n"}'
 ```
 
 | Часть команды | Значение |
@@ -549,10 +551,10 @@ spec:
   - type: Resource
     resource: {name: cpu, target: {type: Utilization, averageUtilization: 80}}
 EOF
-kubectl apply -f hpa.yaml
-until [ "$(kubectl get deploy shop -o jsonpath='{.spec.replicas}')" = 3 ]; do sleep 2; done
+k apply -f hpa.yaml
+until [ "$(k get deploy shop -o jsonpath='{.spec.replicas}')" = 3 ]; do sleep 2; done
 echo "HPA set replicas=3"
-kubectl get deploy shop --show-managed-fields -o json \
+k get deploy shop --show-managed-fields -o json \
   | jq -c '.metadata.managedFields[] | {manager, operation, subresource}'
 ```
 
@@ -581,14 +583,14 @@ HPA set replicas=3
 Теперь применяем тот же файл без единой правки и следим за числом реплик.
 
 ```bash
-t0=$(date +%s); kubectl apply -f hpa.yaml
+t0=$(date +%s); k apply -f hpa.yaml
 for i in $(seq 1 25); do
-  r=$(kubectl get deploy shop -o jsonpath='{.spec.replicas}/{.status.replicas}')
+  r=$(k get deploy shop -o jsonpath='{.spec.replicas}/{.status.replicas}')
   echo "t=+$(( $(date +%s)-t0 ))s spec/status=$r"
   [ "${r%/*}" = 3 ] && [ $i -gt 1 ] && break
   sleep 2
 done
-kubectl get events --field-selector involvedObject.name=shop \
+k get events --field-selector involvedObject.name=shop \
   --sort-by=.lastTimestamp -o custom-columns=REASON:.reason,MSG:.message | tail -4
 ```
 
@@ -629,10 +631,10 @@ ScalingReplicaSet   Scaled up replica set shop-5bcf84c5cb from 1 to 3
 
 ```bash
 sed -i '/replicas: 1/d' hpa.yaml
-kubectl apply --server-side --force-conflicts -f hpa.yaml
-kubectl apply --server-side -f hpa.yaml
-kubectl get deploy shop -o jsonpath='{.spec.replicas}{"\n"}'
-kubectl get deploy shop --show-managed-fields -o json \
+k apply --server-side --force-conflicts -f hpa.yaml
+k apply --server-side -f hpa.yaml
+k get deploy shop -o jsonpath='{.spec.replicas}{"\n"}'
+k get deploy shop --show-managed-fields -o json \
   | jq -c '.metadata.managedFields[]
       | {manager, subresource, replicas: (.fieldsV1."f:spec"."f:replicas" != null)}'
 ```
@@ -674,8 +676,8 @@ kubectl get deploy shop --show-managed-fields -o json \
 **Уборка.**
 
 ```bash
-kubectl delete deploy api api2 shop
-kubectl delete hpa shop
+k delete deploy api api2 shop
+k delete hpa shop
 rm -f d1.yaml d2.yaml d2b.yaml d2c.yaml hpa.yaml
 ```
 
@@ -732,8 +734,8 @@ spec:
     spec:
       containers: [{name: web, image: busybox:1.37, command: ["sleep","infinity"]}]
 EOF
-kubectl apply -f d1.yaml && kubectl rollout status deploy/api
-kubectl get pods -l app=api -o jsonpath='{.items[0].metadata.ownerReferences}' | jq .
+k apply -f d1.yaml && k rollout status deploy/api
+k get pods -l app=api -o jsonpath='{.items[0].metadata.ownerReferences}' | jq .
 ```
 
 | Часть команды | Значение |
@@ -769,9 +771,9 @@ kubectl get pods -l app=api -o jsonpath='{.items[0].metadata.ownerReferences}' |
 Удаляем Deployment, но оставляем зависимые объекты.
 
 ```bash
-kubectl delete deploy api --cascade=orphan
-kubectl get deploy,rs,pods -l app=api
-kubectl get rs -l app=api -o jsonpath='rs ownerRefs="{.items[0].metadata.ownerReferences}"{"\n"}'
+k delete deploy api --cascade=orphan
+k get deploy,rs,pods -l app=api
+k get rs -l app=api -o jsonpath='rs ownerRefs="{.items[0].metadata.ownerReferences}"{"\n"}'
 ```
 
 | Часть команды | Значение |
@@ -801,11 +803,11 @@ rs ownerRefs=""
 Теперь удаляем сироту-ReplicaSet в режиме foreground и сразу смотрим на него.
 
 ```bash
-kubectl delete rs -l app=api --cascade=foreground --wait=false
+k delete rs -l app=api --cascade=foreground --wait=false
 j='finalizers={.items[0].metadata.finalizers}'
 j+=' deletionTimestamp={.items[0].metadata.deletionTimestamp}{"\n"}'
-kubectl get rs -l app=api -o jsonpath="$j"
-kubectl get pods -l app=api
+k get rs -l app=api -o jsonpath="$j"
+k get pods -l app=api
 ```
 
 | Часть команды | Значение |
@@ -832,7 +834,7 @@ api-756bbf9595-d2dmn   1/1   Terminating   0     3s
 Конец каскада проверим через 40 секунд. Поды уходят около 30 с: `sleep` в роли PID 1 игнорирует SIGTERM, и kubelet ждёт `terminationGracePeriodSeconds` (30 с) до SIGKILL (02-5).
 
 ```bash
-sleep 40; kubectl get rs,pods -l app=api
+sleep 40; k get rs,pods -l app=api
 ```
 
 Результат (ожидаемый):
@@ -852,7 +854,7 @@ No resources found in lab-01-3 namespace.
 **Уборка.**
 
 ```bash
-kubectl delete deploy,rs -l app=api --ignore-not-found
+k delete deploy,rs -l app=api --ignore-not-found
 rm -f d1.yaml
 ```
 
@@ -894,12 +896,12 @@ rm -f d1.yaml
 Команды создают ConfigMap, вешают на него finalizer и удаляют объект, не дожидаясь конца удаления.
 
 ```bash
-kubectl create cm guarded --from-literal=a=1
-kubectl patch cm guarded -p '{"metadata":{"finalizers":["example.com/cleanup"]}}'
-kubectl delete cm guarded --wait=false
+k create cm guarded --from-literal=a=1
+k patch cm guarded -p '{"metadata":{"finalizers":["example.com/cleanup"]}}'
+k delete cm guarded --wait=false
 j='deletionTimestamp={.metadata.deletionTimestamp}'
 j+=' finalizers={.metadata.finalizers}{"\n"}'
-kubectl get cm guarded -o jsonpath="$j"
+k get cm guarded -o jsonpath="$j"
 ```
 
 | Часть команды | Значение |
@@ -924,8 +926,8 @@ deletionTimestamp=2026-10-14T08:56:22Z finalizers=["example.com/cleanup"]
 Снимаем finalizer вручную, как делают, когда владелец finalizer'а недоступен, а внешних ресурсов за объектом нет.
 
 ```bash
-kubectl patch cm guarded --type=json -p '[{"op":"remove","path":"/metadata/finalizers"}]'
-kubectl get cm guarded
+k patch cm guarded --type=json -p '[{"op":"remove","path":"/metadata/finalizers"}]'
+k get cm guarded
 ```
 
 | Часть команды | Значение |
@@ -948,10 +950,10 @@ Error from server (NotFound): configmaps "guarded" not found
 Команды создают Deployment с четырьмя репликами, пытаются изменить его `status` обычным patch и читают подресурс `scale`.
 
 ```bash
-kubectl create deployment api2 --image=busybox:1.37 --replicas=4 -- sleep infinity
-kubectl rollout status deploy/api2
-kubectl patch deploy api2 -p '{"status":{"replicas":99}}'
-kubectl get deploy api2 -o jsonpath='status.replicas={.status.replicas}{"\n"}'
+k create deployment api2 --image=busybox:1.37 --replicas=4 -- sleep infinity
+k rollout status deploy/api2
+k patch deploy api2 -p '{"status":{"replicas":99}}'
+k get deploy api2 -o jsonpath='status.replicas={.status.replicas}{"\n"}'
 kubectl get --raw /apis/apps/v1/namespaces/lab-01-3/deployments/api2/scale \
   | jq -c '{kind, spec, status}'
 ```
@@ -1025,17 +1027,17 @@ Warning: v1 Endpoints is deprecated in v1.33+; use discovery.k8s.io/v1 EndpointS
 | Scale — отдельный адрес для масштабирования | шаг 2, объект `Scale` |
 | Сервер предупреждает об устаревших API и считает их | шаг 3, `Warning` и метрика |
 
-**Уборка.** Удаляем Deployment, файлы и namespace, возвращаем текущий namespace kubectl по умолчанию.
+**Уборка.** Удаляем Deployment, файлы и namespace, а затем функцию `k`.
 
 ```bash
-kubectl delete deploy api2 --ignore-not-found
+k delete deploy api2 --ignore-not-found
 cd ~ && rmdir ~/lab/k8s/01-3
-kubectl config set-context --current --namespace=default
 kubectl delete ns lab-01-3
 kubectl get ns lab-01-3
+unset -f k
 ```
 
-Первая команда удаляет Deployment, а вторая — рабочий каталог; `rmdir` откажется удалять каталог, если в нём остались файлы. Третья возвращает namespace по умолчанию, четвёртая удаляет `lab-01-3`. Удаление namespace ждёт завершения подов, поэтому может занять около 30 с, как в работе 2. Последняя команда должна ответить `NotFound`.
+Первая команда удаляет Deployment, а вторая — рабочий каталог; `rmdir` откажется удалять каталог, если в нём остались файлы. Третья удаляет `lab-01-3`. Удаление namespace ждёт завершения подов, поэтому может занять около 30 с, как в работе 2. Четвёртая команда должна ответить `NotFound`, а пятая удаляет функцию `k`.
 
 **Вопросы для самопроверки.**
 

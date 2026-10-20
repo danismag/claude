@@ -425,7 +425,7 @@ kube-scheduler                         lab-control-plane_c3379c1d-162c-49c2-b7c5
 
 ## Лабораторные работы
 
-Работы идут на стенде 00-1 в namespace `lab-01-1`, а файлы работ лежат в `~/lab/k8s/01-1/`. Единственное изменение хоста — namespace по умолчанию текущего контекста в `~/.kube/config`: его возвращает уборка последней работы. Работа 3 меняет узел control plane и начинается блоком «Риски».
+Работы идут на стенде 00-1 в namespace `lab-01-1`, а файлы работ лежат в `~/lab/k8s/01-1/`. Хост не меняется: контекст kubectl и `~/.kube/config` остаются прежними, а namespace работ задаёт функция `k`. Работа 3 меняет узел control plane и начинается блоком «Риски».
 
 Образ `busybox:1.37` узлы тянут из Docker Hub. Если он недоступен, положите образ в реестр стенда по схеме из начала лабораторных работ 00-2: он получит имя `localhost:5001/lab-01-1/busybox:1.37`, и его подставляют в команды.
 
@@ -434,11 +434,11 @@ kube-scheduler                         lab-control-plane_c3379c1d-162c-49c2-b7c5
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-01-1
-kubectl config set-context --current --namespace=lab-01-1
+k() { kubectl -n lab-01-1 "$@"; }
 mkdir -p ~/lab/k8s/01-1
 ```
 
-Первая команда выбирает кластер стенда, вторая создаёт namespace, третья делает его текущим для kubectl, а четвёртая создаёт каталог для файлов. Namespace удаляется в уборке работы 3.
+Первая команда выбирает кластер стенда, вторая создаёт namespace, третья определяет **функцию shell** (shell function) `k`: она запускает `kubectl -n lab-01-1` и передаёт ей остальные аргументы. Четвёртая команда создаёт каталог для файлов. Функция живёт только в этом терминале, поэтому в новом терминале определите её снова. Namespace и функция удаляются в уборке работы 3.
 
 ### Лабораторная работа 1. Объект в etcd и resourceVersion, 409 Conflict
 
@@ -467,10 +467,10 @@ kubectl apply ──► apiserver ──► etcd:  /registry/configmaps/lab-01-1
 
 ```bash
 cd ~/lab/k8s/01-1
-kubectl create configmap demo2 --from-literal=color=blue --dry-run=client -o yaml > cm2.yaml
-kubectl apply -f cm2.yaml -v=6 2>&1 | grep '"Response"' | grep configmaps
+k create configmap demo2 --from-literal=color=blue --dry-run=client -o yaml > cm2.yaml
+k apply -f cm2.yaml -v=6 2>&1 | grep '"Response"' | grep configmaps
 sed -i 's/blue/red/' cm2.yaml
-kubectl apply -f cm2.yaml -v=6 2>&1 | grep '"Response"' | grep configmaps
+k apply -f cm2.yaml -v=6 2>&1 | grep '"Response"' | grep configmaps
 ```
 
 | Часть команды | Значение |
@@ -504,8 +504,8 @@ kubectl apply -f cm2.yaml -v=6 2>&1 | grep '"Response"' | grep configmaps
 Команды создают ConfigMap `demo` и читают его `resourceVersion` и `uid`.
 
 ```bash
-kubectl create configmap demo --from-literal=color=blue
-kubectl get cm demo -o jsonpath='rv={.metadata.resourceVersion} uid={.metadata.uid}{"\n"}'
+k create configmap demo --from-literal=color=blue
+k get cm demo -o jsonpath='rv={.metadata.resourceVersion} uid={.metadata.uid}{"\n"}'
 ```
 
 | Часть команды | Значение |
@@ -571,8 +571,8 @@ kubectl -n kube-system exec etcd-lab-control-plane -- $E \
 Команды меняют значение и снова читают версию из API и из etcd.
 
 ```bash
-kubectl patch cm demo -p '{"data":{"color":"green"}}'
-kubectl get cm demo -o jsonpath='rv={.metadata.resourceVersion}{"\n"}'
+k patch cm demo -p '{"data":{"color":"green"}}'
+k get cm demo -o jsonpath='rv={.metadata.resourceVersion}{"\n"}'
 kubectl -n kube-system exec etcd-lab-control-plane -- $E \
   get /registry/configmaps/lab-01-1/demo -w json | jq -c '.kvs[0] | {mod_revision, version}'
 ```
@@ -638,10 +638,10 @@ kubectl -n kube-system exec etcd-lab-control-plane -- $E \
 
 ```bash
 cd ~/lab/k8s/01-1
-kubectl get cm demo -o yaml > cm-old.yaml
-kubectl patch cm demo -p '{"data":{"color":"red"}}'
+k get cm demo -o yaml > cm-old.yaml
+k patch cm demo -p '{"data":{"color":"red"}}'
 sed -i 's/color: green/color: yellow/' cm-old.yaml
-kubectl replace -f cm-old.yaml
+k replace -f cm-old.yaml
 ```
 
 | Часть команды | Значение |
@@ -679,7 +679,7 @@ to the latest version and try again
 **Уборка.**
 
 ```bash
-kubectl delete cm demo demo2
+k delete cm demo demo2
 rm -f ~/lab/k8s/01-1/cm2.yaml ~/lab/k8s/01-1/cm-old.yaml
 ```
 
@@ -726,15 +726,15 @@ rm -f ~/lab/k8s/01-1/cm2.yaml ~/lab/k8s/01-1/cm-old.yaml
 
 ```bash
 cd ~/lab/k8s/01-1
-kubectl create configmap demo --from-literal=color=blue
-RV=$(kubectl get cm demo -o jsonpath='{.metadata.resourceVersion}')
+k create configmap demo --from-literal=color=blue
+RV=$(k get cm demo -o jsonpath='{.metadata.resourceVersion}')
 kubectl get --raw \
   "/api/v1/namespaces/lab-01-1/configmaps?watch=1&resourceVersion=$RV&timeoutSeconds=10" \
   > watch.json &
 echo $! > watch.pid
 sleep 1
-kubectl patch cm demo -p '{"data":{"color":"black"}}'
-kubectl delete cm demo
+k patch cm demo -p '{"data":{"color":"black"}}'
+k delete cm demo
 wait $(cat watch.pid)
 jq -r '"\(.type) \(.object.metadata.name) rv=\(.object.metadata.resourceVersion) \(.object.data)"' \
   watch.json
@@ -798,19 +798,19 @@ kubectl get --raw \
 Команды создают под, ждут готовности и читают время условий, менеджеров полей и флаги API-сервера. Файл манифеста читается внутри узла, и в нём ничего не меняется.
 
 ```bash
-kubectl run timing --image=busybox:1.37 --restart=Never -- sleep 3600
-kubectl wait --for=condition=Ready pod/timing
+k run timing --image=busybox:1.37 --restart=Never -- sleep 3600
+k wait --for=condition=Ready pod/timing
 T='created={.metadata.creationTimestamp}{"\n"}'
 T+='{range .status.conditions[*]}{.type}={.lastTransitionTime}{"\n"}{end}'
-kubectl get pod timing -o jsonpath="$T"
-kubectl get pod timing -o jsonpath='{.metadata.managedFields[*].manager}{"\n"}'
+k get pod timing -o jsonpath="$T"
+k get pod timing -o jsonpath='{.metadata.managedFields[*].manager}{"\n"}'
 docker exec lab-control-plane grep -E 'enable-admission|authorization-mode|etcd-servers' \
   /etc/kubernetes/manifests/kube-apiserver.yaml
 ```
 
 | Часть команды | Значение |
 |---|---|
-| `kubectl run timing --restart=Never` | одиночный под без контроллера |
+| `k run timing --restart=Never` | одиночный под без контроллера |
 | `-- sleep 3600` | держать под живым час |
 | `wait --for=condition=Ready` | ждать условия `Ready` |
 | `range .status.conditions[*]` | перебрать условия пода |
@@ -854,7 +854,7 @@ kubectl-run kubelet
 **Уборка.**
 
 ```bash
-kubectl delete pod timing --wait=false
+k delete pod timing --wait=false
 rm -f ~/lab/k8s/01-1/watch.json ~/lab/k8s/01-1/watch.pid
 ```
 
@@ -914,10 +914,10 @@ lab-control-plane:/etc/kubernetes/manifests/  ──mv──►  /root/     (и 
 docker exec lab-control-plane ls /etc/kubernetes/manifests
 docker exec lab-control-plane mv /etc/kubernetes/manifests/kube-scheduler.yaml /root/
 sleep 10
-kubectl create deploy web --image=busybox:1.37 --replicas=2 -- sleep infinity
+k create deploy web --image=busybox:1.37 --replicas=2 -- sleep infinity
 sleep 15
-kubectl get pods -o wide
-kubectl get events --sort-by=.lastTimestamp \
+k get pods -o wide
+k get events --sort-by=.lastTimestamp \
   -o custom-columns=OBJ:.involvedObject.name,REASON:.reason,FROM:.source.component
 kubectl -n orders get pods
 ```
@@ -962,7 +962,7 @@ postgres-0                   1/1     Running   1 (6m37s ago)   15m
 
 ```bash
 docker exec lab-control-plane mv /root/kube-scheduler.yaml /etc/kubernetes/manifests/
-kubectl get pods -o wide -w
+k get pods -o wide -w
 ```
 
 | Часть команды | Значение |
@@ -981,10 +981,10 @@ kubectl get pods -o wide -w
 ```bash
 docker exec lab-control-plane mv /etc/kubernetes/manifests/kube-controller-manager.yaml /root/
 sleep 10
-kubectl scale deploy web --replicas=4
-kubectl delete pod $(kubectl get pods -o jsonpath='{.items[0].metadata.name}')
+k scale deploy web --replicas=4
+k delete pod $(k get pods -o jsonpath='{.items[0].metadata.name}')
 sleep 20
-kubectl get deploy,rs,pods
+k get deploy,rs,pods
 ```
 
 | Часть команды | Значение |
@@ -1019,8 +1019,8 @@ pod/web-78bbb77d7c-p5d9f   1/1     Running   0          87s
 ```bash
 SECONDS=0
 docker exec lab-control-plane mv /root/kube-controller-manager.yaml /etc/kubernetes/manifests/
-until [ "$(kubectl get deploy web -o jsonpath='{.status.readyReplicas}')" = 4 ]; do sleep 1; done
-kubectl get deploy web
+until [ "$(k get deploy web -o jsonpath='{.status.readyReplicas}')" = 4 ]; do sleep 1; done
+k get deploy web
 echo "прошло ${SECONDS} с"
 ```
 
@@ -1120,7 +1120,7 @@ CONTAINER       IMAGE         CREATED          STATE     NAME      ATTEMPT  … 
 docker exec lab-control-plane mv /root/kube-apiserver.yaml /etc/kubernetes/manifests/
 until kubectl get --raw /readyz >/dev/null 2>&1; do sleep 1; done
 P=<имя пода из колонки POD>
-for i in 1 2 3; do sleep 10; kubectl get pods --no-headers | grep "$P"; done
+for i in 1 2 3; do sleep 10; k get pods --no-headers | grep "$P"; done
 ```
 
 | Часть команды | Значение |
@@ -1148,15 +1148,15 @@ for i in 1 2 3; do sleep 10; kubectl get pods --no-headers | grep "$P"; done
 | Контейнер перезапускает kubelet без API | шаг 6 |
 | После возврата API status догоняет за секунды | шаг 7 |
 
-**Уборка.** Проверяем, что все четыре манифеста на месте, затем удаляем Deployment, namespace и каталог работы и возвращаем namespace по умолчанию.
+**Уборка.** Проверяем, что все четыре манифеста на месте, затем удаляем Deployment, namespace, каталог работы и функцию `k`.
 
 ```bash
 docker exec lab-control-plane ls /etc/kubernetes/manifests
 docker exec lab-control-plane ls /root
 kubectl get pods -n kube-system -l tier=control-plane
-kubectl delete deploy web
-kubectl config set-context --current --namespace=default
+k delete deploy web
 kubectl delete ns lab-01-1
+unset -f k
 rm -r ~/lab/k8s/01-1
 ```
 

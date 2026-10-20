@@ -374,18 +374,18 @@ cgroup2fs
 
 ## Лабораторные работы
 
-Работы идут на стенде 00-1 в namespace `lab-01-2`. Работы 1 и 2 только читают состояние, а работы 3 и 4 меняют узлы стенда и начинаются с блока «Риски». Хост не меняется, потому что узлы kind — контейнеры Docker; единственное исключение — namespace по умолчанию в `~/.kube/config`, его возвращает уборка последней работы. Файлы с манифестами, если они понадобятся, лежат в `~/lab/k8s/01-2/`. Образ `busybox:1.37` узлы тянут из Docker Hub; если он недоступен, положите его в реестр стенда по схеме из начала лабораторных работ 00-2 под именем `localhost:5001/lab-01-2/busybox:1.37`.
+Работы идут на стенде 00-1 в namespace `lab-01-2`. Работы 1 и 2 только читают состояние, а работы 3 и 4 меняют узлы стенда и начинаются с блока «Риски». Хост не меняется, потому что узлы kind — контейнеры Docker; контекст kubectl и `~/.kube/config` остаются прежними, а namespace работ задаёт функция `k`. Файлы с манифестами, если они понадобятся, лежат в `~/lab/k8s/01-2/`. Образ `busybox:1.37` узлы тянут из Docker Hub; если он недоступен, положите его в реестр стенда по схеме из начала лабораторных работ 00-2 под именем `localhost:5001/lab-01-2/busybox:1.37`.
 
 Подготовка выполняется один раз.
 
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-01-2
-kubectl config set-context --current --namespace=lab-01-2
+k() { kubectl -n lab-01-2 "$@"; }
 kubectl -n orders get pods -o wide
 ```
 
-Первая команда выбирает кластер стенда, вторая создаёт namespace, третья делает его текущим, чтобы не писать `-n lab-01-2`. Четвёртая показывает, на каком узле работает `postgres-0`: в примере это `lab-worker`, а если у вас иначе, подставьте свой узел в работе 4. Namespace удаляется в уборке работы 4.
+Первая команда выбирает кластер стенда, вторая создаёт namespace, третья определяет **функцию shell** (shell function) `k`: она запускает `kubectl -n lab-01-2` и передаёт ей остальные аргументы. Четвёртая показывает, на каком узле работает `postgres-0`: в примере это `lab-worker`, а если у вас иначе, подставьте свой узел в работе 4. Функция живёт только в этом терминале, поэтому в новом терминале определите её снова. Namespace и функция удаляются в уборке работы 4.
 
 ### Лабораторная работа 1. Sandbox, pause и namespaces пода
 
@@ -546,7 +546,7 @@ unset W
 ```
 docker exec lab-worker   → systemd-cgls          (дерево cgroup)
 kubectl get --raw …/configz → jq                 (параметры kubelet с умолчаниями)
-kubectl get lease        → renewTime             (heartbeat, меняется каждые ~10 с)
+kubectl get lease    → renewTime             (heartbeat, меняется каждые ~10 с)
 docker exec lab-worker   → /var/log/containers   (симлинки на логи)
 ```
 
@@ -732,7 +732,7 @@ spec:
     command: ["sleep", "infinity"]
 EOF
 sleep 15
-kubectl get pods -o wide
+k get pods -o wide
 ```
 
 | Часть команды | Значение |
@@ -760,7 +760,7 @@ static-web-lab-worker2   1/1     Running   0          15s   10.244.3.10   lab-wo
 Команда выводит аннотации и владельца зеркального пода.
 
 ```bash
-kubectl get pod static-web-lab-worker2 \
+k get pod static-web-lab-worker2 \
   -o jsonpath='{.metadata.annotations}{"\n"}{.metadata.ownerReferences}{"\n"}'
 ```
 
@@ -788,15 +788,15 @@ kubectl get pod static-web-lab-worker2 \
 Команда удаляет объект пода в API и сразу сверяет контейнер на узле.
 
 ```bash
-kubectl delete pod static-web-lab-worker2
+k delete pod static-web-lab-worker2
 sleep 5
-kubectl get pods
+k get pods
 docker exec lab-worker2 crictl ps --name '^web$'
 ```
 
 | Часть команды | Значение |
 |---|---|
-| `kubectl delete pod …` | удалить зеркальный объект |
+| `k delete pod …` | удалить зеркальный объект |
 | `crictl ps --name '^web$'` | найти контейнер `web` на узле |
 
 Результат (колонки вывода `crictl` сокращены):
@@ -822,7 +822,7 @@ CONTAINER       IMAGE           CREATED          STATE     NAME   ATTEMPT   POD 
 ```bash
 docker exec lab-worker2 rm /etc/kubernetes/manifests/static-web.yaml
 sleep 30
-kubectl get pods
+k get pods
 ```
 
 | Часть команды | Значение |
@@ -904,7 +904,7 @@ t=+353 с поды узла получают deletionTimestamp → Deployment с
 Команда создаёт Deployment из трёх подов, которые по `topologySpreadConstraints` занимают разные worker'ы, и показывает их расположение.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: web}
@@ -922,8 +922,8 @@ spec:
       containers:
       - {name: web, image: busybox:1.37, command: ["sleep", "infinity"]}
 EOF
-kubectl rollout status deploy/web
-kubectl get pods -o wide
+k rollout status deploy/web
+k get pods -o wide
 ```
 
 | Часть команды | Значение |
@@ -954,7 +954,7 @@ docker exec $NODE systemctl stop kubelet; echo "t=0 kubelet stopped on $NODE"
 while [ $(( $(date +%s)-t0 )) -lt 420 ]; do
   n=$(kubectl get node $NODE -o jsonpath="$NJ")
   p=$(kubectl -n orders get pod postgres-0 -o jsonpath="$PJ")
-  w=$(kubectl get pods -o wide --no-headers |
+  w=$(k get pods -o wide --no-headers |
     awk '{printf "%s:%s:%s ", substr($1,length($1)-4), $3, $7}')
   ep=$(kubectl -n orders get endpointslice \
     -l kubernetes.io/service-name=postgres \
@@ -1005,7 +1005,7 @@ t=+353s node=Unknown/NodeStatusUnknown taints=node.kubernetes.io/unreachable
 
 ```bash
 docker exec $NODE crictl ps --name postgres
-kubectl get events --field-selector reason=FailedScheduling \
+k get events --field-selector reason=FailedScheduling \
   -o jsonpath='{.items[-1:].message}{"\n"}'
 ```
 
@@ -1039,7 +1039,7 @@ until [ "$(curl -s -o /dev/null -m 3 -w '%{http_code}' \
   http://orders.localhost:8088/api/orders)" = 200 ]; do sleep 1; done
 echo "api=200 after $(( $(date +%s)-t0 ))s"
 kubectl -n orders get pods -o wide
-kubectl get pods -o wide
+k get pods -o wide
 curl -s http://orders.localhost:8088/api/orders | jq -c '[.orders[].item]'
 ```
 
@@ -1084,12 +1084,12 @@ web-747b449645-5hmqj Running lab-worker
 docker exec $NODE systemctl is-active kubelet
 docker exec lab-worker2 ls /etc/kubernetes/manifests
 kubectl -n orders get pods
-kubectl config set-context --current --namespace=default
 kubectl delete ns lab-01-2
+unset -f k
 unset NODE NJ PJ t0 prev
 ```
 
-Первая команда должна вывести `active`, вторая — ничего, потому что `static-web` удалён в работе 3. Третья показывает поды `orders`, и все они должны быть Running. Остальные команды удаляют namespace вместе с Deployment `web` и переменные.
+Первая команда должна вывести `active`, вторая — ничего, потому что `static-web` удалён в работе 3. Третья показывает поды `orders`, и все они должны быть Running. Остальные команды удаляют namespace вместе с Deployment `web`, функцию `k` и переменные.
 
 **Вопросы для самопроверки.**
 

@@ -188,7 +188,7 @@ kubectl <команда>
 
 **Откуда берёт данные:** адрес и ключи kubectl берёт из kubeconfig, а список типов объектов — из discovery. Сами объекты приходят с API-сервера, который читает их из etcd (01-1), а локально kubectl хранит только кэш discovery.
 
-**Основные команды:** блок сводит команды, которые понадобятся в лабораторных работах, а комментарий в конце строки говорит, что она делает.
+**Основные команды:** блок сводит команды, которые понадобятся в лабораторных работах, а комментарий в конце строки говорит, что она делает. Команда `set-context` дана как справка: в лабораторных курса контекст kubectl не меняют, а namespace задают флагом `-n` или функцией `k`.
 
 ```bash
 kubectl config get-contexts                    # список контекстов; звёздочка — текущий
@@ -290,7 +290,7 @@ diff                     манифест ──► API-сервер (как ser
 
 ### Карточка инструмента: kubectx и kubens
 
-**Назначение:** kubectx переключает контекст, а kubens — namespace по умолчанию. Обе команды короткие, имеют автодополнение и запоминают предыдущее значение. Это та же правка kubeconfig, что делают `config use-context` и `config set-context`, только быстрее.
+**Назначение:** kubectx переключает контекст, а kubens — namespace по умолчанию. Обе команды короткие, имеют автодополнение и запоминают предыдущее значение. Это та же правка kubeconfig, что делают `config use-context` и `config set-context`, только быстрее. В лабораторных курса обе утилиты контекст не меняют: они показывают текущие значения.
 
 **Как работает:** утилиты читают kubeconfig и меняют в нём одно из двух полей.
 
@@ -692,25 +692,25 @@ docker push localhost:5001/lab-00-2/busybox:1.37
 
 Первая команда скачивает образ, вторая даёт ему имя с адресом реестра стенда, а третья загружает его в реестр.
 
-Подготовка ниже выполняется один раз перед первой работой и меняет namespace по умолчанию в `~/.kube/config`.
+Подготовка ниже выполняется один раз перед первой работой. Контекст kubectl и `~/.kube/config` она не меняет: вместо смены namespace по умолчанию определяется функция `k`.
 
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-00-2
-kubectl config set-context --current --namespace=lab-00-2
+k() { kubectl -n lab-00-2 "$@"; }
 mkdir -p ~/lab/k8s/00-2
 ```
 
-Первая команда выбирает кластер стенда, вторая создаёт namespace, а третья делает его текущим, чтобы не писать `-n lab-00-2`. Четвёртая команда создаёт каталог для файлов работ. Namespace удаляет уборка последней, третьей работы.
+Первая команда выбирает кластер стенда, вторая создаёт namespace, а третья определяет **функцию shell** (shell function) `k`: она запускает `kubectl -n lab-00-2` и передаёт ей остальные аргументы. Функция живёт только в этом терминале, поэтому в новом терминале повторите её определение. Четвёртая команда создаёт каталог для файлов работ. Namespace удаляет уборка последней, третьей работы.
 
 ### Лабораторная работа 1. kubectl по-взрослому
 
 **Риски.** Работа меняет настройки вашего kubectl и, на шагах 9 и 10, ставит программы на хост.
 
-- **Что меняется.** Шаги 1–8: namespace по умолчанию текущего контекста в `~/.kube/config` и namespace `lab-00-2` в кластере стенда. Шаги 9–10: бинарники `kubectx`, `kubens` в `/usr/local/bin`, каталог `~/.krew`, строка `PATH` в `~/.bashrc`, плагины kubectl. Шаг 11: файл `~/lab/k8s/00-2/kuberc` и переменная `KUBERC` только в текущем терминале; ваш `~/.kube/kuberc`, если он есть, не меняется.
+- **Что меняется.** Шаги 1–8: namespace `lab-00-2` в кластере стенда и функция `k` в текущем терминале. Шаги 9–10: бинарники `kubectx`, `kubens` в `/usr/local/bin`, каталог `~/.krew`, строка `PATH` в `~/.bashrc`, плагины kubectl. Шаг 11: файл `~/lab/k8s/00-2/kuberc` и переменная `KUBERC` только в текущем терминале; ваш `~/.kube/kuberc`, если он есть, не меняется.
 - **Надолго ли.** До уборки. Установленные программы остаются, пока вы их не удалите.
-- **Безопасность.** Бинарники скачиваются с GitHub: сверьте версию и контрольную сумму с файлом на странице релиза (`checksums.txt` у kubectx, файл `.sha256` рядом с архивом krew). Плагины krew запускаются с вашими правами в кластере. Цель шагов 1–8 — только чтение и пробный запуск, `orders` не меняется.
-- **Влияние на систему.** Другие контексты kubectl не затрагиваются. Правка namespace видна во всех терминалах, пока вы её не вернёте.
+- **Безопасность.** Бинарники скачиваются с GitHub: сверьте версию и контрольную сумму с файлом на странице релиза (`checksums.txt` у kubectx, файл `.sha256` рядом с архивом krew; в нём только сумма без имени архива, поэтому строку для `sha256sum -c` собирают сами, приложение B.3). Плагины krew запускаются с вашими правами в кластере. Цель шагов 1–8 — только чтение и пробный запуск, `orders` не меняется.
+- **Влияние на систему.** Другие контексты kubectl не затрагиваются. Функция `k` видна только в текущем терминале, а `~/.kube/config` не меняется.
 - **Откат.** Блок «Уборка» в конце работы.
 
 **Цель.** Достать нужные поля из объектов, увидеть реальные HTTP-запросы kubectl, отличить пробный запуск на клиенте от запуска на сервере, поставить вспомогательные инструменты и настроить kuberc.
@@ -761,7 +761,6 @@ clusters:
 contexts:
 - context:
     cluster: kind-lab
-    namespace: lab-00-2
     user: kind-lab
   name: kind-lab
 current-context: kind-lab
@@ -787,7 +786,7 @@ Extra: authentication.kubernetes.io/credential-id   [X509SHA256=d6cd0ad7…]
 
 1. `kind-lab` — активный контекст.
 2. В `view` те же три списка, что на схеме 2, а сертификаты и ключ скрыты строкой `DATA+OMITTED`.
-3. Строка `namespace: lab-00-2` — результат подготовки.
+3. Строки `namespace` в контексте нет: namespace по умолчанию остаётся `default`, а работы курса обращаются к `lab-00-2` через `k`.
 4. `Username kubernetes-admin` и группа `kubeadm:cluster-admins` — вы администратор по клиентскому сертификату. В проде так быть не должно (06-1).
 
 #### Шаг 2. Собрать свою таблицу
@@ -954,13 +953,13 @@ kubectl -n orders get deploy orders-api -v=8 2>&1 \
 Команды пробуют создать Deployment с отрицательным числом реплик. Это заведомая ошибка.
 
 ```bash
-kubectl create deploy bad --image=x --replicas=-1 --dry-run=client -o name
-kubectl create deploy bad --image=x --replicas=-1 --dry-run=server
+k create deploy bad --image=x --replicas=-1 --dry-run=client -o name
+k create deploy bad --image=x --replicas=-1 --dry-run=server
 ```
 
 | Часть команды | Значение |
 |---|---|
-| `create deploy bad` | собрать объект Deployment с именем `bad` |
+| `k create deploy bad` | собрать объект Deployment с именем `bad` |
 | `--replicas=-1` | заведомо неверное число реплик |
 | `--dry-run=client` | разобрать и напечатать, не обращаясь к проверкам сервера |
 | `--dry-run=server` | отправить на сервер без сохранения |
@@ -983,7 +982,7 @@ error: … spec.replicas: Invalid value: -1: must be greater than or equal to 0
 1. Режим `client` объект собрал и «одобрил»: проверок сервера он не проходит.
 2. Режим `server` вернул ошибку валидации с полем `spec.replicas` и причиной.
 3. Вывод: CI на `--dry-run=client` ошибку пропустит.
-4. Ничего не создано ни в одном режиме: `kubectl get deploy bad` ответит `NotFound`.
+4. Ничего не создано ни в одном режиме: `k get deploy bad` ответит `NotFound`.
 
 #### Шаг 8. Посмотреть разницу и проверить apply
 
@@ -1064,32 +1063,25 @@ sudo pacman -S kubectx
 | `install -m 0755` | положить файл в `/usr/local/bin` с правом запуска |
 | `rm -rf "$D"` | удалить временный каталог |
 
-Теперь переключим namespace туда и обратно и проверим текущие значения.
+Переключать контекст и namespace мы не будем: в лабораторных курса они не меняются. Команды ниже только показывают текущие значения.
 
 ```bash
 kubectx -c
-kubens orders
 kubens -c
-kubens -
 ```
 
 Ожидаемый результат:
 
 ```
 kind-lab
-Context "kind-lab" modified.
-Active namespace is "orders".
-orders
-Context "kind-lab" modified.
-Active namespace is "lab-00-2".
+default
 ```
 
 Разбор:
 
 1. `kubectx -c` печатает текущий контекст.
-2. `kubens orders` меняет namespace по умолчанию и сообщает об этом.
-3. `kubens -c` подтверждает: namespace теперь `orders`.
-4. `kubens -` возвращает предыдущий namespace `lab-00-2`.
+2. `kubens -c` печатает namespace по умолчанию контекста: пока он не задан, это `default`.
+3. Команда `kubens orders` записала бы `orders` в `~/.kube/config`, а `kubens -` вернула бы прежнее значение. Эти две команды вы запустите на рабочих кластерах сами.
 
 #### Шаг 10. Поставить krew и два плагина
 
@@ -1160,9 +1152,9 @@ aliases:
     default: name
 E
 export KUBERC=~/lab/k8s/00-2/kuberc
-kubectl create configmap kuberc-test --from-literal=a=1
-kubectl getn configmaps
-kubectl delete configmap kuberc-test
+k create configmap kuberc-test --from-literal=a=1
+k getn configmaps
+k delete configmap kuberc-test
 ```
 
 | Часть команды | Значение |
@@ -1203,12 +1195,11 @@ configmap/kuberc-test
 | kubectx и kubens правят общий kubeconfig | шаг 9 |
 | kuberc задаёт алиасы и флаги по умолчанию | шаг 11 |
 
-**Уборка.** Удаляем копию манифеста и файл kuberc, отключаем kuberc и возвращаем текущему контексту namespace `lab-00-2`, который остаётся для работ 2 и 3.
+**Уборка.** Удаляем копию манифеста и файл kuberc, отключаем kuberc. Функция `k` и namespace `lab-00-2` остаются для работ 2 и 3.
 
 ```bash
 rm -f ~/lab/k8s/00-2/orders-api.yaml ~/lab/k8s/00-2/kuberc
 unset KUBERC
-kubectl config set-context --current --namespace=lab-00-2
 ```
 
 Программы с шагов 9 и 10 можно оставить, потому что они пригодятся дальше. Чтобы убрать их в Ubuntu, выполните `sudo rm /usr/local/bin/kubectx /usr/local/bin/kubens` и `rm -rf ~/.krew`. Затем удалите из `~/.bashrc` строку с `.krew`. В Manjaro вместо первой команды выполните `sudo pacman -Rns kubectx krew`, а каталог и строку уберите так же.
@@ -1432,7 +1423,7 @@ unset N ID
 
 **Цель.** Прочитать лог упавшего контейнера, зайти в под без shell и на узел через `kubectl debug`, пробросить порт и посмотреть логи через stern и k9s.
 
-**Что понадобится.** Стенд 00-1 с подами orders-api, namespace `lab-00-2`, образ `busybox:1.37`, интернет для шагов 8 и 9.
+**Что понадобится.** Стенд 00-1 с подами orders-api, namespace `lab-00-2` и функция `k` из подготовки, образ `busybox:1.37`, интернет для шагов 8 и 9.
 
 **Схема опыта.**
 
@@ -1476,15 +1467,15 @@ kubectl -n orders logs -l app=orders-api --prefix --tail=2
 Эту работу вы выполняете сами, результаты в ней — ожидаемые. Команды создают под, который пишет строку и падает, а затем читают лог его предыдущего запуска.
 
 ```bash
-kubectl run crash --image=busybox:1.37 -- sh -c 'echo "run failed: no config"; exit 1'
+k run crash --image=busybox:1.37 -- sh -c 'echo "run failed: no config"; exit 1'
 sleep 40
-kubectl get pod crash
-kubectl logs crash --previous
+k get pod crash
+k logs crash --previous
 ```
 
 | Часть команды | Значение |
 |---|---|
-| `kubectl run crash` | одиночный под с именем `crash` |
+| `k run crash` | одиночный под с именем `crash` |
 | `sh -c '…; exit 1'` | напечатать строку и выйти с ошибкой |
 | `sleep 40` | подождать несколько перезапусков |
 | `logs --previous` | лог предыдущего экземпляра контейнера |
@@ -1586,10 +1577,10 @@ main.py
 Эту работу вы выполняете сами, результаты в ней — ожидаемые. Команды создают копию пода `crash`, у которой команда запуска заменена на `sleep`, и проверяют, что копия жива.
 
 ```bash
-kubectl debug crash --copy-to=crash-dbg --container=crash -- sleep 3600
+k debug crash --copy-to=crash-dbg --container=crash -- sleep 3600
 sleep 5
-kubectl get pod crash crash-dbg
-kubectl exec crash-dbg -- ls /
+k get pod crash crash-dbg
+k exec crash-dbg -- ls /
 ```
 
 | Часть команды | Значение |
@@ -1747,16 +1738,16 @@ k9s --readonly -n orders
 | port-forward к Service не балансирует | шаг 7, один и тот же под |
 | stern и k9s собирают то же, что kubectl, удобнее | шаги 8 и 9 |
 
-**Уборка.** Останавливаем проброс по pid-файлу, удаляем временные поды и под отладки, пересоздаём поды orders-api без ephemeral-контейнера, возвращаем namespace по умолчанию и удаляем namespace работ.
+**Уборка.** Останавливаем проброс по pid-файлу, удаляем временные поды и под отладки, пересоздаём поды orders-api без ephemeral-контейнера, удаляем namespace работ и функцию `k`.
 
 ```bash
 kill $(cat ~/lab/k8s/00-2/pf.pid)
-kubectl delete pod crash crash-dbg --now
+k delete pod crash crash-dbg --now
 kubectl get pods -A | grep node-debugger
 kubectl -n orders rollout restart deploy/orders-api
 kubectl -n orders rollout status deploy/orders-api
-kubectl config set-context --current --namespace=default
 kubectl delete ns lab-00-2
+unset -f k
 rm -rf ~/lab/k8s/00-2
 ```
 
