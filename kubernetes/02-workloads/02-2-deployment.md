@@ -346,12 +346,12 @@ IMAGEID:.status.containerStatuses[0].imageID
 
 Образ клиента `python:3.12-slim` узлы тянут из Docker Hub. Если он недоступен, положите образ в реестр стенда так же, как `busybox` в 02-1, и замените имя в команде `kubectl run`.
 
-Подготовка создаёт namespace, каталог для файлов и два образа в реестре стенда. Образ версии 2.0 — это тот же образ из 00-1 под новым именем, а 2.1 собирается из тех же исходников с другим номером версии.
+Подготовка создаёт namespace, функцию `k` (короткое имя для `kubectl -n lab-02-2`), каталог для файлов и два образа в реестре стенда. Функция живёт только в текущем окне терминала: в новом окне определите её снова. Образ версии 2.0 — это тот же образ из 00-1 под новым именем, а 2.1 собирается из тех же исходников с другим номером версии.
 
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-02-2
-kubectl config set-context --current --namespace=lab-02-2
+k() { kubectl -n lab-02-2 "$@"; }
 mkdir -p ~/lab/k8s/02-2
 
 cd ~/lab/k8s/orders-api
@@ -363,7 +363,7 @@ docker push localhost:5001/lab-02-2/orders-api:2.1
 
 | Часть команды | Значение |
 |---|---|
-| `config set-context --current --namespace=…` | сделать `lab-02-2` текущим namespace |
+| `k() { … }` | короткая команда `kubectl -n lab-02-2`; контекст не меняется |
 | `docker tag … lab-02-2/orders-api:2.0` | дать образу 2.0 имя в префиксе работы |
 | `docker build … --build-arg APP_VERSION=2.1` | собрать версию 2.1 из исходников orders-api |
 | `docker push` | отправить оба образа в реестр стенда |
@@ -435,12 +435,12 @@ window = f"{max(error_times) - min(error_times):.1f}s" if error_times else "0s"
 print(f"requests={total} ok={codes[200]} errors={errors} error_window={window} "
       f"detail={dict(codes)} versions={dict(versions)}")
 EOF
-kubectl run client --image=python:3.12-slim --command -- sleep infinity
-kubectl wait --for=condition=Ready pod/client
-kubectl cp ~/lab/k8s/02-2/load.py client:/tmp/load.py
+k run client --image=python:3.12-slim --command -- sleep infinity
+k wait --for=condition=Ready pod/client
+k cp ~/lab/k8s/02-2/load.py client:/tmp/load.py
 ```
 
-Команда `kubectl run` запускает под-клиент, который ничего не делает, а `kubectl cp` копирует в него скрипт. Каждый запуск `kubectl exec client -- python /tmp/load.py <секунды>` нагружает Service в течение указанного времени и печатает одну итоговую строку.
+Команда `k run` запускает под-клиент, который ничего не делает, а `k cp` копирует в него скрипт. Каждый запуск `k exec client -- python /tmp/load.py <секунды>` нагружает Service в течение указанного времени и печатает одну итоговую строку.
 
 ### Лабораторная работа 1. Плавное обновление и Recreate
 
@@ -464,9 +464,9 @@ kubectl cp ~/lab/k8s/02-2/load.py client:/tmp/load.py
 Команда создаёт Deployment и Service, ждёт готовности подов и запускает пятисекундную нагрузку без выкатки.
 
 ```bash
-kubectl apply -f ~/lab/k8s/02-2/orders.yaml
-kubectl rollout status deploy/orders-api
-kubectl exec client -- python /tmp/load.py 5
+k apply -f ~/lab/k8s/02-2/orders.yaml
+k rollout status deploy/orders-api
+k exec client -- python /tmp/load.py 5
 ```
 
 | Часть команды | Значение |
@@ -495,11 +495,11 @@ requests=940 ok=940 errors=0 … versions={'2.0': 940}
 Команда запускает нагрузку на 40 секунд в фоне, через 3 секунды меняет образ на 2.1 и замеряет время выкатки.
 
 ```bash
-kubectl exec client -- python /tmp/load.py 40 > ~/lab/k8s/02-2/r1.txt &
+k exec client -- python /tmp/load.py 40 > ~/lab/k8s/02-2/r1.txt &
 sleep 3; t0=$(date +%s)
-kubectl set image deploy/orders-api api=localhost:5001/lab-02-2/orders-api:2.1
-kubectl annotate deploy/orders-api kubernetes.io/change-cause="image 2.1" --overwrite
-kubectl rollout status deploy/orders-api
+k set image deploy/orders-api api=localhost:5001/lab-02-2/orders-api:2.1
+k annotate deploy/orders-api kubernetes.io/change-cause="image 2.1" --overwrite
+k rollout status deploy/orders-api
 echo "rollout took $(( $(date +%s) - t0 ))s"
 ```
 
@@ -522,9 +522,9 @@ rollout took 3s
 
 ```bash
 wait; cat ~/lab/k8s/02-2/r1.txt
-kubectl get events --field-selector involvedObject.kind=Deployment \
+k get events --field-selector involvedObject.kind=Deployment \
   --sort-by=.lastTimestamp -o custom-columns=MSG:.message | tail -8
-kubectl get rs -o wide
+k get rs -o wide
 ```
 
 | Часть команды | Значение |
@@ -564,14 +564,14 @@ orders-api-c5cffb4fd   4         4         4       …   localhost:5001/lab-02-2
 Команда переключает стратегию на Recreate, запускает нагрузку на 25 секунд и возвращает образ 2.0.
 
 ```bash
-kubectl patch deploy orders-api \
+k patch deploy orders-api \
   -p '{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}'
-kubectl exec client -- python /tmp/load.py 25 > ~/lab/k8s/02-2/r2.txt &
+k exec client -- python /tmp/load.py 25 > ~/lab/k8s/02-2/r2.txt &
 sleep 3; t0=$(date +%s)
-kubectl set image deploy/orders-api api=localhost:5001/lab-02-2/orders-api:2.0
-kubectl annotate deploy/orders-api --overwrite \
+k set image deploy/orders-api api=localhost:5001/lab-02-2/orders-api:2.0
+k annotate deploy/orders-api --overwrite \
   kubernetes.io/change-cause="image 2.0, Recreate"
-kubectl rollout status deploy/orders-api
+k rollout status deploy/orders-api
 echo "rollout took $(( $(date +%s) - t0 ))s"
 wait; cat ~/lab/k8s/02-2/r2.txt
 ```
@@ -604,14 +604,14 @@ requests=3960 ok=3930 errors=30 error_window=9.7s
 Этот шаг вы выполняете сами, результат в нём ожидаемый. Команда уменьшает число реплик до двух и семь секунд подряд печатает счётчики Deployment, а затем возвращает четыре реплики.
 
 ```bash
-kubectl scale deploy/orders-api --replicas=2
+k scale deploy/orders-api --replicas=2
 for i in 1 2 3 4 5 6 7; do
-  kubectl get deploy orders-api \
+  k get deploy orders-api \
     -o jsonpath='replicas={.status.replicas} terminating={.status.terminatingReplicas}{"\n"}'
   sleep 1
 done
-kubectl scale deploy/orders-api --replicas=4
-kubectl rollout status deploy/orders-api
+k scale deploy/orders-api --replicas=4
+k rollout status deploy/orders-api
 ```
 
 | Часть команды | Значение |
@@ -627,7 +627,7 @@ kubectl rollout status deploy/orders-api
 
 1. `replicas=2` сразу после `scale` — Deployment уже считает только два пода своими.
 2. `terminating=2` — два остановленных пода ещё существуют, потому что отвечают на запросы 5 секунд после SIGTERM.
-3. Без этого поля о таких подах говорит только `kubectl get pods` со статусом `Terminating`.
+3. Без этого поля о таких подах говорит только `k get pods` со статусом `Terminating`.
 
 **Итог.**
 
@@ -676,14 +676,14 @@ Deployment (RollingUpdate 25 %/25 %, progressDeadlineSeconds 30)
 Команда возвращает плавную стратегию с дедлайном 30 секунд, запоминает время и меняет образ на несуществующий тег.
 
 ```bash
-kubectl patch deploy orders-api -p '{"spec":{"progressDeadlineSeconds":30,
+k patch deploy orders-api -p '{"spec":{"progressDeadlineSeconds":30,
   "strategy":{"type":"RollingUpdate","rollingUpdate":{"maxSurge":"25%","maxUnavailable":"25%"}}}}'
-kubectl rollout status deploy/orders-api
+k rollout status deploy/orders-api
 t0=$(date +%s)
-kubectl set image deploy/orders-api api=localhost:5001/lab-02-2/orders-api:2.9
-kubectl annotate deploy/orders-api --overwrite \
+k set image deploy/orders-api api=localhost:5001/lab-02-2/orders-api:2.9
+k annotate deploy/orders-api --overwrite \
   kubernetes.io/change-cause="image 2.9 (нет такого тега)"
-kubectl rollout status deploy/orders-api --timeout=120s
+k rollout status deploy/orders-api --timeout=120s
 echo "rollout status exit=$? after $(( $(date +%s) - t0 ))s"
 ```
 
@@ -716,11 +716,11 @@ rollout status exit=1 after 32s
 Команды показывают Deployment, поды и условия, а затем проверяют, отвечает ли сервис.
 
 ```bash
-kubectl get deploy orders-api
-kubectl get pods -L pod-template-hash
-kubectl get deploy orders-api \
+k get deploy orders-api
+k get pods -L pod-template-hash
+k get deploy orders-api \
   -o jsonpath='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
-kubectl exec client -- python /tmp/load.py 5
+k exec client -- python /tmp/load.py 5
 ```
 
 | Часть команды | Значение |
@@ -762,11 +762,11 @@ Progressing=False ProgressDeadlineExceeded: ReplicaSet "orders-api-5fbc95fb6" ha
 Команды показывают историю, откатывают на предыдущую ревизию и проверяют образ.
 
 ```bash
-kubectl rollout history deploy/orders-api
-kubectl rollout undo deploy/orders-api
-kubectl rollout status deploy/orders-api
-kubectl rollout history deploy/orders-api
-kubectl get deploy orders-api -o jsonpath='image={.spec.template.spec.containers[0].image}{"\n"}'
+k rollout history deploy/orders-api
+k rollout undo deploy/orders-api
+k rollout status deploy/orders-api
+k rollout history deploy/orders-api
+k get deploy orders-api -o jsonpath='image={.spec.template.spec.containers[0].image}{"\n"}'
 ```
 
 | Часть команды | Значение |
@@ -851,12 +851,12 @@ surge 0 + unavailable 0                                  ─► ошибка в�
 Команда задаёт `minReadySeconds: 10` и строгие параметры surge 1 и unavailable 0, затем меняет образ и замеряет время.
 
 ```bash
-kubectl patch deploy orders-api -p '{"spec":{"progressDeadlineSeconds":30,"minReadySeconds":10,
+k patch deploy orders-api -p '{"spec":{"progressDeadlineSeconds":30,"minReadySeconds":10,
   "strategy":{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}'
-kubectl rollout status deploy/orders-api
+k rollout status deploy/orders-api
 t0=$(date +%s)
-kubectl set image deploy/orders-api api=localhost:5001/lab-02-2/orders-api:2.1
-kubectl rollout status deploy/orders-api
+k set image deploy/orders-api api=localhost:5001/lab-02-2/orders-api:2.1
+k rollout status deploy/orders-api
 echo "$(( $(date +%s) - t0 ))s"
 ```
 
@@ -884,11 +884,11 @@ echo "$(( $(date +%s) - t0 ))s"
 Команда убирает `minReadySeconds`, возвращает образ 2.0 и замеряет время.
 
 ```bash
-kubectl patch deploy orders-api -p '{"spec":{"minReadySeconds":0}}'
-kubectl rollout status deploy/orders-api
+k patch deploy orders-api -p '{"spec":{"minReadySeconds":0}}'
+k rollout status deploy/orders-api
 t0=$(date +%s)
-kubectl set image deploy/orders-api api=localhost:5001/lab-02-2/orders-api:2.0
-kubectl rollout status deploy/orders-api
+k set image deploy/orders-api api=localhost:5001/lab-02-2/orders-api:2.0
+k rollout status deploy/orders-api
 echo "$(( $(date +%s) - t0 ))s"
 ```
 
@@ -910,7 +910,7 @@ echo "$(( $(date +%s) - t0 ))s"
 Команда пытается обнулить оба параметра.
 
 ```bash
-kubectl patch deploy orders-api \
+k patch deploy orders-api \
   -p '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":0,"maxUnavailable":0}}}}'
 ```
 
@@ -937,7 +937,7 @@ kubectl patch deploy orders-api \
 **Уборка.** Удаляем Deployment и Service, клиент оставляем для работы 4.
 
 ```bash
-kubectl delete -f ~/lab/k8s/02-2/orders.yaml
+k delete -f ~/lab/k8s/02-2/orders.yaml
 ```
 
 Команда удаляет Deployment, его ReplicaSet и поды вместе с Service (01-3 §3).
@@ -987,9 +987,9 @@ kubectl delete -f ~/lab/k8s/02-2/orders.yaml
 Команда создаёт Deployment заново, переводит его на 2.1 и ждёт готовности. Теперь старая 2.1 лежит в кэше узлов, где есть поды.
 
 ```bash
-kubectl apply -f ~/lab/k8s/02-2/orders.yaml
-kubectl set image deploy/orders-api api=localhost:5001/lab-02-2/orders-api:2.1
-kubectl rollout status deploy/orders-api
+k apply -f ~/lab/k8s/02-2/orders.yaml
+k set image deploy/orders-api api=localhost:5001/lab-02-2/orders-api:2.1
+k rollout status deploy/orders-api
 ```
 
 | Часть команды | Значение |
@@ -1026,12 +1026,12 @@ docker exec lab-worker2 crictl rmi localhost:5001/lab-02-2/orders-api:2.1
 Команды перезапускают Deployment без смены образа, выводят фактический дайджест каждого пода и запускают нагрузку.
 
 ```bash
-kubectl rollout restart deploy/orders-api
-kubectl rollout status deploy/orders-api
-kubectl get pods -l app=orders-api --field-selector=status.phase=Running \
+k rollout restart deploy/orders-api
+k rollout status deploy/orders-api
+k get pods -l app=orders-api --field-selector=status.phase=Running \
   -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName,\
 IMAGEID:.status.containerStatuses[0].imageID
-kubectl exec client -- python /tmp/load.py 4
+k exec client -- python /tmp/load.py 4
 ```
 
 | Часть команды | Значение |
@@ -1068,9 +1068,9 @@ requests=655 ok=654 errors=1 … versions={'2.1-hotfix': 178, '2.1': 476}
 ```bash
 DIG=$(docker inspect -f '{{index .RepoDigests 0}}' localhost:5001/lab-02-2/orders-api:2.1)
 echo "$DIG"
-kubectl set image deploy/orders-api api="$DIG"
-kubectl rollout status deploy/orders-api
-kubectl exec client -- python /tmp/load.py 4
+k set image deploy/orders-api api="$DIG"
+k rollout status deploy/orders-api
+k exec client -- python /tmp/load.py 4
 ```
 
 | Часть команды | Значение |
@@ -1100,7 +1100,6 @@ requests=759 ok=759 errors=0 … versions={'2.1-hotfix': 759}
 **Уборка.** Удаляем Deployment и клиент вместе с namespace, образы из кэша узлов и хоста, тег из реестра и файлы работы.
 
 ```bash
-kubectl config set-context --current --namespace=default
 kubectl delete ns lab-02-2
 for n in lab-worker lab-worker2 lab-worker3; do
   docker exec $n crictl rmi localhost:5001/lab-02-2/orders-api:2.0 \

@@ -346,10 +346,10 @@ parameters: {iops: "6000", throughput: "200Mi"}
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-04-2
-kubectl config set-context --current --namespace=lab-04-2
+k() { kubectl -n lab-04-2 "$@"; }
 ```
 
-Первая команда выбирает кластер стенда, вторая создаёт namespace, а третья делает его текущим для kubectl. Namespace удаляется в уборке последней, четвёртой работы.
+Первая команда выбирает кластер стенда, вторая создаёт namespace, а третья определяет функцию `k` — короткое имя для `kubectl -n lab-04-2`. Функция живёт только в текущем окне терминала: в новом окне определите её снова. Namespace удаляется в уборке последней, четвёртой работы.
 
 ### Лабораторная работа 1. Класс, WaitForFirstConsumer и ёмкость
 
@@ -388,7 +388,7 @@ Pod writer ──► scheduler выбирает узел ──► provisioner �
 
 ```bash
 kubectl get sc
-kubectl get csidrivers
+k get csidrivers
 ```
 
 | Часть команды | Значение |
@@ -417,7 +417,7 @@ No resources found
 Команды создают PVC на 100 МиБ и показывают его статус и события.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata: {name: data}
@@ -426,8 +426,8 @@ spec:
   resources: {requests: {storage: 100Mi}}
 EOF
 sleep 5
-kubectl get pvc data -o jsonpath='{.status.phase}{"\n"}'
-kubectl get events --field-selector involvedObject.name=data \
+k get pvc data -o jsonpath='{.status.phase}{"\n"}'
+k get events --field-selector involvedObject.name=data \
   -o custom-columns=REASON:.reason,MSG:.message
 ```
 
@@ -458,7 +458,7 @@ WaitForFirstConsumer  waiting for first consumer to be created before binding
 Команды создают под, который пишет имя хоста в файл на томе, и читают данные о PV.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: writer}
@@ -472,9 +472,9 @@ spec:
   volumes:
   - {name: d, persistentVolumeClaim: {claimName: data}}
 EOF
-kubectl wait --for=condition=Ready pod/writer
-kubectl get pvc data -o jsonpath='{.status.phase}{"\n"}'
-PV=$(kubectl get pvc data -o jsonpath='{.spec.volumeName}')
+k wait --for=condition=Ready pod/writer
+k get pvc data -o jsonpath='{.status.phase}{"\n"}'
+PV=$(k get pvc data -o jsonpath='{.spec.volumeName}')
 T='path={.spec.hostPath.path} '
 T+='nodeAffinity={.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values} '
 T+='reclaim={.spec.persistentVolumeReclaimPolicy}{"\n"}'
@@ -508,7 +508,7 @@ path=/var/local-path-provisioner/pvc-…_lab-04-2_data nodeAffinity=["lab-worker
 Команда пишет в том 300 МБ и показывает размер каталога.
 
 ```bash
-kubectl exec writer -- sh -c \
+k exec writer -- sh -c \
   'dd if=/dev/zero of=/data/big bs=1M count=300 2>&1 | tail -1; du -sh /data'
 ```
 
@@ -543,8 +543,8 @@ kubectl exec writer -- sh -c \
 **Уборка.**
 
 ```bash
-kubectl delete pod writer --now
-kubectl delete pvc data
+k delete pod writer --now
+k delete pvc data
 ```
 
 Первая команда останавливает под, вторая удаляет заявку, а вместе с ней по политике `Delete` — том и 300 МБ файла.
@@ -599,7 +599,7 @@ cordon lab-worker: moved не планируется, пока узел закр
 Определяем функцию `mk`, которая создаёт под с томом, и запускаем `writer`.
 
 ```bash
-mk() { kubectl apply -f - <<EOF
+mk() { k apply -f - <<EOF
 apiVersion: v1
 kind: Pod
 metadata: {name: $1}
@@ -615,7 +615,7 @@ spec:
   - {name: d, persistentVolumeClaim: {claimName: ${3:-data}}}
 EOF
 }
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata: {name: data}
@@ -624,7 +624,7 @@ spec:
   resources: {requests: {storage: 100Mi}}
 EOF
 mk writer
-kubectl wait --for=condition=Ready pod/writer
+k wait --for=condition=Ready pod/writer
 ```
 
 | Часть команды | Значение |
@@ -641,15 +641,15 @@ kubectl wait --for=condition=Ready pod/writer
 Команды определяют узел `writer`, выбирают другой рабочий узел и запускают два пода с `nodeName`.
 
 ```bash
-NODE=$(kubectl get pod writer -o jsonpath='{.spec.nodeName}')
+NODE=$(k get pod writer -o jsonpath='{.spec.nodeName}')
 OTHER=$(kubectl get nodes -o name | sed 's|node/||' | grep worker | grep -v "^$NODE$" | head -1)
 mk same-node $NODE
 mk other-node $OTHER
 sleep 15
-kubectl get pods -o wide --no-headers | awk '{print $1, $3, $7}'
-kubectl get events --field-selector involvedObject.name=other-node \
+k get pods -o wide --no-headers | awk '{print $1, $3, $7}'
+k get events --field-selector involvedObject.name=other-node \
   -o custom-columns=REASON:.reason,MSG:.message | tail -1
-kubectl exec writer -- cat /data/log
+k exec writer -- cat /data/log
 ```
 
 | Часть команды | Значение |
@@ -685,7 +685,7 @@ same-node
 Команды создают заявку RWOP и два пода, второй из которых нацелен на тот же узел.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata: {name: rwop}
@@ -694,9 +694,9 @@ spec:
   resources: {requests: {storage: 10Mi}}
 EOF
 mk rwop-1 "" rwop
-kubectl wait --for=condition=Ready pod/rwop-1
-N2=$(kubectl get pod rwop-1 -o jsonpath='{.spec.nodeName}')
-kubectl apply -f - <<EOF
+k wait --for=condition=Ready pod/rwop-1
+N2=$(k get pod rwop-1 -o jsonpath='{.spec.nodeName}')
+k apply -f - <<EOF
 apiVersion: v1
 kind: Pod
 metadata: {name: rwop-2}
@@ -711,8 +711,8 @@ spec:
   - {name: d, persistentVolumeClaim: {claimName: rwop}}
 EOF
 sleep 8
-kubectl get pod rwop-2 --no-headers | awk '{print $1, $3}'
-kubectl get events --field-selector involvedObject.name=rwop-2 \
+k get pod rwop-2 --no-headers | awk '{print $1, $3}'
+k get events --field-selector involvedObject.name=rwop-2 \
   -o jsonpath='{.items[-1:].message}{"\n"}'
 ```
 
@@ -742,9 +742,9 @@ rwop-2 Pending
 Команды удаляют поды, закрывают узел и пытаются запустить под с той же заявкой, затем открывают узел.
 
 ```bash
-kubectl delete pod other-node same-node writer rwop-2 rwop-1 --now
+k delete pod other-node same-node writer rwop-2 rwop-1 --now
 kubectl cordon $NODE
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: moved}
@@ -758,12 +758,12 @@ spec:
   - {name: d, persistentVolumeClaim: {claimName: data}}
 EOF
 sleep 6
-kubectl get pod moved --no-headers | awk '{print $1, $3}'
-kubectl get events --field-selector involvedObject.name=moved,reason=FailedScheduling \
+k get pod moved --no-headers | awk '{print $1, $3}'
+k get events --field-selector involvedObject.name=moved,reason=FailedScheduling \
   -o jsonpath='{.items[-1:].message}{"\n"}'
 kubectl uncordon $NODE
-kubectl wait --for=condition=Ready pod/moved
-kubectl get pod moved -o jsonpath='{.spec.nodeName}{"\n"}'
+k wait --for=condition=Ready pod/moved
+k get pod moved -o jsonpath='{.spec.nodeName}{"\n"}'
 ```
 
 | Часть команды | Значение |
@@ -803,8 +803,8 @@ lab-worker
 
 ```bash
 kubectl uncordon $NODE
-kubectl delete pod moved --now
-kubectl delete pvc data rwop
+k delete pod moved --now
+k delete pvc data rwop
 ```
 
 Первая команда безопасно повторяет открытие узла, остальные удаляют под и заявки (вместе с ними по `Delete` — тома).
@@ -834,7 +834,7 @@ kubectl delete pvc data rwop
 - **Надолго ли:** Примерно на 3–5 минут. Автоматических изменений на хосте нет.
 - **Безопасность:** Внешних последствий нет, образы и сеть хоста не меняются.
 - **Влияние:** Демо-приложение в `orders` может стать недоступным, если на узле стоит PostgreSQL. Узел для опыта выбирают так, чтобы он был свободен (шаг 1). Через 300 секунд недоступности узла контроллер начнёт выселять с него поды, поэтому работу укладывают в пять минут.
-- **Откат:** `docker start <узел>`, затем `kubectl wait --for=condition=Ready node/<узел>`. Если узел не вернулся, пересоздайте стенд скриптами `lab-down.sh` и `lab-up.sh` из 00-1 §3 и верните демо-приложение: `kubectl apply -f ~/lab/k8s/orders-api/k8s/`.
+- **Откат:** `docker start <узел>`, затем `kubectl wait --for=condition=Ready node/<узел>`. Если узел не вернулся, пересоздайте стенд скриптами `lab-down.sh` и `lab-up.sh` из 00-1 §3 и верните демо-приложение: `k apply -f ~/lab/k8s/orders-api/k8s/`.
 
 **Цель.** Увидеть, что происходит с томом и новым подом, когда узел с PV отказал.
 
@@ -876,7 +876,7 @@ kubectl -n orders get pods -o wide
 
 ```bash
 NODE=lab-worker3
-kubectl apply -f - <<EOF
+k apply -f - <<EOF
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata: {name: data}
@@ -898,7 +898,7 @@ spec:
   volumes:
   - {name: d, persistentVolumeClaim: {claimName: data}}
 EOF
-kubectl wait --for=condition=Ready pod/victim
+k wait --for=condition=Ready pod/victim
 ```
 
 | Часть команды | Значение |
@@ -917,7 +917,7 @@ kubectl wait --for=condition=Ready pod/victim
 docker stop $NODE
 sleep 60
 kubectl get node $NODE --no-headers | awk '{print $1, $2}'
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: second}
@@ -931,8 +931,8 @@ spec:
   - {name: d, persistentVolumeClaim: {claimName: data}}
 EOF
 sleep 8
-kubectl get pod second --no-headers | awk '{print $1, $3}'
-kubectl get events --field-selector involvedObject.name=second,reason=FailedScheduling \
+k get pod second --no-headers | awk '{print $1, $3}'
+k get events --field-selector involvedObject.name=second,reason=FailedScheduling \
   -o jsonpath='{.items[-1:].message}{"\n"}'
 ```
 
@@ -965,8 +965,8 @@ second Pending
 ```bash
 docker start $NODE
 kubectl wait --for=condition=Ready node/$NODE --timeout=180s
-kubectl wait --for=condition=Ready pod/second --timeout=120s
-kubectl exec second -- cat /data/state
+k wait --for=condition=Ready pod/second --timeout=120s
+k exec second -- cat /data/state
 ```
 
 | Часть команды | Значение |
@@ -988,8 +988,8 @@ kubectl exec second -- cat /data/state
 **Уборка.**
 
 ```bash
-kubectl delete pod victim second --now
-kubectl delete pvc data
+k delete pod victim second --now
+k delete pvc data
 docker start $NODE 2>/dev/null; kubectl get nodes
 ```
 
@@ -1043,7 +1043,7 @@ patch PVC на 50Mi в классе standard → Forbidden
 Команды создают заявку и под, пытаются удалить заявку при работающем поде, затем удаляют под.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata: {name: data}
@@ -1064,16 +1064,16 @@ spec:
   volumes:
   - {name: d, persistentVolumeClaim: {claimName: data}}
 EOF
-kubectl wait --for=condition=Ready pod/user
-NODE=$(kubectl get pod user -o jsonpath='{.spec.nodeName}')
-PV=$(kubectl get pvc data -o jsonpath='{.spec.volumeName}')
-kubectl get pvc data -o jsonpath='finalizers={.metadata.finalizers}{"\n"}'
-kubectl delete pvc data --wait=false
+k wait --for=condition=Ready pod/user
+NODE=$(k get pod user -o jsonpath='{.spec.nodeName}')
+PV=$(k get pvc data -o jsonpath='{.spec.volumeName}')
+k get pvc data -o jsonpath='finalizers={.metadata.finalizers}{"\n"}'
+k delete pvc data --wait=false
 sleep 2
-kubectl get pvc data --no-headers | awk '{print $1, $2}'
-kubectl delete pod user --now
+k get pvc data --no-headers | awk '{print $1, $2}'
+k delete pod user --now
 sleep 10
-kubectl get pvc data
+k get pvc data
 kubectl get pv $PV
 docker exec $NODE sh -c "ls /var/local-path-provisioner/ | grep -c $PV"
 ```
@@ -1108,7 +1108,7 @@ Error from server (NotFound): persistentvolumes "pvc-…" not found
 Команды создают класс с `Retain`, пишут файл на том, удаляют заявку и читают файл прямо на узле.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata: {name: local-retain}
@@ -1137,11 +1137,11 @@ spec:
   volumes:
   - {name: d, persistentVolumeClaim: {claimName: keep}}
 EOF
-kubectl wait --for=condition=Ready pod/keeper
-PV2=$(kubectl get pvc keep -o jsonpath='{.spec.volumeName}')
-NODE2=$(kubectl get pod keeper -o jsonpath='{.spec.nodeName}')
-kubectl delete pod keeper --now
-kubectl delete pvc keep
+k wait --for=condition=Ready pod/keeper
+PV2=$(k get pvc keep -o jsonpath='{.spec.volumeName}')
+NODE2=$(k get pod keeper -o jsonpath='{.spec.nodeName}')
+k delete pod keeper --now
+k delete pvc keep
 sleep 3
 T='{.metadata.name} {.spec.persistentVolumeReclaimPolicy} {.status.phase} '
 T+='{.spec.claimRef.namespace}/{.spec.claimRef.name}{"\n"}'
@@ -1189,7 +1189,7 @@ kubectl get pv $PV2 -o jsonpath='{.status.phase}{"\n"}'
 Команды создают заявку класса `standard`, запускают под и пытаются увеличить заявку.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata: {name: grow}
@@ -1210,13 +1210,13 @@ spec:
   volumes:
   - {name: d, persistentVolumeClaim: {claimName: grow}}
 EOF
-kubectl wait --for=condition=Ready pod/g
-kubectl patch pvc grow -p '{"spec":{"resources":{"requests":{"storage":"50Mi"}}}}'
+k wait --for=condition=Ready pod/g
+k patch pvc grow -p '{"spec":{"resources":{"requests":{"storage":"50Mi"}}}}'
 ```
 
 | Часть команды | Значение |
 |---|---|
-| `kubectl patch pvc grow -p …` | поднять запрос ёмкости с 10 до 50 МиБ |
+| `k patch pvc grow -p …` | поднять запрос ёмкости с 10 до 50 МиБ |
 | `storage: "50Mi"` | новое значение запроса |
 
 Результат (одна строка, здесь перенесена):
@@ -1238,11 +1238,10 @@ provisioned pvc can be resized and the storageclass that provisions the pvc must
 | Released-том возвращают в работу, очищая `claimRef` | шаг 2, `Available` |
 | Расширение требует `allowVolumeExpansion` | шаг 3 |
 
-**Уборка.** Retain-том сам не удаляется, это его назначение, поэтому его убираем вручную. Затем удаляем namespace и возвращаем namespace kubectl по умолчанию.
+**Уборка.** Retain-том сам не удаляется, это его назначение, поэтому его убираем вручную. Затем удаляем namespace.
 
 ```bash
-kubectl delete pod g --now
-kubectl config set-context --current --namespace=default
+k delete pod g --now
 kubectl delete ns lab-04-2
 kubectl delete pv $PV2
 docker exec $NODE2 rm -rf /var/local-path-provisioner/${PV2}_lab-04-2_keep

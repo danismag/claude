@@ -329,7 +329,7 @@ Kubectl при этом предупреждает об устаревшем `v1
 
 Сборка с Helm падает в трёх известных местах. Во-первых, нужен флаг `--enable-helm`, а `kubectl apply -k` его не принимает: сообщение `must specify --enable-helm`. Во-вторых, ограничитель загрузки не разрешает читать чарт вне каталога kustomization: сообщение `security; file '…' is not in or below '…'`.
 
-В-третьих, `namespace` может не примениться к объектам из `helmCharts`. На Kustomize v5.8.1 в прогоне автора ни ConfigMap, ни Deployment, ни Service не получили `metadata.namespace`. Без явного `-n` объекты уйдут в namespace текущего контекста, поэтому проверяйте вывод сборки и задавайте namespace при применении.
+В-третьих, `namespace` может не примениться к объектам из `helmCharts`. На Kustomize v5.8.1 ни ConfigMap, ни Deployment, ни Service не получили `metadata.namespace`. Без явного `-n` объекты уйдут в namespace текущего контекста, поэтому проверяйте вывод сборки и задавайте namespace при применении.
 
 ---
 
@@ -608,7 +608,7 @@ deployment "orders-api" successfully rolled out
 
 1. `orders-env-65k4tf7cd9` — другое содержимое дало другой хэш и новый ConfigMap.
 2. Deployment перезапустил поды без вашей команды: шаблон пода изменился.
-3. `get rs,cm` показывает два ReplicaSet (в прогоне автора было 1, стало 2) и два ConfigMap: `orders-env-65k4tf7cd9` и `orders-env-hcdt7bmb5c`.
+3. `get rs,cm` показывает два ReplicaSet (было 1, стало 2) и два ConfigMap: `orders-env-65k4tf7cd9` и `orders-env-hcdt7bmb5c`.
 4. `half` в ответе подтверждает, что приложение увидело новое значение, хотя env из ConfigMap сам по себе не обновляется (04-1).
 
 #### Шаг 5. Убрать старый ConfigMap
@@ -1031,7 +1031,7 @@ kubectl kustomize --enable-helm --load-restrictor=LoadRestrictionsNone overlays/
 Разбор:
 
 1. Переменная `SHUTDOWN_DELAY_OVERRIDE` есть в Deployment: патч Kustomize сработал на объекте, который создал Helm.
-2. Счётчик `0` — поле `namespace` из kustomization не применилось к объектам из `helmCharts`. В прогоне автора на Kustomize v5.8.1 ConfigMap, Deployment и Service остались без `metadata.namespace`.
+2. Счётчик `0` — поле `namespace` из kustomization не применилось к объектам из `helmCharts`. На Kustomize v5.8.1 ConfigMap, Deployment и Service остались без `metadata.namespace`.
 3. Без явного `-n` при применении объекты ушли бы в namespace текущего контекста, поэтому следующий шаг задаёт `-n`.
 
 #### Шаг 5. Применить и сравнить с Helm-релизом

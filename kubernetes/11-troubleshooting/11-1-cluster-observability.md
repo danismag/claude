@@ -605,7 +605,7 @@ k top pod burner --containers
 | `sleep 60` | дать metrics-server собрать два замера |
 | `top pod burner --containers` | потребление по контейнерам пода |
 
-Результат первой команды (часть строк пропущена, числа с прогона 2026-10-14):
+Результат первой команды (часть строк пропущена, числа из замера на тестовом стенде):
 
 ```
 NAME                CPU(cores)   CPU(%)   MEMORY(bytes)   MEMORY(%)
@@ -1247,7 +1247,7 @@ kubectl get --raw "/api/v1/nodes/$N/proxy/logs/?query=kubelet&tailLines=3"
 | `proxy/logs/?query=kubelet` | запрос журнала службы kubelet через API (node log query) |
 | `tailLines=3` | последние три записи |
 
-Результат первой команды (ожидаемый; первые два значения совпадают с прогоном 2026-10-14):
+Результат первой команды (ожидаемый; первые два значения совпадают с замером на тестовом стенде):
 
 ```
 {"containerLogMaxSize":"10Mi","containerLogMaxFiles":5,"containerLogMonitorInterval":"10s",

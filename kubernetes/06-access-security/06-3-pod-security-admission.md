@@ -1,6 +1,6 @@
 # 06-3. Pod Security и admission-политики
 
-> Модуль 06 «Доступ и безопасность» · часть 3 из 4 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд 00-1 (контекст `kind-lab`), образы `localhost:5001/orders-api:2.0` и `busybox:1.37` · Опирается на: 01-1 (путь запроса), 01-3 (API-объекты), 06-1 (RBAC), 06-2 (securityContext)
+> Модуль 06 «Доступ и безопасность» · часть 3 из 4 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд 00-1 (контекст `kind-lab`), образы `localhost:5001/orders-api:2.0` и `localhost:5001/busybox:1.37` · Опирается на: 01-1 (путь запроса), 01-3 (API-объекты), 06-1 (RBAC), 06-2 (securityContext)
 
 ## Где мы на карте
 
@@ -316,7 +316,7 @@ VAP и MAP видят один объект и параметры. Они не �
 
 ## Лабораторные работы
 
-Работы идут на стенде 00-1 в namespace `lab-06-3` и `lab-06-3b`; последний нужен для мягкого внедрения, а MAP использует отдельный `lab-06-3c`. Команды везде с явным `-n`: контекст kubectl и текущий namespace не меняются. Хост работы не меняют; политики и привязки — объекты кластера, их удаляет уборка. Образ `busybox:1.37` узлы тянут из Docker Hub, а при недоступности используйте копию `localhost:5001/busybox:1.37` в реестре стенда (02-1).
+Работы идут на стенде 00-1 в namespace `lab-06-3` и `lab-06-3b`; последний нужен для мягкого внедрения, а MAP использует отдельный `lab-06-3c`. Команды везде с явным `-n`: контекст kubectl и текущий namespace не меняются. Хост работы не меняют; политики и привязки — объекты кластера, их удаляет уборка. Образы поды берут из реестра стенда; если `localhost:5001/busybox:1.37` там нет, положите его командами из вступления к лабораторным 02-1.
 
 Подготовку делают один раз: выбирают контекст стенда и создают два namespace.
 
@@ -470,7 +470,7 @@ Namespace остаётся для следующих работ.
 **Что понадобится.**
 
 - Namespace `lab-06-3b` из подготовки.
-- Образы `localhost:5001/orders-api:2.0` и `busybox:1.37`.
+- Образы `localhost:5001/orders-api:2.0` и `localhost:5001/busybox:1.37` (общие образы стенда).
 - Namespace `orders` со стенда, который работа только читает.
 
 **Схема опыта.**
@@ -509,7 +509,7 @@ kubectl label ns lab-06-3b \
 
 ```bash
 kubectl -n lab-06-3b run plain --image=localhost:5001/orders-api:2.0
-kubectl -n lab-06-3b run hostnet --image=busybox:1.37 \
+kubectl -n lab-06-3b run hostnet --image=localhost:5001/busybox:1.37 \
   --overrides='{"spec":{"hostNetwork":true}}' -- sleep 60
 ```
 
@@ -612,7 +612,7 @@ kubectl -n lab-06-3b delete pod plain
 
 **Что понадобится.**
 
-- Namespace `lab-06-3b` и образы `busybox` и `localhost:5001/orders-api:2.0`.
+- Namespace `lab-06-3b` и общие образы стенда `localhost:5001/busybox:1.37` и `localhost:5001/orders-api:2.0`.
 - Дайджест образа `orders-api:2.0` из вывода `docker push` в 00-1: вместо него в примере стоит сокращение.
 
 **Схема опыта.**
@@ -679,21 +679,21 @@ EOF
 
 ```bash
 sleep 3
-kubectl -n lab-06-3b run w1 --image=busybox -- sleep 60
+kubectl -n lab-06-3b run w1 --image=localhost:5001/busybox -- sleep 60
 ```
 
 Результат:
 
 ```
 Warning: Validation failed for ValidatingAdmissionPolicy 'no-latest-tag' with binding
-'no-latest-tag': образ без тега или с :latest запрещён: busybox
+'no-latest-tag': образ без тега или с :latest запрещён: localhost:5001/busybox
 ```
 
 Разбор:
 
 1. `sleep 3` — пауза на загрузку политики в API-сервер.
 2. Предупреждение называет политику и привязку, а текст собран `messageExpression`.
-3. Под при этом создан, потому что действие — `Warn`.
+3. Под при этом создан, потому что действие — `Warn`. Тега `latest` в реестре стенда нет, поэтому под останется в `ErrImagePull`; для опыта это неважно, работа его удалит.
 
 #### Шаг 3. Переключить на Deny и проверить шесть образов
 
@@ -704,7 +704,8 @@ kubectl patch validatingadmissionpolicybinding no-latest-tag --type=merge \
   -p '{"spec":{"validationActions":["Deny"]}}'
 sleep 3
 DIGEST=sha256:ad4f8fd…   # свой дайджест из docker push
-for img in busybox busybox:latest busybox:1.37 localhost:5001/orders-api:2.0 \
+for img in localhost:5001/busybox localhost:5001/busybox:latest \
+           localhost:5001/busybox:1.37 localhost:5001/orders-api:2.0 \
            localhost:5001/orders-api localhost:5001/orders-api@$DIGEST; do
   printf "%-40s -> " "${img:0:40}"
   kubectl -n lab-06-3b run t-$RANDOM --image=$img -- sleep 60 2>&1 | tail -1 | cut -c1-110
@@ -721,10 +722,10 @@ done
 Результат:
 
 ```
-busybox                       -> … ValidatingAdmissionPolicy 'no-latest-tag' with binding
+localhost:5001/busybox        -> … ValidatingAdmissionPolicy 'no-latest-tag' with binding
                                  'no-latest-tag' denied request
-busybox:latest                -> … denied request
-busybox:1.37                  -> pod/… created
+localhost:5001/busybox:latest -> … denied request
+localhost:5001/busybox:1.37   -> pod/… created
 localhost:5001/orders-api:2.0 -> pod/… created
 localhost:5001/orders-api     -> … denied
 localhost:5001/orders-api@sha256:ad4f8fd… -> pod/… created
@@ -732,8 +733,8 @@ localhost:5001/orders-api@sha256:ad4f8fd… -> pod/… created
 
 Разбор:
 
-1. `busybox` и `busybox:latest` отклонены: образа нет тега, либо тег `latest`.
-2. `busybox:1.37` создан: закреплённый тег принят.
+1. `localhost:5001/busybox` и `localhost:5001/busybox:latest` отклонены: образа нет тега, либо тег `latest`.
+2. `localhost:5001/busybox:1.37` создан: закреплённый тег принят.
 3. `orders-api:2.0` создан: порт `5001` лежит в предпоследнем сегменте, а тег `2.0` в последнем.
 4. `localhost:5001/orders-api` отклонён: двоеточие порта не принято за тег.
 5. Образ с дайджестом создан: он закреплён навсегда.
@@ -787,7 +788,7 @@ kubectl -n lab-06-3b delete pod --all
 **Что понадобится.**
 
 - Kubernetes 1.36 (стенд).
-- Образ `busybox:1.37`.
+- Образ `localhost:5001/busybox:1.37` (общий образ стенда).
 - Около 20 минут.
 
 **Схема опыта.**
@@ -870,7 +871,7 @@ EOF
 
 ```bash
 sleep 3
-kubectl -n lab-06-3c run m1 --image=busybox:1.37 -- sleep 60
+kubectl -n lab-06-3c run m1 --image=localhost:5001/busybox:1.37 -- sleep 60
 kubectl -n lab-06-3c get pod m1 \
   -o jsonpath='{.spec.securityContext.seccompProfile.type}{"\n"}{.metadata.labels}{"\n"}'
 ```
@@ -911,7 +912,7 @@ spec:
   securityContext:
     seccompProfile: {type: Unconfined}
   containers:
-  - {name: c, image: "busybox:1.37", command: ["sleep", "60"]}
+  - {name: c, image: "localhost:5001/busybox:1.37", command: ["sleep", "60"]}
 EOF
 kubectl -n lab-06-3c get pod m2 -o jsonpath='{.spec.securityContext.seccompProfile.type}{"\n"}'
 ```

@@ -313,18 +313,18 @@ StatefulSet подходит, когда достаточно имён и дис
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-02-3
-kubectl config set-context --current --namespace=lab-02-3
+k() { kubectl -n lab-02-3 "$@"; }
 mkdir -p ~/lab/k8s/02-3
 ```
 
-Первая команда выбирает кластер стенда, вторая создаёт namespace, третья делает его текущим для kubectl, четвёртая создаёт каталог для манифестов. Каждая работа начинается с общего манифеста из шага 1 работы 1 и убирает за собой свой StatefulSet и PVC.
+Первая команда выбирает кластер стенда, вторая создаёт namespace, третья определяет функцию `k` — короткое имя для `kubectl -n lab-02-3`, четвёртая создаёт каталог для манифестов. Функция живёт только в текущем окне терминала: в новом окне определите её снова. Каждая работа начинается с общего манифеста из шага 1 работы 1 и убирает за собой свой StatefulSet и PVC.
 
 ### Лабораторная работа 1. Порядок, PVC, DNS и идентичность
 
-**Риски.** Работа меняет только кластер стенда и одну настройку на хосте.
+**Риски.** Работа меняет только кластер стенда и каталог на хосте.
 
-- **Что меняется:** в кластере — namespace `lab-02-3` с StatefulSet, Service, тремя PVC и подами; на хосте — namespace по умолчанию у контекста `kind-lab` в `~/.kube/config` и каталог `~/lab/k8s/02-3/`.
-- **Надолго ли:** до уборки; уборка последней работы удаляет namespace, возвращает `default` и удаляет каталог.
+- **Что меняется:** в кластере — namespace `lab-02-3` с StatefulSet, Service, тремя PVC и подами; на хосте — каталог `~/lab/k8s/02-3/`.
+- **Надолго ли:** до уборки; уборка последней работы удаляет namespace и каталог.
 - **Безопасность:** привилегий не нужно; работа с namespace `orders` только читает.
 - **Влияние на систему:** другие контексты kubectl и рабочие кластеры не затрагиваются; три тома по 100 МиБ создаются как каталоги на дисках узлов.
 - **Откат:** блок «Уборка» в конце работы и в конце работы 3.
@@ -407,11 +407,11 @@ EOF
 Команда применяет манифест, ждёт выката и выводит время создания и готовности каждого пода.
 
 ```bash
-kubectl apply -f ~/lab/k8s/02-3/sts.yaml
-kubectl rollout status sts/web
+k apply -f ~/lab/k8s/02-3/sts.yaml
+k rollout status sts/web
 T='POD:.metadata.name,NODE:.spec.nodeName,CREATED:.metadata.creationTimestamp,'
 T+='READY:.status.conditions[?(@.type=="Ready")].lastTransitionTime'
-kubectl get pods -o custom-columns="$T"
+k get pods -o custom-columns="$T"
 ```
 
 | Часть команды | Значение |
@@ -442,7 +442,7 @@ web-2   lab-worker2   2026-10-14T09:22:55Z   2026-10-14T09:22:58Z
 Команда показывает заявки на диски, созданные из шаблона.
 
 ```bash
-kubectl get pvc -o custom-columns=NAME:.metadata.name,STATUS:.status.phase
+k get pvc -o custom-columns=NAME:.metadata.name,STATUS:.status.phase
 ```
 
 | Часть команды | Значение |
@@ -470,12 +470,12 @@ data-web-2   Bound
 Команда запускает два одноразовых пода. Первый резолвит имена через libc командой `getent`, второй — через busybox `nslookup`; сравним ответы.
 
 ```bash
-kubectl run dns --image=python:3.12-slim --restart=Never --command -- sh -c \
+k run dns --image=python:3.12-slim --restart=Never --command -- sh -c \
   'getent ahostsv4 web | awk "{print \$1}" | sort -u; getent hosts web-1.web'
-kubectl run dns-bb --image=busybox:1.37 --restart=Never --command -- nslookup web-1.web
+k run dns-bb --image=busybox:1.37 --restart=Never --command -- nslookup web-1.web
 sleep 15
-kubectl logs dns
-kubectl logs dns-bb
+k logs dns
+k logs dns-bb
 ```
 
 | Часть команды | Значение |
@@ -513,14 +513,14 @@ kubectl logs dns-bb
 Команда читает файл `born` и IP, UID и узел пода `web-1`, удаляет под и читает всё это снова.
 
 ```bash
-kubectl exec web-1 -- cat /data/born
-kubectl get pod web-1 \
+k exec web-1 -- cat /data/born
+k get pod web-1 \
   -o jsonpath='before: ip={.status.podIP} node={.spec.nodeName} uid={.metadata.uid}{"\n"}'
-kubectl delete pod web-1
-kubectl wait --for=condition=Ready pod/web-1
-kubectl get pod web-1 \
+k delete pod web-1
+k wait --for=condition=Ready pod/web-1
+k get pod web-1 \
   -o jsonpath='after:  ip={.status.podIP} node={.spec.nodeName} uid={.metadata.uid}{"\n"}'
-kubectl exec web-1 -- cat /data/born
+k exec web-1 -- cat /data/born
 ```
 
 | Часть команды | Значение |
@@ -591,12 +591,12 @@ postgres-0.postgres
 **Уборка.**
 
 ```bash
-kubectl delete pod dns dns-bb
-kubectl delete sts web
-kubectl delete pvc --all
+k delete pod dns dns-bb
+k delete sts web
+k delete pvc --all
 ```
 
-Команды удаляют одноразовые поды, StatefulSet и PVC; сам Service `web` остаётся и нужен следующим работам, а `delete pvc --all` затрагивает только текущий namespace.
+Команды удаляют одноразовые поды, StatefulSet и PVC; сам Service `web` остаётся и нужен следующим работам, а `delete pvc --all` затрагивает только namespace `lab-02-3`.
 
 **Вопросы для самопроверки.**
 
@@ -634,16 +634,16 @@ delete sts ─► PVC остаются          OrderedReady 14 с   проти�
 Команда создаёт StatefulSet заново, уменьшает число подов до одного и показывает, что остаётся.
 
 ```bash
-kubectl apply -f ~/lab/k8s/02-3/sts.yaml
-kubectl rollout status sts/web
-kubectl scale sts web --replicas=1
-kubectl get pods -w
+k apply -f ~/lab/k8s/02-3/sts.yaml
+k rollout status sts/web
+k scale sts web --replicas=1
+k get pods -w
 ```
 
 Остановите наблюдение клавишами Ctrl-C, когда останется один под. Затем выведите заявки.
 
 ```bash
-kubectl get pvc -o custom-columns=NAME:.metadata.name,STATUS:.status.phase
+k get pvc -o custom-columns=NAME:.metadata.name,STATUS:.status.phase
 ```
 
 | Часть команды | Значение |
@@ -671,9 +671,9 @@ data-web-2   Bound
 Команда возвращает три пода и читает файлы `born` у `web-1` и `web-2`.
 
 ```bash
-kubectl scale sts web --replicas=3
-kubectl rollout status sts/web
-for p in web-1 web-2; do kubectl exec $p -- cat /data/born; done
+k scale sts web --replicas=3
+k rollout status sts/web
+for p in web-1 web-2; do k exec $p -- cat /data/born; done
 ```
 
 | Часть команды | Значение |
@@ -696,14 +696,14 @@ web-2 09:22:58
 Команда меняет политику так, чтобы PVC лишних подов удалялись, уменьшает число подов до двух и снова увеличивает до трёх.
 
 ```bash
-kubectl patch sts web -p \
+k patch sts web -p \
   '{"spec":{"persistentVolumeClaimRetentionPolicy":{"whenScaled":"Delete","whenDeleted":"Retain"}}}'
-kubectl scale sts web --replicas=2
+k scale sts web --replicas=2
 sleep 12
-kubectl get pvc -o custom-columns=NAME:.metadata.name,STATUS:.status.phase
-kubectl scale sts web --replicas=3
-kubectl rollout status sts/web
-kubectl exec web-2 -- cat /data/born
+k get pvc -o custom-columns=NAME:.metadata.name,STATUS:.status.phase
+k scale sts web --replicas=3
+k rollout status sts/web
+k exec web-2 -- cat /data/born
 ```
 
 | Часть команды | Значение |
@@ -734,8 +734,8 @@ data-web-1   Bound
 Команда удаляет StatefulSet и смотрит, что осталось от дисков.
 
 ```bash
-kubectl delete sts web
-kubectl get pvc -o custom-columns=NAME:.metadata.name,STATUS:.status.phase
+k delete sts web
+k get pvc -o custom-columns=NAME:.metadata.name,STATUS:.status.phase
 ```
 
 | Часть команды | Значение |
@@ -748,10 +748,10 @@ kubectl get pvc -o custom-columns=NAME:.metadata.name,STATUS:.status.phase
 Разбор: при `whenDeleted: Retain` у заявок нет ссылки владельца на StatefulSet, поэтому сборщик мусора их не тронул. Так накапливаются осиротевшие PVC, и поэтому их нужно искать и убирать (§3). Удаление namespace сразу удалит всё.
 
 ```bash
-kubectl delete pvc --all
+k delete pvc --all
 ```
 
-Команда удаляет все заявки текущего namespace, чтобы следующий опыт начался с пустых томов.
+Команда удаляет все заявки namespace `lab-02-3`, чтобы следующий опыт начался с пустых томов.
 
 #### Шаг 5. Сравнить OrderedReady и Parallel
 
@@ -761,15 +761,15 @@ kubectl delete pvc --all
 sed 's/^  serviceName: web$/  serviceName: web\n  podManagementPolicy: Parallel/' \
   ~/lab/k8s/02-3/sts.yaml > ~/lab/k8s/02-3/sts-par.yaml
 t0=$(date +%s)
-kubectl apply -f ~/lab/k8s/02-3/sts-par.yaml
-kubectl rollout status sts/web
+k apply -f ~/lab/k8s/02-3/sts-par.yaml
+k rollout status sts/web
 echo "Parallel: $(( $(date +%s)-t0 ))s"
-kubectl get pods -l app=web -o custom-columns=POD:.metadata.name,CREATED:.metadata.creationTimestamp
-kubectl delete sts web
-kubectl delete pvc --all
+k get pods -l app=web -o custom-columns=POD:.metadata.name,CREATED:.metadata.creationTimestamp
+k delete sts web
+k delete pvc --all
 t0=$(date +%s)
-kubectl apply -f ~/lab/k8s/02-3/sts.yaml
-kubectl rollout status sts/web
+k apply -f ~/lab/k8s/02-3/sts.yaml
+k rollout status sts/web
 echo "OrderedReady: $(( $(date +%s)-t0 ))s"
 ```
 
@@ -804,8 +804,8 @@ echo "OrderedReady: $(( $(date +%s)-t0 ))s"
 **Уборка.**
 
 ```bash
-kubectl delete sts web
-kubectl delete pvc --all
+k delete sts web
+k delete pvc --all
 rm -f ~/lab/k8s/02-3/sts-par.yaml
 ```
 
@@ -850,20 +850,20 @@ rm -f ~/lab/k8s/02-3/sts-par.yaml
 Команда создаёт StatefulSet, включает partition и меняет значение переменной версии в шаблоне. Затем она печатает версию и ревизию каждого пода.
 
 ```bash
-kubectl apply -f ~/lab/k8s/02-3/sts.yaml
-kubectl rollout status sts/web
-kubectl patch sts web -p \
+k apply -f ~/lab/k8s/02-3/sts.yaml
+k rollout status sts/web
+k patch sts web -p \
   '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":2}}}}'
-kubectl set env sts/web VERSION=v2
+k set env sts/web VERSION=v2
 sleep 15
 for p in web-0 web-1 web-2; do
-  echo "$p $(kubectl get pod $p -o jsonpath='{.metadata.labels.controller-revision-hash}')" \
-    "$(kubectl exec $p -- cat /data/version)"
+  echo "$p $(k get pod $p -o jsonpath='{.metadata.labels.controller-revision-hash}')" \
+    "$(k exec $p -- cat /data/version)"
 done
 T='current={.status.currentRevision} update={.status.updateRevision} '
 T+='updated={.status.updatedReplicas}{"\n"}'
-kubectl get sts web -o jsonpath="$T"
-kubectl rollout status sts/web --timeout=5s
+k get sts web -o jsonpath="$T"
+k rollout status sts/web --timeout=5s
 ```
 
 | Часть команды | Значение |
@@ -896,9 +896,9 @@ partitioned roll out complete: 1 new pods have been updated...
 Команда обнуляет partition и ждёт обновления остальных подов; затем перечисляет ревизии.
 
 ```bash
-kubectl patch sts web -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":0}}}}'
-kubectl rollout status sts/web
-kubectl get controllerrevisions
+k patch sts web -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":0}}}}'
+k rollout status sts/web
+k get controllerrevisions
 ```
 
 | Часть команды | Значение |
@@ -919,18 +919,18 @@ kubectl get controllerrevisions
 Команда подставляет в шаблон команду, которая сразу завершается с ошибкой, ждёт 30 секунд и показывает поды. Затем возвращает предыдущую версию шаблона.
 
 ```bash
-kubectl patch sts web --type=json -p \
+k patch sts web --type=json -p \
   '[{"op":"replace","path":"/spec/template/spec/containers/0/command/2","value":"exit 1"}]'
 sleep 30
-kubectl get pods -l app=web
-kubectl rollout undo sts/web
+k get pods -l app=web
+k rollout undo sts/web
 sleep 45
-kubectl get pods -l app=web
+k get pods -l app=web
 T='current={.status.currentRevision} update={.status.updateRevision} '
 T+='ready={.status.readyReplicas}{"\n"}'
-kubectl get sts web -o jsonpath="$T"
+k get sts web -o jsonpath="$T"
 H='{.metadata.labels.controller-revision-hash}'
-kubectl get pod web-2 -o jsonpath="web-2 revision=$H{\"\\n\"}"
+k get pod web-2 -o jsonpath="web-2 revision=$H{\"\\n\"}"
 ```
 
 | Часть команды | Значение |
@@ -963,11 +963,11 @@ web-2 revision=web-<h3>
 Команда удаляет сломанный под и проверяет, на какой ревизии появился новый.
 
 ```bash
-kubectl delete pod web-2
-kubectl wait --for=condition=Ready pod/web-2
+k delete pod web-2
+k wait --for=condition=Ready pod/web-2
 H='{.metadata.labels.controller-revision-hash}'
-kubectl get pod web-2 -o jsonpath="web-2 revision=$H{\"\\n\"}"
-kubectl exec web-2 -- cat /data/version
+k get pod web-2 -o jsonpath="web-2 revision=$H{\"\\n\"}"
+k exec web-2 -- cat /data/version
 ```
 
 | Часть команды | Значение |
@@ -1019,12 +1019,12 @@ spec:
         command: ["sh", "-c", "sleep 8; httpd -f -p 80 -h /tmp"]
         readinessProbe: {tcpSocket: {port: 80}, periodSeconds: 1}
 EOF
-kubectl apply -f ~/lab/k8s/02-3/sts-burst.yaml
-kubectl get sts burst -o jsonpath='{.spec.updateStrategy}{"\n"}'
-kubectl rollout status sts/burst
-kubectl set env sts/burst VERSION=v2
-kubectl rollout status sts/burst
-kubectl get pods -l app=burst \
+k apply -f ~/lab/k8s/02-3/sts-burst.yaml
+k get sts burst -o jsonpath='{.spec.updateStrategy}{"\n"}'
+k rollout status sts/burst
+k set env sts/burst VERSION=v2
+k rollout status sts/burst
+k get pods -l app=burst \
   -o custom-columns=POD:.metadata.name,CREATED:.metadata.creationTimestamp
 ```
 
@@ -1054,12 +1054,11 @@ kubectl get pods -l app=burst \
 | Сломанный под нужно удалить вручную | шаг 4 |
 | `maxUnavailable` ускоряет обновление, только если гейт включён | шаг 5 |
 
-**Уборка.** Удаляем все созданные объекты, возвращаем namespace по умолчанию и убираем файлы.
+**Уборка.** Удаляем все созданные объекты и убираем файлы.
 
 ```bash
-kubectl delete sts web burst
-kubectl delete pvc --all
-kubectl config set-context --current --namespace=default
+k delete sts web burst
+k delete pvc --all
 kubectl delete ns lab-02-3
 rm -rf ~/lab/k8s/02-3
 ```

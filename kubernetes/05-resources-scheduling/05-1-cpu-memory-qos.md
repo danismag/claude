@@ -376,11 +376,11 @@ docker push localhost:5001/lab-05-1/python:3.12-slim
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-05-1
-kubectl config set-context --current --namespace=lab-05-1
+k() { kubectl -n lab-05-1 "$@"; }
 mkdir -p ~/lab/k8s/05-1
 ```
 
-Первая команда выбирает кластер стенда, вторая создаёт namespace, третья делает его текущим, четвёртая создаёт каталог для файлов работ. Namespace удаляется в уборке последней работы.
+Первая команда выбирает кластер стенда, вторая создаёт namespace, третья определяет функцию `k` — короткое имя для `kubectl -n lab-05-1`, четвёртая создаёт каталог для файлов работ. Namespace удаляется в уборке последней работы.
 
 ### Лабораторная работа 1. QoS-классы, requests и их cgroup
 
@@ -410,7 +410,7 @@ Pod big (request 20Gi), Pod greedy (limit 40Gi) ─► что делает sched
 Команда создаёт три пода: Guaranteed (request равен limit), Burstable (request есть, CPU-лимита нет) и BestEffort (без ресурсов), и ждёт их готовности.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: guaranteed}
@@ -444,7 +444,7 @@ spec:
     image: python:3.12-slim
     command: ["sleep", "infinity"]
 EOF
-kubectl wait --for=condition=Ready pod --all --timeout=90s
+k wait --for=condition=Ready pod --all --timeout=90s
 ```
 
 | Часть команды | Значение |
@@ -480,8 +480,8 @@ R+=' memory.min=$(cat /sys/fs/cgroup/memory.min)'
 R+='; echo oom.group=$(cat /sys/fs/cgroup/memory.oom.group)'
 R+=' oom_score_adj=$(cat /proc/1/oom_score_adj) nproc=$(nproc)'
 for p in guaranteed burstable besteffort; do
-  echo "== $p qos=$(kubectl get pod $p -o jsonpath='{.status.qosClass}')"
-  kubectl exec $p -- sh -c "$R"
+  echo "== $p qos=$(k get pod $p -o jsonpath='{.status.qosClass}')"
+  k exec $p -- sh -c "$R"
 done
 ```
 
@@ -524,13 +524,13 @@ oom.group=1 oom_score_adj=1000 nproc=12
 Команда печатает раздел `Allocated resources` узла, на котором работает burstable. Это то, что видит scheduler.
 
 ```bash
-kubectl describe node $(kubectl get pod burstable -o jsonpath='{.spec.nodeName}') \
+kubectl describe node $(k get pod burstable -o jsonpath='{.spec.nodeName}') \
   | sed -n '/Allocated resources/,/Events/p'
 ```
 
 | Часть команды | Значение |
 |---|---|
-| `kubectl get pod burstable -o jsonpath=…` | имя узла, на котором работает под |
+| `k get pod burstable -o jsonpath=…` | имя узла, на котором работает под |
 | `describe node` | подробное описание узла |
 | `sed -n '/Allocated resources/,/Events/p'` | оставить только раздел от заголовка до `Events` |
 
@@ -553,7 +553,7 @@ kubectl describe node $(kubectl get pod burstable -o jsonpath='{.spec.nodeName}'
 Команда создаёт два пода. Первому нужно 20Gi памяти по request, больше, чем есть на любом узле. Второй просит 64Mi, а лимит у него 40Gi.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: big}
@@ -578,8 +578,8 @@ spec:
       limits:   {memory: 40Gi}
 EOF
 sleep 5
-kubectl get pod big greedy
-kubectl get events --field-selector involvedObject.name=big,reason=FailedScheduling \
+k get pod big greedy
+k get events --field-selector involvedObject.name=big,reason=FailedScheduling \
   -o jsonpath='{.items[0].message}{"\n"}'
 ```
 
@@ -623,7 +623,7 @@ no new claims to deallocate, preemption: 0/4 nodes are available: 4 Preemption i
 **Уборка.** Команда удаляет все поды работы; namespace остаётся для следующих работ.
 
 ```bash
-kubectl delete pod guaranteed burstable besteffort big greedy --now
+k delete pod guaranteed burstable besteffort big greedy --now
 ```
 
 **Вопросы для самопроверки.**
@@ -669,7 +669,7 @@ Pod oom: limit 128Mi, процесс выделяет 200 MiB
 Команда создаёт под с лимитом 128Mi, процесс которого занимает 200 MiB, ждёт сорок пять секунд и читает статус.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: oom}
@@ -690,8 +690,8 @@ spec:
       limits:   {memory: 128Mi}
 EOF
 sleep 45
-kubectl get pod oom
-kubectl get pod oom -o jsonpath='{.status.containerStatuses[0].lastState}{"\n"}'
+k get pod oom
+k get pod oom -o jsonpath='{.status.containerStatuses[0].lastState}{"\n"}'
 ```
 
 | Часть команды | Значение |
@@ -722,7 +722,7 @@ oom    0/1     OOMKilled   3 (30s ago)   45s
 Команда выбирает события пода `oom` в виде таблицы: причина, число повторов и сообщение.
 
 ```bash
-kubectl get events --field-selector involvedObject.name=oom \
+k get events --field-selector involvedObject.name=oom \
   -o custom-columns=REASON:.reason,COUNT:.count,MSG:.message
 ```
 
@@ -749,7 +749,7 @@ BackOff     3       Back-off restarting failed container app in pod oom_lab-05-1
 Команда ищет в журнале ядра узла, где работает под, строки об OOM. На узле kind это `docker exec <узел> dmesg`, на обычном узле — `sudo dmesg` или `journalctl -k`.
 
 ```bash
-docker exec $(kubectl get pod oom -o jsonpath='{.spec.nodeName}') dmesg \
+docker exec $(k get pod oom -o jsonpath='{.spec.nodeName}') dmesg \
   | grep -iE 'out of memory|oom.group' | tail -2
 ```
 
@@ -782,12 +782,12 @@ Tasks in /system.slice/docker-…scope/…/kubelet-kubepods-burstable.slice/…/
 Команда пробует взять лог предыдущего экземпляра контейнера.
 
 ```bash
-kubectl logs oom --previous
+k logs oom --previous
 ```
 
 | Часть команды | Значение |
 |---|---|
-| `kubectl logs oom` | лог контейнера пода `oom` |
+| `k logs oom` | лог контейнера пода `oom` |
 | `--previous` | лог предыдущего, уже завершённого запуска |
 
 Результат зависит от момента. На стенде между перезапусками команда несколько раз вернула ошибку `unable to retrieve container logs for containerd://…`: kubelet уже удалил лог предыдущего экземпляра. Повтор через несколько секунд показывает лог, в котором стоит только строка `allocating 200 MiB`.
@@ -807,7 +807,7 @@ kubectl logs oom --previous
 **Уборка.**
 
 ```bash
-kubectl delete pod oom --now
+k delete pod oom --now
 ```
 
 **Вопросы для самопроверки.**
@@ -855,7 +855,7 @@ Pod cpu-limited  (request = limit = 200m)         ├─► work.py: ~100 мс C
 Команда создаёт два пода с одинаковым request. У cpu-limited лимит равен request, у cpu-free лимита CPU нет. Затем она пишет скрипт нагрузки.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: cpu-limited}
@@ -880,7 +880,7 @@ spec:
       requests: {cpu: 200m, memory: 64Mi}
       limits:   {memory: 128Mi}
 EOF
-kubectl wait --for=condition=Ready pod/cpu-limited pod/cpu-free --timeout=60s
+k wait --for=condition=Ready pod/cpu-limited pod/cpu-free --timeout=60s
 
 cat > ~/lab/k8s/05-1/work.py <<'EOF'
 import time
@@ -918,8 +918,8 @@ pod/cpu-free condition met
 ```bash
 for p in cpu-free cpu-limited; do
   echo "== $p"
-  kubectl cp ~/lab/k8s/05-1/work.py $p:/tmp/work.py
-  kubectl exec $p -- sh -c 'grep throttled /sys/fs/cgroup/cpu.stat
+  k cp ~/lab/k8s/05-1/work.py $p:/tmp/work.py
+  k exec $p -- sh -c 'grep throttled /sys/fs/cgroup/cpu.stat
     for i in 1 2 3; do python /tmp/work.py; done
     grep throttled /sys/fs/cgroup/cpu.stat'
 done
@@ -927,7 +927,7 @@ done
 
 | Часть команды | Значение |
 |---|---|
-| `kubectl cp … $p:/tmp/work.py` | скопировать скрипт внутрь пода |
+| `k cp … $p:/tmp/work.py` | скопировать скрипт внутрь пода |
 | `grep throttled /sys/fs/cgroup/cpu.stat` | счётчики троттлинга контейнера |
 | `for i in 1 2 3; do python …; done` | три последовательных «запроса» |
 
@@ -963,8 +963,8 @@ throttled_usec 43016
 Команда находит на узле cgroup пода cpu-limited и печатает квоту и счётчики пода и его контейнеров.
 
 ```bash
-N=$(kubectl get pod cpu-limited -o jsonpath='{.spec.nodeName}')
-U=$(kubectl get pod cpu-limited -o jsonpath='{.metadata.uid}' | tr - _)
+N=$(k get pod cpu-limited -o jsonpath='{.spec.nodeName}')
+U=$(k get pod cpu-limited -o jsonpath='{.metadata.uid}' | tr - _)
 docker exec $N sh -c "d=\$(find /sys/fs/cgroup -type d -name '*pod${U}.slice'); \
   echo pod: \$(cat \$d/cpu.max); \
   grep -E 'nr_periods|nr_throttled|throttled_usec' \$d/cpu.stat; \
@@ -1010,13 +1010,13 @@ throttled_usec 0
 Команда поднимает лимит cpu-limited до 500m без пересоздания пода, проверяет квоту в cgroup, а потом запускает четыре «запроса» одновременно в каждом поде. Сам механизм resize и его проверки разобраны в 05-2 (лабораторная работа 1, шаг 2), здесь он нужен только чтобы сменить квоту.
 
 ```bash
-kubectl patch pod cpu-limited --subresource resize \
+k patch pod cpu-limited --subresource resize \
   --patch '{"spec":{"containers":[{"name":"app","resources":
   {"requests":{"cpu":"500m"},"limits":{"cpu":"500m"}}}]}}'
-kubectl exec cpu-limited -- cat /sys/fs/cgroup/cpu.max
+k exec cpu-limited -- cat /sys/fs/cgroup/cpu.max
 for p in cpu-free cpu-limited; do
   echo "== $p"
-  kubectl exec $p -- sh -c 'for i in 1 2 3 4; do python /tmp/work.py & done; wait'
+  k exec $p -- sh -c 'for i in 1 2 3 4; do python /tmp/work.py & done; wait'
 done
 ```
 
@@ -1060,11 +1060,10 @@ one request: 1100 ms
 | Троттлинг контейнера может быть занижен | 2 периода у контейнера, 19 у пода |
 | Квота 500m — 50 мс на период 100 мс | `cpu.max` = `50000 100000` |
 
-**Уборка.** Команда удаляет поды, скрипт и namespace; возвращает kubectl к namespace `default`. Этой работой завершается серия: namespace `lab-05-1` удаляется вместе со всем, что в нём осталось.
+**Уборка.** Команда удаляет поды, скрипт и namespace. Этой работой завершается серия: namespace `lab-05-1` удаляется вместе со всем, что в нём осталось.
 
 ```bash
-kubectl delete pod cpu-limited cpu-free --now
-kubectl config set-context --current --namespace=default
+k delete pod cpu-limited cpu-free --now
 kubectl delete ns lab-05-1
 rm -f ~/lab/k8s/05-1/work.py
 rmdir ~/lab/k8s/05-1

@@ -419,12 +419,12 @@ docker push localhost:5001/lab-05-4/python:3.12-slim
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-05-4
-kubectl config set-context --current --namespace=lab-05-4
+k() { kubectl -n lab-05-4 "$@"; }
 mkdir -p ~/lab/k8s/05-4
 kubectl top nodes
 ```
 
-Первые три команды выбирают кластер стенда, создают namespace и делают его текущим для kubectl. Четвёртая создаёт каталог для манифестов, а `kubectl top nodes` должна показать CPU и память узлов: значит, metrics-server работает и HPA получит метрики. Namespace и каталог удаляет уборка последней работы.
+Первые три команды выбирают кластер стенда, создают namespace и определяют функцию `k` — короткое имя для `kubectl -n lab-05-4`. Функция живёт только в текущем окне терминала: в новом окне определите её снова. Четвёртая создаёт каталог для манифестов, а `kubectl top nodes` должна показать CPU и память узлов: значит, metrics-server работает и HPA получит метрики. Namespace и каталог удаляет уборка последней работы.
 
 ### Лабораторная работа 1. HPA без requests
 
@@ -452,7 +452,7 @@ Deployment noreq (без requests) ◄── scaleTargetRef ── HPA noreq (cp
 Команды создают Deployment без блока `resources` и HPA с целью 50 % CPU, а затем ждут 45 секунд, пока контроллер сделает первый расчёт.
 
 ```bash
-kubectl create deploy noreq --image=localhost:5001/orders-api:2.0 --port=8000
+k create deploy noreq --image=localhost:5001/orders-api:2.0 --port=8000
 cat > ~/lab/k8s/05-4/noreq-hpa.yaml <<'EOF'
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -467,8 +467,8 @@ spec:
       name: cpu
       target: {type: Utilization, averageUtilization: 50}
 EOF
-kubectl apply -f ~/lab/k8s/05-4/noreq-hpa.yaml
-sleep 45; kubectl get hpa noreq
+k apply -f ~/lab/k8s/05-4/noreq-hpa.yaml
+sleep 45; k get hpa noreq
 ```
 
 | Часть команды | Значение |
@@ -496,7 +496,7 @@ noreq   Deployment/noreq   cpu: <unknown>/50%   1         5         1
 
 ```bash
 CJ='{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}'
-kubectl get hpa noreq -o jsonpath="$CJ"
+k get hpa noreq -o jsonpath="$CJ"
 ```
 
 | Часть команды | Значение |
@@ -524,9 +524,9 @@ ScalingActive=False FailedGetResourceMetric: the HPA was unable to compute the r
 Команда задаёт requests CPU 100m, Deployment пересоздаёт под, и через минуту HPA читает метрики.
 
 ```bash
-kubectl set resources deploy noreq --requests=cpu=100m
-kubectl rollout status deploy/noreq
-sleep 60; kubectl get hpa noreq
+k set resources deploy noreq --requests=cpu=100m
+k rollout status deploy/noreq
+sleep 60; k get hpa noreq
 ```
 
 | Часть команды | Значение |
@@ -555,8 +555,8 @@ noreq   Deployment/noreq   cpu: <число>%/50%  1         5         1
 **Уборка.** Удаляем HPA и Deployment этой работы.
 
 ```bash
-kubectl delete hpa noreq
-kubectl delete deploy noreq
+k delete hpa noreq
+k delete deploy noreq
 rm -f ~/lab/k8s/05-4/noreq-hpa.yaml
 ```
 
@@ -637,8 +637,8 @@ spec:
       name: cpu
       target: {type: Utilization, averageUtilization: 50}
 EOF
-kubectl apply -f ~/lab/k8s/05-4/api.yaml -f ~/lab/k8s/05-4/hpa.yaml
-kubectl rollout status deploy/api
+k apply -f ~/lab/k8s/05-4/api.yaml -f ~/lab/k8s/05-4/hpa.yaml
+k rollout status deploy/api
 ```
 
 | Часть команды | Значение |
@@ -661,7 +661,7 @@ deployment "api" successfully rolled out
 Нужны две функции оболочки. Функция `load` запускает под, который шлёт запросы в `/work?ms=40` шестью потоками. Функция `mon` раз в 5 секунд читает загрузку и число реплик и печатает строку при изменении. Функции живут в текущем окне терминала, поэтому все шаги работы выполняют в нём.
 
 ```bash
-load() { kubectl run load --image=python:3.12-slim --command -- python -c "
+load() { k run load --image=python:3.12-slim --command -- python -c "
 import urllib.request, threading, time
 def w():
     while True:
@@ -675,9 +675,9 @@ JP="$JP desired={.status.desiredReplicas} current={.status.currentReplicas}"
 mon() { t0=$(date +%s); prev=""; stopped=0
   while [ $(( $(date +%s)-t0 )) -lt $1 ]; do t=$(( $(date +%s)-t0 ))
     if [ $stopped = 0 ] && [ $t -ge $2 ]; then
-      kubectl delete pod load --now >/dev/null; echo "t=+${t}s LOAD STOPPED"; stopped=1
+      k delete pod load --now >/dev/null; echo "t=+${t}s LOAD STOPPED"; stopped=1
     fi
-    s=$(kubectl get hpa api -o jsonpath="$JP")
+    s=$(k get hpa api -o jsonpath="$JP")
     [ "$s" != "$prev" ] && echo "t=+${t}s cpu=$s" && prev=$s
     sleep 5
   done; }
@@ -685,7 +685,7 @@ mon() { t0=$(date +%s); prev=""; stopped=0
 
 | Часть команды | Значение |
 |---|---|
-| `kubectl run load … python -c` | под, который запускает Python с шестью потоками |
+| `k run load … python -c` | под, который запускает Python с шестью потоками |
 | `/work?ms=40` | ручка orders-api, которая 40 мс жжёт CPU |
 | `JP` | шаблон jsonpath: загрузка, желаемые и текущие реплики |
 | `mon 600 180` | наблюдать 600 с, на 180-й секунде удалить `load` |
@@ -727,12 +727,12 @@ t=+538s  cpu=1% desired=1 current=1
 Команда накладывает на HPA ограничение: рост не больше +2 пода за 30 с, падение не больше −50 % за 15 с с окном 30 с. Затем нагрузка запускается снова, и опыт длится 5 минут.
 
 ```bash
-kubectl patch hpa api --type=merge -p '{"spec":{"behavior":{
+k patch hpa api --type=merge -p '{"spec":{"behavior":{
   "scaleUp":{"stabilizationWindowSeconds":0,
              "policies":[{"type":"Pods","value":2,"periodSeconds":30}]},
   "scaleDown":{"stabilizationWindowSeconds":30,
                "policies":[{"type":"Percent","value":50,"periodSeconds":15}]}}}}'
-load; kubectl wait --for=condition=Ready pod/load; mon 300 150
+load; k wait --for=condition=Ready pod/load; mon 300 150
 ```
 
 | Часть команды | Значение |
@@ -775,8 +775,8 @@ t=+239s cpu=1% desired=1 current=2
 **Уборка.** Удаляем HPA, приложение и нагрузку. Файлы манифестов остаются для работы 3.
 
 ```bash
-kubectl delete -f ~/lab/k8s/05-4/hpa.yaml -f ~/lab/k8s/05-4/api.yaml
-kubectl delete pod load --ignore-not-found --now
+k delete -f ~/lab/k8s/05-4/hpa.yaml -f ~/lab/k8s/05-4/api.yaml
+k delete pod load --ignore-not-found --now
 ```
 
 **Вопросы для самопроверки.**
@@ -858,10 +858,10 @@ pod/keda-operator-metrics-apiserver-… condition met
 Команды создают Deployment `api`, вычисляют окно (старт через 2 минуты, конец через 4) по московскому времени, создают ScaledObject и 6 минут печатают изменения. Команда `date -d` — это GNU date из Ubuntu и Manjaro.
 
 ```bash
-kubectl apply -f ~/lab/k8s/05-4/api.yaml
+k apply -f ~/lab/k8s/05-4/api.yaml
 S1=$(TZ=Europe/Moscow date -d '+2 min' +'%M %H')
 E1=$(TZ=Europe/Moscow date -d '+4 min' +'%M %H')
-kubectl apply -f - <<EOF
+k apply -f - <<EOF
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata: {name: api}
@@ -876,9 +876,9 @@ spec:
 EOF
 SO='{.status.conditions[?(@.type=="Active")].status}'
 prev=""; for i in $(seq 1 72); do
-  s="replicas=$(kubectl get deploy api -o jsonpath='{.spec.replicas}')"
-  s="$s/ready=$(kubectl get deploy api -o jsonpath='{.status.readyReplicas}')"
-  s="$s active=$(kubectl get scaledobject api -o jsonpath="$SO")"
+  s="replicas=$(k get deploy api -o jsonpath='{.spec.replicas}')"
+  s="$s/ready=$(k get deploy api -o jsonpath='{.status.readyReplicas}')"
+  s="$s active=$(k get scaledobject api -o jsonpath="$SO")"
   [ "$s" != "$prev" ] && echo "$(TZ=Europe/Moscow date +%H:%M:%S) $s" && prev=$s
   sleep 5
 done
@@ -913,7 +913,7 @@ done
 Команда показывает все HPA namespace с владельцем и целью.
 
 ```bash
-kubectl get hpa -o custom-columns=NAME:.metadata.name,TARGET:.spec.scaleTargetRef.name,\
+k get hpa -o custom-columns=NAME:.metadata.name,TARGET:.spec.scaleTargetRef.name,\
 OWNER:.metadata.ownerReferences[0].kind
 ```
 
@@ -943,13 +943,12 @@ keda-hpa-api   api      ScaledObject
 **Уборка.** Удаляем ScaledObject и приложение, затем KEDA, её CRD и репозиторий Helm, потом namespace и каталог.
 
 ```bash
-kubectl delete scaledobject api
-kubectl delete -f ~/lab/k8s/05-4/api.yaml
+k delete scaledobject api
+k delete -f ~/lab/k8s/05-4/api.yaml
 helm -n keda uninstall keda
 kubectl delete ns keda
 kubectl get crd -o name | grep keda.sh | xargs -r kubectl delete
 helm repo remove kedacore
-kubectl config set-context --current --namespace=default
 kubectl delete ns lab-05-4
 rm -rf ~/lab/k8s/05-4
 ```

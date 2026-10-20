@@ -365,11 +365,11 @@ $X $E get /registry/secrets/lab-04-1/db --print-value-only | strings
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-04-1
-kubectl config set-context --current --namespace=lab-04-1
+k() { kubectl -n lab-04-1 "$@"; }
 mkdir -p ~/lab/k8s/04-1
 ```
 
-Первая команда выбирает кластер стенда, вторая создаёт namespace, третья делает его текущим, а четвёртая готовит каталог для временных файлов.
+Первая команда выбирает кластер стенда, вторая создаёт namespace, третья определяет функцию `k` — короткое имя для `kubectl -n lab-04-1`, а четвёртая готовит каталог для временных файлов.
 
 ### Лабораторная работа 1. Обновление конфигурации: переменная, том, subPath
 
@@ -396,9 +396,9 @@ patch ConfigMap ──► засечь секунды до изменения к
 Команда создаёт ConfigMap с переменной и файлом, затем под orders-api, который подключает их тремя способами.
 
 ```bash
-kubectl create configmap app --from-literal=FEATURE_DISCOUNT=off \
+k create configmap app --from-literal=FEATURE_DISCOUNT=off \
   --from-literal=config.json='{"discount_percent": 0, "banner": "welcome"}'
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: api}
@@ -416,7 +416,7 @@ spec:
   - name: cfg
     configMap: {name: app, items: [{key: config.json, path: config.json}]}
 EOF
-kubectl wait --for=condition=Ready pod/api
+k wait --for=condition=Ready pod/api
 ```
 
 | Часть команды | Значение |
@@ -438,7 +438,7 @@ kubectl wait --for=condition=Ready pod/api
 
 ```bash
 show() {
-  kubectl exec api -- python -c "
+  k exec api -- python -c "
 import json, urllib.request as u
 c = json.loads(u.urlopen('http://127.0.0.1:8000/config').read())
 s = json.load(open('/etc/orders-subpath/config.json'))
@@ -447,7 +447,7 @@ print('env=' + str(c['env_FEATURE_DISCOUNT']),
       'subPath=' + str(s.get('discount_percent')))"
 }
 show
-kubectl exec api -- ls -la /etc/orders/
+k exec api -- ls -la /etc/orders/
 ```
 
 | Часть команды | Значение |
@@ -480,7 +480,7 @@ lrwxrwxrwx config.json -> ..data/config.json
 Команда меняет оба значения, запоминает время и каждые 2 секунды вызывает `show`, пока том не покажет новое значение.
 
 ```bash
-kubectl patch configmap app -p '{"data":{"FEATURE_DISCOUNT":"on",
+k patch configmap app -p '{"data":{"FEATURE_DISCOUNT":"on",
   "config.json":"{\"discount_percent\": 15, \"banner\": \"sale\"}"}}'
 t0=$(date +%s)
 until show | grep -q 'volume=15'; do sleep 2; done
@@ -516,10 +516,10 @@ env=off volume=15 subPath=0
 
 ```bash
 for v in 20 25; do
-  kubectl patch configmap app -p \
+  k patch configmap app -p \
     "{\"data\":{\"config.json\":\"{\\\"discount_percent\\\": $v}\"}}"
   t0=$(date +%s)
-  until kubectl exec api -- cat /etc/orders/config.json | grep -q "$v"; do sleep 1; done
+  until k exec api -- cat /etc/orders/config.json | grep -q "$v"; do sleep 1; done
   echo "change to $v: volume updated after $(( $(date +%s) - t0 ))s"
 done
 ```
@@ -544,7 +544,7 @@ change to 25: volume updated after 63s
 Команда запрашивает конфигурацию kubelet узла, на котором работает под, и выбирает два поля.
 
 ```bash
-NODE=$(kubectl get pod api -o jsonpath='{.spec.nodeName}')
+NODE=$(k get pod api -o jsonpath='{.spec.nodeName}')
 kubectl get --raw /api/v1/nodes/$NODE/proxy/configz \
   | jq -c '.kubeletconfig | {configMapAndSecretChangeDetectionStrategy, syncFrequency}'
 ```
@@ -572,8 +572,8 @@ kubectl get --raw /api/v1/nodes/$NODE/proxy/configz \
 **Уборка.**
 
 ```bash
-kubectl delete pod api
-kubectl delete configmap app
+k delete pod api
+k delete configmap app
 ```
 
 **Вопросы для самопроверки.**
@@ -616,10 +616,10 @@ Secret db ── API: base64 ──► base64 -d ──► пароль
 Команды создают ConfigMap, включают `immutable`, затем пытаются изменить данные и снять флаг.
 
 ```bash
-kubectl create configmap frozen --from-literal=k=v1
-kubectl patch configmap frozen -p '{"immutable":true}'
-kubectl patch configmap frozen -p '{"data":{"k":"v2"}}'
-kubectl patch configmap frozen -p '{"immutable":false}'
+k create configmap frozen --from-literal=k=v1
+k patch configmap frozen -p '{"immutable":true}'
+k patch configmap frozen -p '{"data":{"k":"v2"}}'
+k patch configmap frozen -p '{"immutable":false}'
 ```
 
 | Часть команды | Значение |
@@ -648,7 +648,7 @@ configmap/frozen patched
 
 ```bash
 head -c 1100000 /dev/urandom | base64 -w0 | head -c 1100000 > ~/lab/k8s/04-1/big.txt
-kubectl create configmap big --from-file=$HOME/lab/k8s/04-1/big.txt
+k create configmap big --from-file=$HOME/lab/k8s/04-1/big.txt
 rm ~/lab/k8s/04-1/big.txt
 ```
 
@@ -672,9 +672,9 @@ ConfigMap "big" is invalid: []: Too long: may not be more than 1048576 bytes
 Команда создаёт Secret с паролем, читает его из API и раскодирует base64.
 
 ```bash
-kubectl create secret generic db --from-literal=password='S3cr3t-P@ss'
-kubectl get secret db -o jsonpath='{.data.password}'; echo
-kubectl get secret db -o jsonpath='{.data.password}' | base64 -d; echo
+k create secret generic db --from-literal=password='S3cr3t-P@ss'
+k get secret db -o jsonpath='{.data.password}'; echo
+k get secret db -o jsonpath='{.data.password}' | base64 -d; echo
 ```
 
 | Часть команды | Значение |
@@ -735,7 +735,7 @@ S3cr3t-P@ss
 **Уборка.** Secret `db` останется для работы 3, а ненужные ConfigMap удаляем.
 
 ```bash
-kubectl delete configmap frozen
+k delete configmap frozen
 ```
 
 **Вопросы для самопроверки.**
@@ -876,10 +876,10 @@ ec() {
   echo "   contains plaintext: $($X $E get /registry/secrets/lab-04-1/$1 --print-value-only \
     | strings | grep -c S3cr3t)"
 }
-kubectl create secret generic db2 --from-literal=password='S3cr3t-P@ss'
+k create secret generic db2 --from-literal=password='S3cr3t-P@ss'
 ec db
 ec db2
-kubectl get secret db2 -o jsonpath='{.data.password}' | base64 -d; echo
+k get secret db2 -o jsonpath='{.data.password}' | base64 -d; echo
 kubectl get secrets -A -o json | kubectl replace -f - > /dev/null
 ec db
 ```
@@ -985,16 +985,15 @@ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: orders.localhost' \
 | Метрика показывает используемые провайдеры | шаг 5 |
 | Отключают в обратном порядке, ключ удаляют последним | шаги 5 и 6 |
 
-**Уборка.** Шаги 5 и 6 вернули узел в исходное состояние. Остаётся удалить namespace и вернуть namespace по умолчанию.
+**Уборка.** Шаги 5 и 6 вернули узел в исходное состояние. Остаётся удалить namespace.
 
 ```bash
-kubectl config set-context --current --namespace=default
 kubectl delete ns lab-04-1
 rmdir ~/lab/k8s/04-1
 unset CP F E X
 ```
 
-Первая команда возвращает namespace по умолчанию, вторая удаляет всё созданное работами 1–3, третья убирает пустой каталог, четвёртая очищает переменные шелла.
+Первая команда удаляет всё созданное работами 1–3, вторая убирает пустой каталог, третья очищает переменные шелла.
 
 **Вопросы для самопроверки.**
 

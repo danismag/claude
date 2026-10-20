@@ -443,7 +443,7 @@ mkdir -p ~/lab/k8s/03-5
 
 **Риски.** Работа ставит в кластер cert-manager и меняет общий Gateway стенда.
 
-- **Что меняется:** в кластере — namespace `cert-manager`, CRD cert-manager (кластерные объекты) и ClusterIssuer; в Gateway `lab` — одна аннотация и второй listener; в `~/.kube/config` — namespace по умолчанию.
+- **Что меняется:** в кластере — namespace `cert-manager`, CRD cert-manager (кластерные объекты) и ClusterIssuer; в Gateway `lab` — одна аннотация и второй listener.
 - **Надолго ли:** до уборки; уборка убирает listener, аннотацию, CRD и все объекты.
 - **Безопасность:** привилегий на хосте не нужно; закрытый ключ CA живёт в Secret кластера стенда.
 - **Влияние на систему:** другие части курса работают, пока Gateway `lab` содержит свой первый listener; rolling-обновление Envoy при смене listener занимает секунды.
@@ -477,8 +477,8 @@ cert-manager (ns cert-manager):
 
 ```bash
 kubectl create ns lab-03-5
-kubectl config set-context --current --namespace=lab-03-5
-kubectl apply -f - <<'EOF'
+k() { kubectl -n lab-03-5 "$@"; }
+k apply -f - <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: api}
@@ -509,7 +509,7 @@ spec:
   hostnames: ["shop.localhost"]
   rules: [{backendRefs: [{name: api, port: 80}]}]
 EOF
-kubectl rollout status deploy/api
+k rollout status deploy/api
 ```
 
 Разбор команд:
@@ -517,7 +517,7 @@ kubectl rollout status deploy/api
 | Часть команды | Значение |
 |---|---|
 | `create ns lab-03-5` | namespace с именем части |
-| `set-context --current --namespace=` | сделать его namespace по умолчанию |
+| `k() { … }` | короткая команда `kubectl -n lab-03-5` |
 | `readinessProbe … /ready` | Service получит только готовые поды (02-5) |
 | `parentRefs: [{name: lab, …}]` | прицепить маршрут к Gateway стенда |
 | `hostnames: ["shop.localhost"]` | маршрут отвечает только на это имя |
@@ -815,7 +815,6 @@ kubectl delete clusterissuer selfsigned lab-ca
 helm -n cert-manager uninstall cert-manager
 kubectl delete ns cert-manager
 kubectl get crd -o name | grep cert-manager.io | xargs kubectl delete
-kubectl config set-context --current --namespace=default
 kubectl delete ns lab-03-5
 rm -rf ~/lab/k8s/03-5
 curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders
@@ -863,7 +862,7 @@ Envoy оборвал соединение на уровне TLS: SNI клиен�
 
 **Риски.** Работа меняет только кластер стенда и общий каталог в `~/lab/k8s`.
 
-- **Что меняется:** namespace `lab-03-5` с подом и Service; в `~/.kube/config` — namespace по умолчанию; в каталоге `~/lab/k8s/03-5` лежат ключи и сертификаты.
+- **Что меняется:** namespace `lab-03-5` с подом и Service; в каталоге `~/lab/k8s/03-5` лежат ключи и сертификаты.
 - **Надолго ли:** до уборки; уборка удаляет namespace и каталог.
 - **Безопасность:** ключи тестовые и живут 30 дней; Gateway `lab` не меняется, маршрут прицепляется к существующему listener.
 - **Влияние на систему:** другие хосты Gateway не затрагиваются.
@@ -932,10 +931,10 @@ subject=CN=secure
 
 ```bash
 kubectl create ns lab-03-5
-kubectl config set-context --current --namespace=lab-03-5
-kubectl create configmap backend-ca --from-file=ca.crt=ca.crt
-kubectl create secret tls backend-tls --cert=tls.crt --key=tls.key
-kubectl apply -f - <<'EOF'
+k() { kubectl -n lab-03-5 "$@"; }
+k create configmap backend-ca --from-file=ca.crt=ca.crt
+k create secret tls backend-tls --cert=tls.crt --key=tls.key
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: ConfigMap
 metadata: {name: server-py}
@@ -984,7 +983,7 @@ spec:
   selector: {app: secure}
   ports: [{name: https, port: 443, targetPort: https}]
 EOF
-kubectl rollout status deploy/secure
+k rollout status deploy/secure
 ```
 
 Разбор ключей манифеста:
@@ -1021,7 +1020,7 @@ deployment "secure" successfully rolled out
 Создаём маршрут `secure.localhost` на этот Service и обращаемся к нему с хоста. Gateway пока не знает, что бэкенд говорит по TLS, и шлёт открытый HTTP на порт TLS.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata: {name: secure}
@@ -1060,7 +1059,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://secure.localhost:8088/
 Политика велит Envoy подключаться к Service `secure` по TLS и проверять сертификат по корню из ConfigMap `backend-ca`. Имя `hostname` совпадает с SAN сертификата из шага 1.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: gateway.networking.k8s.io/v1
 kind: BackendTLSPolicy
 metadata: {name: secure}
@@ -1099,7 +1098,7 @@ hello from tls backend
 Политика сообщает о принятии в `status.ancestors`: по одной записи на каждый Gateway, к которому относится Service. Читаем условия.
 
 ```bash
-kubectl get backendtlspolicy secure \
+k get backendtlspolicy secure \
   -o jsonpath='{range .status.ancestors[*].conditions[*]}{.type}={.status} {.reason}{"\n"}{end}'
 ```
 
@@ -1121,7 +1120,7 @@ ResolvedRefs=True ResolvedRefs
 Меняем `hostname` на имя, которого нет в SAN. Соединение TLS теперь не пройдёт проверку, хотя корень верный.
 
 ```bash
-kubectl patch backendtlspolicy secure --type=json \
+k patch backendtlspolicy secure --type=json \
   -p '[{"op":"replace","path":"/spec/validation/hostname","value":"wrong.example.com"}]'
 sleep 3
 curl -s -o /dev/null -w '%{http_code}\n' http://secure.localhost:8088/
@@ -1156,10 +1155,9 @@ curl -s -o /dev/null -w '%{http_code}\n' http://secure.localhost:8088/
 | Неверное имя ломает проверку | код 503 в шаге 6 |
 | Снаружи ошибки TLS и сети выглядят одинаково | логи Envoy |
 
-**Уборка.** Удаляем namespace, возвращаем namespace по умолчанию и стираем ключи. Gateway `lab` в этой работе не менялся.
+**Уборка.** Удаляем namespace и стираем ключи. Gateway `lab` в этой работе не менялся.
 
 ```bash
-kubectl config set-context --current --namespace=default
 kubectl delete ns lab-03-5
 rm -rf ~/lab/k8s/03-5
 ```
@@ -1206,7 +1204,7 @@ Envoy не получил ответ от апстрима и сообщает �
 
 **Риски.** Работа меняет только namespace `lab-03-5` и каталог `~/lab/k8s/03-5`.
 
-- **Что меняется:** в кластере — namespace с подами и объектами Ingress и HTTPRoute; в `~/.kube/config` — namespace по умолчанию; на хосте — бинарник `ingress2gateway` в `~/go/bin` или в каталоге из PATH.
+- **Что меняется:** в кластере — namespace с подами и объектами Ingress и HTTPRoute; на хосте — бинарник `ingress2gateway` в `~/go/bin` или в каталоге из PATH.
 - **Надолго ли:** до уборки; бинарник остаётся, если вы не удалите его сами.
 - **Безопасность:** конвертер только читает входной файл и печатает манифесты; в кластер он ничего не пишет.
 - **Влияние на систему:** общий Gateway стенда не меняется.
@@ -1276,9 +1274,9 @@ HTTPRoute (parentRefs → Gateway lab) ──► Service api ──► поды 
 
 ```bash
 kubectl create ns lab-03-5
-kubectl config set-context --current --namespace=lab-03-5
+k() { kubectl -n lab-03-5 "$@"; }
 mkdir -p ~/lab/k8s/03-5
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: api}
@@ -1316,7 +1314,7 @@ spec:
         pathType: Prefix
         backend: {service: {name: api, port: {number: 80}}}
 EOF
-kubectl rollout status deploy/api
+k rollout status deploy/api
 ```
 
 Разбор ключей:
@@ -1351,8 +1349,8 @@ deployment "api" successfully rolled out
 
 ```bash
 kubectl get ingressclass
-kubectl get ingress shop-legacy
-kubectl get ingress shop-legacy -o jsonpath='{.status}{"\n"}'
+k get ingress shop-legacy
+k get ingress shop-legacy -o jsonpath='{.status}{"\n"}'
 curl -s -o /dev/null -w '%{http_code}\n' http://legacy.localhost:8088/
 ```
 
@@ -1478,7 +1476,7 @@ ingress2gateway print --input-file ingress.yaml \
 
 ```bash
 grep -E '^kind:|^  name:|gatewayClassName|type: RequestRedirect|request:' gateway.yaml
-kubectl apply --dry-run=server -f gateway.yaml
+k apply --dry-run=server -f gateway.yaml
 ```
 
 Разбор команд:
@@ -1528,7 +1526,6 @@ httproute.gateway.networking.k8s.io/shop-legacy-legacy-localhost created (server
 **Уборка.** Удаляем namespace и каталог. Бинарник ingress2gateway остаётся в `~/go/bin`: удалите его, если инструмент больше не нужен.
 
 ```bash
-kubectl config set-context --current --namespace=default
 kubectl delete ns lab-03-5
 rm -rf ~/lab/k8s/03-5
 rm -f ~/go/bin/ingress2gateway

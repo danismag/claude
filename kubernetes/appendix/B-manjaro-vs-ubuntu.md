@@ -16,7 +16,7 @@
 
 Docker запускает узлы kind и реестр стенда, поэтому его ставят первым. Курс требует Docker 27 или новее (00-1, работа 1, шаг 2).
 
-- **Ubuntu 24.04.** Пакет `docker.io`: в выпуске 24.0.7, в обновлениях `noble-updates` — 29.1.3. Версию покажет `apt-cache policy docker.io`. Если она ниже 27, берите `docker-ce` из репозитория Docker.
+- **Ubuntu 24.04.** Пакет `docker.io`: в исходном выпуске 24.0.7, в `noble-updates` и `noble-security` — 29.1.3. Версию покажет `apt-cache policy docker.io`. Если она ниже 27, берите `docker-ce` из репозитория Docker.
 - **Manjaro.** Пакет `docker` (29.7.2 на машине автора). Службу включают вручную: `sudo systemctl enable --now docker`.
 - **Обе системы.** Команда `sudo usermod -aG docker "$USER"` и новый вход в сеанс. Группа `docker` даёт права, равные root на хосте.
 
@@ -58,7 +58,7 @@ Docker запускает узлы kind и реестр стенда, поэто
 
 Замечания к обеим таблицам:
 
-- **kind, kubectl, helm, kustomize, k9s, stern.** В Ubuntu 24.04 стандартных пакетов для них нет. Для kubectl и cri-tools добавляют репозиторий `pkgs.k8s.io` (00-1, работа 1, шаг 3).
+- **Пакеты Ubuntu.** В Ubuntu 24.04 нет пакетов kind, kubectl, helm, kustomize, k9s, stern, krew, argocd, cosign и velero. Для kubectl и cri-tools добавляют репозиторий `pkgs.k8s.io` (00-1, работа 1, шаг 3).
 - **kubectx.** В Ubuntu 24.04 есть пакет `kubectx` версии 0.9.5, а курс использует 0.11.0 из релиза (00-2, работа 1, шаг 9).
 - **Helm 4 и kustomize.** В Helm 4 флаг `--rollback-on-failure` заменил `--atomic`, а server-side apply включён по умолчанию (07-1). В курсе хватает `kubectl kustomize`; отдельный бинарник нужен для `kustomize edit` (07-3 §3).
 - **argocd.** Версия клиента должна совпадать с версией сервера, 3.5.5 (08-1 §3). Пакет Manjaro на машине автора был 3.4.2, поэтому сверяйте `argocd version --client`.
@@ -95,9 +95,16 @@ sha256sum --ignore-missing -c ФАЙЛ_СУММ    # ждём строку «…
 | kubectx | checksums.txt | 00-2, работа 1 |
 | stern | checksums.txt | 00-2, работа 3 |
 | k9s | checksums.sha256 | 00-2, работа 3 |
-| krew | .sha256 рядом с архивом | 00-2, работа 1 |
+| krew | krew-linux_amd64.tar.gz.sha256 | 00-2, работа 1 |
 
-Разбор: для cosign файл сумм содержит строки для разных платформ, поэтому курс сначала выбирает свою строку командой `grep ' cosign-linux-amd64$' cosign_checksums.txt | sha256sum -c -`. Для kind, helm, etcd и kustomize курс не показывает проверку суммы. Имя файла сумм у них смотрите на странице релиза проекта.
+Разбор: для cosign файл сумм содержит строки для разных платформ, поэтому курс сначала выбирает свою строку командой `grep ' cosign-linux-amd64$' cosign_checksums.txt | sha256sum -c -`. Файл krew содержит только сумму, без имени архива, поэтому `sha256sum -c` его не прочитает. Строку для проверки собирают сами: `echo "$(cat krew-linux_amd64.tar.gz.sha256)  krew-linux_amd64.tar.gz" | sha256sum -c -`.
+
+Для kind, helm, etcd и kustomize курс не показывает проверку суммы, но файлы сумм у них есть:
+
+- **kind** — `kind-linux-amd64.sha256sum` на странице релиза;
+- **helm** — `helm-v4.2.2-linux-amd64.tar.gz.sha256` на `get.helm.sh`, только сумма, как у krew;
+- **etcd** — `SHA256SUMS` на странице релиза;
+- **kustomize** — `checksums.txt` на странице релиза с тегом `kustomize/v5.8.1`.
 
 После проверки файл кладут в `PATH` командой `sudo install -m 0755 файл /usr/local/bin/имя`. Права 0755 разрешают всем запуск и запрещают запись.
 
@@ -113,7 +120,7 @@ sha256sum --ignore-missing -c ФАЙЛ_СУММ    # ждём строку «…
 sysctl fs.inotify.max_user_instances fs.inotify.max_user_watches
 ```
 
-Команда печатает два лимита. Ubuntu по умолчанию даёт 128 экземпляров, и четыре узла с этим лимитом падают с ошибкой `too many open files`. На машине автора в Manjaro стояло 1024, ошибок не было.
+Команда печатает два лимита. Ядро по умолчанию даёт 128 экземпляров, и с таким лимитом четыре узла kind падают с ошибкой `too many open files`. Лимит наблюдений ядро считает при загрузке от объёма памяти, от 8192 до 1048576 (00-1). На машине автора в Manjaro стояло 1024 экземпляра, и ошибок не было.
 
 Курс поднимает лимиты до значений из документации kind: 512 экземпляров и 524288 наблюдений.
 
@@ -165,11 +172,11 @@ docker exec lab-worker cat /sys/module/apparmor/parameters/enabled
 | Режим nftables в kube-proxy | 5.13 | 03-2 §1 |
 | User namespaces подов | 6.3 | 06-2, работа 3 |
 
-Ubuntu 24.04 поставляется с ядром 6.8. В Manjaro ядро выбирают из установленных: список покажет `mhwd-kernel -li`, текущее — `uname -r`. Версии ядра машины автора в плане не записаны, поэтому работа 3 из 06-2 помечена как непроверенная.
+Ubuntu 24.04 ставит ядро 6.8 из пакета `linux-generic` (GA), а пакет `linux-generic-hwe-24.04` (HWE) в октябре 2026 года даёт ядро 7.0. Оба ядра новее всех версий из таблицы. В Manjaro ядро выбирают из установленных: список покажет `mhwd-kernel -li`, текущее — `uname -r`. Версии ядра машины автора в плане не записаны, поэтому работа 3 из 06-2 помечена как непроверенная.
 
 ### Прочие отличия хоста
 
-- **Имена `*.localhost`.** Systemd-resolved в Ubuntu сопоставляет их с 127.0.0.1. На машине автора в Manjaro `getent hosts orders.localhost` вернул `::1`, и если Envoy слушает только IPv4, используйте `curl -4` или `127.0.0.1` с заголовком `-H Host:`.
+- **Имена `*.localhost`.** Systemd-resolved отвечает на них двумя адресами, 127.0.0.1 и ::1, а порт 8088 стенд открывает только на 127.0.0.1. На машине автора в Manjaro `getent hosts orders.localhost` вернул `::1`. Если клиент получает отказ по IPv6, используйте `curl -4` или `127.0.0.1` с заголовком `-H Host:`.
 - **Порт 8088.** Стенд занимает его вместо 8080, потому что на машине автора 8080 был занят.
 - **Диск.** Под `/var/lib/docker` нужно не меньше 20 ГБ свободно (00-1, работа 1, шаг 1). Kind отключает пороги eviction, поэтому DiskPressure на стенде не воспроизводится (00-1 §6, 01-2 §6).
 - **Автодополнение bash.** В Ubuntu ставят `bash-completion` и пишут вывод `kubectl completion bash` в `/etc/bash_completion.d/kubectl`. В Manjaro пакеты kubectl и helm кладут файлы дополнения сами.
@@ -186,10 +193,10 @@ Ubuntu 24.04 поставляется с ядром 6.8. В Manjaro ядро в�
 
 Курс написан в режиме «только текст»: команды установки не запускались. Проверка по частям записана в таблице 00-plan §7.
 
-- **Ubuntu 24.04.** Установка Docker, kind, kubectl, helm, kubectx, krew, stern, k9s, crictl не выполнялась (00-plan §7, строки 00-1 и 00-2). Проверены только версии и наличие пакетов на сайте packages.ubuntu.com.
-- **Manjaro.** Версии kind, kubectl, helm, kustomize, k9s, stern, kubectx, krew, argocd, docker взяты из `pacman -Si` на машине автора. Пакеты `crictl`, `cosign`, `etcd`, `jq` названы в карточках частей, но версии не снимались; в плане § 7 пакеты crictl, krew, kubectx, stern и k9s отмечены как непроверенные.
-- **Файлы сумм.** Имена файлов сумм для kind, helm, etcd и kustomize не проверялись.
-- **inotify.** Значение 128 для Ubuntu взято из документации kind и из текста 00-1; на реальной Ubuntu 24.04 оно не снималось.
+- **Ubuntu 24.04.** Установка Docker, kind, kubectl, helm, kubectx, krew, stern, k9s, crictl не выполнялась (00-plan §7, строки 00-1 и 00-2). Проверены только версии и наличие пакетов, включая ядра GA и HWE, на сайте packages.ubuntu.com.
+- **Manjaro.** Версии kind, kubectl, helm, kustomize, k9s, stern, kubectx, krew, argocd, docker взяты из `pacman -Si` на машине автора. Пакеты `crictl`, `cosign`, `etcd`, `jq` названы в карточках частей, но версии не снимались; в плане §7 пакеты crictl, krew, kubectx, stern и k9s отмечены как непроверенные. Сайт archlinux.org был недоступен, поэтому названия пакетов повторно не сверялись.
+- **Файлы сумм.** Имена сверены со страницами релизов GitHub в октябре 2026 года. Сайт `get.helm.sh` был недоступен, поэтому имя файла helm взято из скрипта установки Helm.
+- **inotify.** Значение 128 совпадает с умолчанием ядра и с документацией kind, но на реальной Ubuntu 24.04 оно не снималось.
 - **AppArmor.** Ответы `Y` и `N` для Ubuntu и Manjaro типичны, а не измерены (00-plan §7, строка 06-2).
 
 ---

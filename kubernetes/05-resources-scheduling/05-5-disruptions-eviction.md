@@ -420,14 +420,14 @@ Swap (05-2) на узле включается вручную: нужны `failS
 
 Работы идут на стенде 00-1 в namespace `lab-05-5`. Работы выполняют по порядку. Работа 1 выводит из строя узел `lab-worker` на несколько минут, а работа 3 временно меняет конфигурацию kubelet на `lab-worker3`: прочитайте блоки «Риски» до начала.
 
-Хост работы не меняют, кроме текущего namespace в `~/.kube/config`; его возвращает уборка последней, третьей работы. Образы узлы тянут из реестра стенда (`localhost:5001/orders-api:2.0`) и из интернета (`registry.k8s.io/pause:3.10`, `python:3.12-slim`).
+Хост работы не меняют. Образы узлы тянут из реестра стенда (`localhost:5001/orders-api:2.0`) и из интернета (`registry.k8s.io/pause:3.10`, `python:3.12-slim`).
 
-Кластер готовят один раз: выбирают контекст стенда, создают namespace, делают его текущим и каталог для файлов.
+Кластер готовят один раз: выбирают контекст стенда, создают namespace, определяют функцию `k` (короткое имя для `kubectl -n lab-05-5`) и каталог для файлов. Функция живёт только в текущем окне терминала: в новом окне определите её снова.
 
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-05-5
-kubectl config set-context --current --namespace=lab-05-5
+k() { kubectl -n lab-05-5 "$@"; }
 mkdir -p ~/lab/k8s/05-5
 ```
 
@@ -435,7 +435,7 @@ mkdir -p ~/lab/k8s/05-5
 |---|---|
 | `use-context kind-lab` | работать с кластером стенда, а не с рабочим |
 | `create ns lab-05-5` | создать namespace с именем части |
-| `set-context --current` | изменить текущий контекст kubectl |
+| `k() { … }` | короткая команда `kubectl -n lab-05-5` |
 | `mkdir -p ~/lab/k8s/05-5` | каталог для файлов работ |
 
 Результат:
@@ -460,7 +460,7 @@ Context "kind-lab" modified.
 - **Надолго ли:** до `uncordon` в шаге 5; на стенде автора простой занял около 2 секунд после снятия cordon.
 - **Безопасность:** привилегии администратора кластера; привилегированных контейнеров нет.
 - **Влияние на систему:** простой `orders` на 1–2 минуты, поды из других namespace с узла переезжают на другие узлы.
-- **Откат:** `kubectl uncordon lab-worker`; при зависании проверьте `kubectl -n orders get pods` и `kubectl get nodes`. Если `orders` не поднялся, выполните `kubectl apply -f ~/lab/k8s/orders-api/k8s/`.
+- **Откат:** `kubectl uncordon lab-worker`; при зависании проверьте `kubectl -n orders get pods` и `kubectl get nodes`. Если `orders` не поднялся, выполните `k apply -f ~/lab/k8s/orders-api/k8s/`.
 
 **Цель.** Вывести узел из работы командой `drain`, увидеть, как бюджет останавливает выселение, и измерить, что происходит с PostgreSQL на local-томе.
 
@@ -489,7 +489,7 @@ lab-worker                         lab-worker2
 Команда создаёт Deployment `web` из трёх реплик с бюджетом 2, Deployment `single` из одной реплики с бюджетом 1 и голый под `bare`. Затем она показывает, где что запущено.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: web}
@@ -541,11 +541,11 @@ spec:
   minAvailable: 1
   selector: {matchLabels: {app: single}}
 EOF
-kubectl rollout status deploy/web
-kubectl rollout status deploy/single
-kubectl run bare --image=registry.k8s.io/pause:3.10 \
+k rollout status deploy/web
+k rollout status deploy/single
+k run bare --image=registry.k8s.io/pause:3.10 \
   --overrides='{"spec":{"nodeName":"lab-worker"}}'
-kubectl get pdb
+k get pdb
 kubectl -n orders get pods -o wide
 ```
 
@@ -611,7 +611,7 @@ unschedulable after refused drain: true
 ```bash
 kubectl drain lab-worker --ignore-daemonsets --delete-emptydir-data --force \
   --timeout=45s 2>&1 | grep -vE '^evicting pod|^pod/' | sort | uniq -c
-kubectl get pods -o wide
+k get pods -o wide
 ```
 
 | Часть команды | Значение |
@@ -621,7 +621,7 @@ kubectl get pods -o wide
 | `--force` | удалить поды без контроллера |
 | `2>&1 \| grep -vE … \| sort \| uniq -c` | убрать однотипные строки и посчитать повторы |
 
-Результат (оставлены две значимые строки, вывод `kubectl get pods` описан в разборе):
+Результат (оставлены две значимые строки, вывод `k get pods` описан в разборе):
 
 ```
       9 error when evicting pods/"single-674944c7bd-zkjjs" -n "lab-05-5" (will retry after 5s): …
@@ -711,14 +711,14 @@ node/lab-worker uncordoned
 **Уборка.** Удаляем нагрузку работы. Узел уже раскрыт в шаге 5, поэтому проверяем его состояние и `orders`.
 
 ```bash
-kubectl delete deploy web single
-kubectl delete pdb --all
-kubectl delete pod bare --now --ignore-not-found
+k delete deploy web single
+k delete pdb --all
+k delete pod bare --now --ignore-not-found
 kubectl get nodes
 kubectl -n orders get pods
 ```
 
-Ожидаемый результат: четыре узла в состоянии `Ready` без `SchedulingDisabled`, `postgres-0` в `Running`. Если `orders` не поднялся, выполните `kubectl apply -f ~/lab/k8s/orders-api/k8s/`.
+Ожидаемый результат: четыре узла в состоянии `Ready` без `SchedulingDisabled`, `postgres-0` в `Running`. Если `orders` не поднялся, выполните `k apply -f ~/lab/k8s/orders-api/k8s/`.
 
 **Вопросы для самопроверки.**
 
@@ -764,7 +764,7 @@ Deployment `sick` из двух подов, у которых проба гот�
 Команда создаёт Deployment `sick` с проверкой готовности на несуществующий путь и бюджет на него, ждёт 15 секунд и показывает бюджет.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: sick}
@@ -789,7 +789,7 @@ spec:
   minAvailable: 1
   selector: {matchLabels: {app: sick}}
 EOF
-sleep 15; kubectl get pdb sick
+sleep 15; k get pdb sick
 ```
 
 | Часть команды | Значение |
@@ -816,7 +816,7 @@ sick   1               N/A               0
 
 ```bash
 ev() {
-  V=$(kubectl get pods -l app=sick -o jsonpath='{.items[0].metadata.name}')
+  V=$(k get pods -l app=sick -o jsonpath='{.items[0].metadata.name}')
   echo "{\"apiVersion\":\"policy/v1\",\"kind\":\"Eviction\",\
 \"metadata\":{\"name\":\"$V\",\"namespace\":\"lab-05-5\"}}" > ~/lab/k8s/05-5/ev.json
   kubectl create --raw /api/v1/namespaces/lab-05-5/pods/$V/eviction \
@@ -828,7 +828,7 @@ ev
 
 | Часть команды | Значение |
 |---|---|
-| `V=$(kubectl get pods …)` | имя первого пода `sick` |
+| `V=$(k get pods …)` | имя первого пода `sick` |
 | `"kind":"Eviction"` | тело запроса к Eviction API |
 | `create --raw …/eviction` | отправить POST на подресурс пода |
 | `-f ev.json` | файл с телом запроса |
@@ -850,9 +850,9 @@ disruption budget.
 Команда меняет политику бюджета на лету и повторяет выселение той же функцией.
 
 ```bash
-kubectl patch pdb sick -p '{"spec":{"unhealthyPodEvictionPolicy":"AlwaysAllow"}}'
+k patch pdb sick -p '{"spec":{"unhealthyPodEvictionPolicy":"AlwaysAllow"}}'
 ev
-kubectl get pdb sick -o jsonpath=\
+k get pdb sick -o jsonpath=\
 'currentHealthy={.status.currentHealthy} allowed={.status.disruptionsAllowed}{"\n"}'
 ```
 
@@ -887,8 +887,8 @@ currentHealthy=0 allowed=0
 **Уборка.** Удаляем Deployment, бюджет и файл запроса.
 
 ```bash
-kubectl delete deploy sick
-kubectl delete pdb sick
+k delete deploy sick
+k delete pdb sick
 rm ~/lab/k8s/05-5/ev.json
 ```
 
@@ -1043,7 +1043,7 @@ capacity=16315248Ki allocatable=1057648Ki
 
 ```bash
 mkp() {  # имя пода, МиБ памяти, resources в виде YAML
-  kubectl apply -f - <<YAML
+  k apply -f - <<YAML
 apiVersion: v1
 kind: Pod
 metadata: {name: $1}
@@ -1060,7 +1060,7 @@ YAML
 }
 mkp guaranteed 200 '{requests: {cpu: 50m, memory: 300Mi}, limits: {cpu: 50m, memory: 300Mi}}'
 mkp besteffort 200 '{}'
-kubectl wait --for=condition=Ready pod/guaranteed pod/besteffort; sleep 12
+k wait --for=condition=Ready pod/guaranteed pod/besteffort; sleep 12
 t0=$(date +%s)
 mkp burstable 300 '{requests: {memory: 1Mi}, limits: {memory: 1Gi}}'
 ```
@@ -1074,7 +1074,7 @@ for i in $(seq 1 45); do
     | jq '.node.memory.availableBytes/1048576|floor')
   mp=$(kubectl get node $W \
     -o jsonpath='{.status.conditions[?(@.type=="MemoryPressure")].status}')
-  pods=$(kubectl get pods --no-headers | awk '{printf "%s:%s ", $1, $3}')
+  pods=$(k get pods --no-headers | awk '{printf "%s:%s ", $1, $3}')
   s="MemoryPressure=$mp | $pods"
   [ "$s" != "$prev" ] && echo "t=+$(( $(date +%s)-t0 ))s avail=${av}Mi $s" && prev=$s
   sleep 2
@@ -1108,10 +1108,10 @@ t=+12s avail=14949Mi MemoryPressure=True  | besteffort:ContainerStatusUnknown bu
 Команда выводит фазу и сообщение каждого пода, taint узла и события узла.
 
 ```bash
-kubectl get pods -o jsonpath=\
+k get pods -o jsonpath=\
 '{range .items[*]}{.metadata.name}: {.status.phase}/{.status.reason} {.status.message}{"\n"}{end}'
 kubectl get node $W -o jsonpath='{.spec.taints}{"\n"}'
-kubectl get events --field-selector involvedObject.name=$W \
+k get events --field-selector involvedObject.name=$W \
   -o custom-columns=REASON:.reason,MSG:.message | grep -iE 'memory|evict'
 ```
 
@@ -1149,11 +1149,10 @@ NodeHasInsufficientMemory   Node lab-worker3 status is now: NodeHasInsufficientM
 | Guaranteed не выселен | остался `Running` |
 | Выселение сопровождается taint и событиями | `memory-pressure:NoSchedule`, `EvictionThresholdMet` |
 
-**Уборка.** Удаляем namespace, возвращаем конфигурацию kubelet и контекст kubectl, проверяем результат. Пока конфигурация не возвращена, узел остаётся с заниженным allocatable.
+**Уборка.** Удаляем namespace, возвращаем конфигурацию kubelet, проверяем результат. Пока конфигурация не возвращена, узел остаётся с заниженным allocatable.
 
 ```bash
 W=lab-worker3
-kubectl config set-context --current --namespace=default
 kubectl delete ns lab-05-5
 docker exec $W cp /root/lab-05-5-config.yaml.bak /var/lib/kubelet/config.yaml
 docker exec $W rm /root/lab-05-5-config.yaml.bak

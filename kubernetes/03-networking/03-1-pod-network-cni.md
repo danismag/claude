@@ -382,25 +382,25 @@ IPAM `host-local` хранит выданные адреса в файлах: у
 
 Образ `busybox:1.37` узлы тянут из Docker Hub; если он недоступен, положите его в реестр стенда, как описано во вводе к 02-1. Работы 2 и 3 запускают на хосте контейнеры Docker, поэтому Docker на хосте должен работать без `sudo`.
 
-**Риски подготовки.** Команда `set-context` меняет текущий namespace контекста `kind-lab` в `~/.kube/config`. Он возвращается в уборке работы 4. Остальное создаётся внутри кластера kind.
+**Риски подготовки.** Контекст `kind-lab` в `~/.kube/config` не меняется: функция `k` добавляет `-n lab-03-1` к каждой команде. Остальное создаётся внутри кластера kind. Функция живёт только в текущем окне терминала: в новом окне определите её снова.
 
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-03-1
-kubectl config set-context --current --namespace=lab-03-1
+k() { kubectl -n lab-03-1 "$@"; }
 for w in lab-worker lab-worker2; do
-  kubectl run p-$w --image=busybox:1.37 \
+  k run p-$w --image=busybox:1.37 \
     --overrides="{\"spec\":{\"nodeName\":\"$w\"}}" -- sleep infinity
 done
-kubectl wait --for=condition=Ready pod --all
-kubectl get pods -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,IP:.status.podIP
+k wait --for=condition=Ready pod --all
+k get pods -o custom-columns=NAME:.metadata.name,NODE:.spec.nodeName,IP:.status.podIP
 ```
 
 | Часть команды | Значение |
 |---|---|
 | `create ns lab-03-1` | создать namespace части |
-| `set-context --current --namespace=…` | сделать его текущим для kubectl |
-| `kubectl run p-$w` | создать под `p-lab-worker` и `p-lab-worker2` |
+| `k() { … }` | короткая команда `kubectl -n lab-03-1` |
+| `k run p-$w` | создать под `p-lab-worker` и `p-lab-worker2` |
 | `--overrides=…nodeName` | прибить под к узлу в обход scheduler'а |
 | `wait --for=condition=Ready` | дождаться готовности подов |
 | `custom-columns=…` | вывести имя, узел и IP пода |
@@ -467,7 +467,7 @@ lab-worker3         10.244.1.0/24   172.20.0.4
 Команда запускает в поде три проверки: адрес `eth0`, default-маршрут и MTU интерфейса.
 
 ```bash
-kubectl exec p-lab-worker -- sh -c \
+k exec p-lab-worker -- sh -c \
   "ip -4 addr show eth0 | grep inet; ip route | grep default; cat /sys/class/net/eth0/mtu"
 ```
 
@@ -497,8 +497,8 @@ default via 10.244.2.1 dev eth0
 Команда сначала узнаёт IP второго пода, потом проверяет связь и трассирует путь.
 
 ```bash
-IPB=$(kubectl get pod p-lab-worker2 -o jsonpath='{.status.podIP}')
-kubectl exec p-lab-worker -- sh -c \
+IPB=$(k get pod p-lab-worker2 -o jsonpath='{.status.podIP}')
+k exec p-lab-worker -- sh -c \
   "ping -c 3 -q $IPB | tail -2; traceroute -n -q 1 -w 1 $IPB"
 ```
 
@@ -664,8 +664,8 @@ docker pull nicolaka/netshoot:v0.13
 Команда в фоне запускает пинг из первого пода, а на переднем плане ловит ICMP на `eth0` узла `lab-worker2`.
 
 ```bash
-IPB=$(kubectl get pod p-lab-worker2 -o jsonpath='{.status.podIP}')
-(sleep 3; kubectl exec p-lab-worker -- ping -c 2 -q $IPB >/dev/null) &
+IPB=$(k get pod p-lab-worker2 -o jsonpath='{.status.podIP}')
+(sleep 3; k exec p-lab-worker -- ping -c 2 -q $IPB >/dev/null) &
 docker run --rm --net=container:lab-worker2 nicolaka/netshoot:v0.13 \
   timeout 10 tcpdump -n -t -p -i eth0 -c 4 "icmp and host $IPB"
 wait
@@ -703,7 +703,7 @@ IP 10.244.3.69 > 10.244.2.84: ICMP echo reply, id 26, seq 0, length 64
 ```bash
 VETH=$(docker exec lab-worker2 sh -c "ip route | awk '/^$IPB /{print \$3}'")
 echo $VETH
-(sleep 3; kubectl exec p-lab-worker -- ping -c 1 -q $IPB >/dev/null) &
+(sleep 3; k exec p-lab-worker -- ping -c 1 -q $IPB >/dev/null) &
 docker run --rm --net=container:lab-worker2 nicolaka/netshoot:v0.13 \
   timeout 10 tcpdump -n -t -p -i $VETH -c 2 icmp
 wait
@@ -814,7 +814,7 @@ docker exec lab-worker iptables-save -t nat | grep -- '-A KIND-MASQ-AGENT'
 Команда в фоне запрашивает внешний адрес из пода, а на переднем плане ловит пакеты по всем интерфейсам узла.
 
 ```bash
-(sleep 3; kubectl exec p-lab-worker -- wget -q -T 5 -O /dev/null http://1.1.1.1) &
+(sleep 3; k exec p-lab-worker -- wget -q -T 5 -O /dev/null http://1.1.1.1) &
 docker run --rm --net=container:lab-worker nicolaka/netshoot:v0.13 \
   timeout 10 tcpdump -n -t -p -i any -c 3 'tcp port 80 and host 1.1.1.1'
 wait
@@ -922,12 +922,12 @@ kubectl get pods -A --field-selector spec.nodeName=lab-worker3 --no-headers | wc
 Команды создают Deployment без реплик, привязывают его к узлу и увеличивают число реплик до 115.
 
 ```bash
-kubectl create deploy many --image=registry.k8s.io/pause:3.10 --replicas=0
-kubectl patch deploy many -p \
+k create deploy many --image=registry.k8s.io/pause:3.10 --replicas=0
+k patch deploy many -p \
   '{"spec":{"template":{"spec":{"nodeSelector":{"kubernetes.io/hostname":"lab-worker3"}}}}}'
-kubectl scale deploy many --replicas=115
+k scale deploy many --replicas=115
 sleep 60
-kubectl get deploy many
+k get deploy many
 ```
 
 | Часть команды | Значение |
@@ -955,8 +955,8 @@ many   106/115   115          106         60s
 
 ```bash
 kubectl get pods -A --field-selector spec.nodeName=lab-worker3 --no-headers | wc -l
-P=$(kubectl get pods -l app=many --field-selector=status.phase=Pending -o name | head -1)
-kubectl get events --field-selector involvedObject.name=${P#pod/},reason=FailedScheduling \
+P=$(k get pods -l app=many --field-selector=status.phase=Pending -o name | head -1)
+k get events --field-selector involvedObject.name=${P#pod/},reason=FailedScheduling \
   -o jsonpath='{.items[-1:].message}{"\n"}'
 ```
 
@@ -1021,11 +1021,10 @@ kube-proxy-…
 | Scheduler пишет `Too many pods` | шаг 3, событие |
 | Занятых IP меньше, чем подов, на число подов с hostNetwork | шаг 4 |
 
-**Уборка.** Удаляем Deployment, поды-клиенты и namespace, возвращаем текущий namespace kubectl по умолчанию.
+**Уборка.** Удаляем Deployment, поды-клиенты и namespace.
 
 ```bash
-kubectl delete deploy many
-kubectl config set-context --current --namespace=default
+k delete deploy many
 kubectl delete ns lab-03-1
 ```
 

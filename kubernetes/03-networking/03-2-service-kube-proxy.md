@@ -377,14 +377,14 @@ spec:
 
 ## Лабораторные работы
 
-Работы идут на стенде 00-1 в namespace `lab-03-2`. Удаление namespace (01-1) удаляет всё, что в нём создано. Работы выполняют по порядку: работы 4 и 5 используют Deployment и Service `echo` из работы 3. Хост работы не меняют, кроме текущего namespace в `~/.kube/config` и коротких контейнеров Docker в работе 2. Работа 4 меняет настройку kube-proxy всего кластера, а работа 5 — метки узлов, поэтому их блоки «Риски» стоит прочитать до начала.
+Работы идут на стенде 00-1 в namespace `lab-03-2`. Удаление namespace (01-1) удаляет всё, что в нём создано. Работы выполняют по порядку: работы 4 и 5 используют Deployment и Service `echo` из работы 3. Хост работы не меняют, кроме коротких контейнеров Docker в работе 2. Работа 4 меняет настройку kube-proxy всего кластера, а работа 5 — метки узлов, поэтому их блоки «Риски» стоит прочитать до начала.
 
-Образы узлы тянут из реестра стенда (`localhost:5001/orders-api:2.0`) и из Docker Hub. Кластер готовят один раз: выбирают контекст стенда, создают namespace и делают его текущим для kubectl.
+Образы узлы тянут из реестра стенда (`localhost:5001/orders-api:2.0`) и из Docker Hub. Кластер готовят один раз: выбирают контекст стенда, создают namespace и определяют функцию `k` — короткое имя для `kubectl -n lab-03-2`. Контекст в `~/.kube/config` не меняется. Функция живёт только в текущем окне терминала: в новом окне определите её снова.
 
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-03-2
-kubectl config set-context --current --namespace=lab-03-2
+k() { kubectl -n lab-03-2 "$@"; }
 ```
 
 Разбор команд:
@@ -393,8 +393,8 @@ kubectl config set-context --current --namespace=lab-03-2
 |---|---|
 | `use-context kind-lab` | работать с кластером стенда, а не с рабочим |
 | `create ns lab-03-2` | создать namespace с именем части |
-| `set-context --current` | изменить текущий контекст kubectl |
-| `--namespace=lab-03-2` | подставлять этот namespace, если флаг `-n` не указан |
+| `k() { … }` | определить функцию шелла `k` |
+| `kubectl -n lab-03-2 "$@"` | подставить namespace и передать остальные аргументы |
 
 Результат:
 
@@ -416,7 +416,7 @@ Namespace и текущий контекст возвращает в исход�
 
 **Риски.** Работа меняет только кластер стенда; одну настройку на хосте меняет подготовка в начале раздела.
 
-- **Что меняется:** в кластере kind — Deployment, Service и клиентский под в namespace `lab-03-2`; на хосте — namespace по умолчанию у контекста `kind-lab` в `~/.kube/config` (подготовка).
+- **Что меняется:** в кластере kind — Deployment, Service и клиентский под в namespace `lab-03-2`; хост не меняется.
 - **Надолго ли:** до уборки; уборка удаляет объекты работы, а namespace и контекст возвращает последняя работа.
 - **Безопасность:** привилегий не нужно; `docker exec … iptables-save` только читает правила узла.
 - **Влияние на систему:** другие контексты kubectl и рабочие кластеры не затрагиваются.
@@ -452,7 +452,7 @@ client (под) ──► DNS: orders ──► ClusterIP:80 ──► прав�
 Создаём Deployment из двух подов с меткой `app=orders` и Service, который ищет поды по метке `app=order`, — одна буква расходится намеренно. Селектор (§1) сравнивается с метками подов (01-3), и совпасть должны обе стороны.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: orders}
@@ -476,7 +476,7 @@ spec:
   selector: {app: order}          # опечатка: order вместо orders
   ports: [{port: 80, targetPort: http}]
 EOF
-kubectl rollout status deploy/orders
+k rollout status deploy/orders
 ```
 
 Разбор ключей манифеста:
@@ -512,8 +512,8 @@ deployment "orders" successfully rolled out
 Первым делом при жалобе «Service не отвечает» проверяют эндпоинты в EndpointSlice (§2). Старый объект v1 Endpoints устарел с версии 1.33, поэтому смотрим только EndpointSlice. Выводим Service, его EndpointSlice и две строки из описания Service.
 
 ```bash
-kubectl get svc,endpointslice
-kubectl describe svc orders | grep -E 'Selector|Endpoints'
+k get svc,endpointslice
+k describe svc orders | grep -E 'Selector|Endpoints'
 ```
 
 Разбор команд:
@@ -541,17 +541,17 @@ Endpoints:
 1. У Service есть ClusterIP (§1) `10.96.88.241`: его выдают всегда, даже если подов нет.
 2. В EndpointSlice `orders-9vf5b` колонки `PORTS` и `ENDPOINTS` равны `<unset>`: адресов нет.
 3. Строка `Selector` показывает `app=order`, а строка `Endpoints` пуста.
-4. Вывод: селектор ничего не выбрал, и это видно, если сравнить его с метками подов командой `kubectl get pods --show-labels`.
+4. Вывод: селектор ничего не выбрал, и это видно, если сравнить его с метками подов командой `k get pods --show-labels`.
 
 #### Шаг 3. Увидеть симптом глазами клиента
 
 Запускаем клиентский под и подключаемся из него к Service по имени. Функция `probe` пытается открыть TCP-соединение и печатает результат вместе со временем попытки. Не закрывайте текущее окно терминала, потому что функция понадобится в следующих шагах.
 
 ```bash
-kubectl run client --image=python:3.12-slim --restart=Never --command -- sleep infinity
-kubectl wait --for=condition=Ready pod/client
+k run client --image=python:3.12-slim --restart=Never --command -- sleep infinity
+k wait --for=condition=Ready pod/client
 probe() {
-  kubectl exec client -- python -c '
+  k exec client -- python -c '
 import socket, sys, time
 t = time.time()
 try:
@@ -625,9 +625,9 @@ docker exec lab-worker iptables-save | grep 'lab-03-2/orders'
 Приводим селектор в соответствие меткам подов, а затем проверяем, что EndpointSlice заполнился и клиент получает ответ.
 
 ```bash
-kubectl patch svc orders -p '{"spec":{"selector":{"app":"orders"}}}'
-kubectl get endpointslice -l kubernetes.io/service-name=orders
-kubectl exec client -- python -c \
+k patch svc orders -p '{"spec":{"selector":{"app":"orders"}}}'
+k get endpointslice -l kubernetes.io/service-name=orders
+k exec client -- python -c \
   'import urllib.request as u; print(u.urlopen("http://orders", timeout=5).status)'
 ```
 
@@ -661,9 +661,9 @@ orders-9vf5b   IPv4          8000    10.244.3.8,10.244.2.10   12s
 Теперь подставляем неверный targetPort (§3). Селектор верный и поды готовы, но на порту 8080 никто не слушает.
 
 ```bash
-kubectl patch svc orders --type=json \
+k patch svc orders --type=json \
   -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":8080}]'
-kubectl get endpointslice -l kubernetes.io/service-name=orders
+k get endpointslice -l kubernetes.io/service-name=orders
 probe orders 80
 ```
 
@@ -698,10 +698,10 @@ ConnectionRefusedError [Errno 111] Connection refused
 Возвращаем `targetPort: http`, потому что имя порта переживает смену номера в образе, а число — нет.
 
 ```bash
-kubectl patch svc orders --type=json \
+k patch svc orders --type=json \
   -p '[{"op":"replace","path":"/spec/ports/0/targetPort","value":"http"}]'
-kubectl get endpointslice -l kubernetes.io/service-name=orders
-kubectl exec client -- python -c \
+k get endpointslice -l kubernetes.io/service-name=orders
+k exec client -- python -c \
   'import urllib.request as u; print(u.urlopen("http://orders", timeout=5).status)'
 ```
 
@@ -734,15 +734,15 @@ orders-9vf5b   IPv4          8000    10.244.2.10,10.244.3.8   30s
 |---|---|
 | Service без эндпоинтов отвечает мгновенным отказом | `probe orders 80`, время около 0,02 с |
 | Причина отказа — правило REJECT в kube-proxy | `iptables-save` на узле |
-| Пустой EndpointSlice значит: селектор не совпал | `kubectl get endpointslice -l …` |
-| Неготовые поды видны в EndpointSlice с `ready: false` | `kubectl describe endpointslice -l …` |
+| Пустой EndpointSlice значит: селектор не совпал | `k get endpointslice -l …` |
+| Неготовые поды видны в EndpointSlice с `ready: false` | `k describe endpointslice -l …` |
 | Адреса есть, отказ есть: неверный `targetPort` | колонка `PORTS` в EndpointSlice |
 | Имя порта надёжнее числа | `targetPort: http` |
 
 **Уборка.** Удаляем Deployment, Service и клиентский под, а функцию `probe` убираем из шелла. Namespace остаётся: он нужен следующим работам, а удаляет его последняя.
 
 ```bash
-kubectl delete deploy/orders svc/orders pod/client
+k delete deploy/orders svc/orders pod/client
 unset -f probe
 ```
 
@@ -762,7 +762,7 @@ pod "client" deleted
 
 <details><summary>Ответ</summary>
 
-`kubectl get endpointslice -l kubernetes.io/service-name=<имя>`. Пустые `PORTS` и `ENDPOINTS` означают, что селектор не выбрал ни одного пода. Если адреса есть, проверьте их готовность (`kubectl describe endpointslice`, поле `Ready`), а затем `targetPort`.
+`k get endpointslice -l kubernetes.io/service-name=<имя>`. Пустые `PORTS` и `ENDPOINTS` означают, что селектор не выбрал ни одного пода. Если адреса есть, проверьте их готовность (`k describe endpointslice`, поле `Ready`), а затем `targetPort`.
 
 </details>
 
@@ -794,7 +794,7 @@ kube-proxy ставит для такого Service правило REJECT с ICM
 
 <details><summary>Ответ</summary>
 
-Адреса подов останутся в EndpointSlice, но с условием `ready: false`, и колонка `ENDPOINTS` в `kubectl get endpointslice` их всё равно покажет. Готовых адресов нет, поэтому kube-proxy поставит то же правило REJECT, и симптом совпадёт с опечаткой в селекторе. Отличие видно в `kubectl describe endpointslice` (`Ready: false`) и в `kubectl get pods`: в колонке `READY` будет `0/1`.
+Адреса подов останутся в EndpointSlice, но с условием `ready: false`, и колонка `ENDPOINTS` в `k get endpointslice` их всё равно покажет. Готовых адресов нет, поэтому kube-proxy поставит то же правило REJECT, и симптом совпадёт с опечаткой в селекторе. Отличие видно в `k describe endpointslice` (`Ready: false`) и в `k get pods`: в колонке `READY` будет `0/1`.
 
 </details>
 
@@ -832,7 +832,7 @@ kube-proxy ставит для такого Service правило REJECT с ICM
 Команда создаёт Deployment из двух подов, закреплённых за `lab-worker`, и Service с портом узла 30081 и политикой `Cluster`.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: echo}
@@ -858,7 +858,7 @@ spec:
   selector: {app: echo}
   ports: [{name: http, port: 80, targetPort: http, nodePort: 30081}]
 EOF
-kubectl rollout status deploy/echo
+k rollout status deploy/echo
 ```
 
 | Часть манифеста | Значение |
@@ -890,7 +890,7 @@ deployment "echo" successfully rolled out
 
 ```bash
 for etp in Cluster Local; do
-  kubectl patch svc echo-np -p "{\"spec\":{\"externalTrafficPolicy\":\"$etp\"}}"
+  k patch svc echo-np -p "{\"spec\":{\"externalTrafficPolicy\":\"$etp\"}}"
   sleep 3
   for n in lab-worker lab-worker2; do
     IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' $n)
@@ -962,15 +962,15 @@ docker exec lab-worker2 iptables-save | grep 'has no local endpoints' | head -2
 
 ```bash
 IP=$(docker inspect -f '{{.NetworkSettings.Networks.kind.IPAddress}}' lab-worker)
-kubectl patch svc echo-np -p '{"spec":{"externalTrafficPolicy":"Local"}}'
+k patch svc echo-np -p '{"spec":{"externalTrafficPolicy":"Local"}}'
 docker run --rm --network kind alpine:3.20 sh -c \
   "ip -4 -o addr show eth0 | awk '{print \"client=\"\$4}'; \
    wget -q -O /dev/null http://$IP:30081/version?local"
-kubectl patch svc echo-np -p '{"spec":{"externalTrafficPolicy":"Cluster"}}'
+k patch svc echo-np -p '{"spec":{"externalTrafficPolicy":"Cluster"}}'
 sleep 2
 docker run --rm --network kind alpine:3.20 \
   wget -q -O /dev/null http://$IP:30081/version?cluster
-kubectl logs -l app=echo --tail=50 --prefix | grep -E 'version\?(local|cluster)'
+k logs -l app=echo --tail=50 --prefix | grep -E 'version\?(local|cluster)'
 ```
 
 | Часть команды | Значение |
@@ -1001,7 +1001,7 @@ client=172.20.0.8/16
 У NodePort нет порта проверки здоровья для внешнего балансировщика. Команда читает поле Service.
 
 ```bash
-kubectl get svc echo-np -o jsonpath='{.spec.healthCheckNodePort}'
+k get svc echo-np -o jsonpath='{.spec.healthCheckNodePort}'
 ```
 
 | Часть команды | Значение |
@@ -1029,7 +1029,7 @@ kubectl get svc echo-np -o jsonpath='{.spec.healthCheckNodePort}'
 **Уборка.** Удаляем Deployment и Service работы. Контейнеры клиентов исчезли сами благодаря `--rm`.
 
 ```bash
-kubectl delete deploy/echo svc/echo-np
+k delete deploy/echo svc/echo-np
 ```
 
 Команда удаляет оба объекта; узлы и хост больше ничего не хранят.
@@ -1075,7 +1075,7 @@ kube-proxy ставит там правило DROP, которое отбрас�
 
 ```
 Service echo ──► EndpointSlice: 3 эндпоинта
-kubectl delete pod X ──► deletionTimestamp ──► preStop sleep 8 с ──► SIGTERM
+k delete pod X ──► deletionTimestamp ──► preStop sleep 8 с ──► SIGTERM
                               │
                               └─ условия X: ready=false, serving=true, terminating=true
 ```
@@ -1087,7 +1087,7 @@ kubectl delete pod X ──► deletionTimestamp ──► preStop sleep 8 с �
 Команда создаёт три пода с паузой перед остановкой и Service, который их выбирает. Эти объекты нужны и следующим двум работам.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: echo}
@@ -1111,7 +1111,7 @@ spec:
   selector: {app: echo}
   ports: [{port: 80, targetPort: http}]
 EOF
-kubectl rollout status deploy/echo
+k rollout status deploy/echo
 ```
 
 | Часть манифеста | Значение |
@@ -1136,9 +1136,9 @@ deployment "echo" successfully rolled out
 Команда удаляет первый под без ожидания его исчезновения, ждёт 2 с и печатает условия всех эндпоинтов.
 
 ```bash
-kubectl delete $(kubectl get pods -l app=echo -o name | head -1) --wait=false
+k delete $(k get pods -l app=echo -o name | head -1) --wait=false
 sleep 2
-kubectl get endpointslice -l kubernetes.io/service-name=echo -o json | jq -c \
+k get endpointslice -l kubernetes.io/service-name=echo -o json | jq -c \
   '.items[].endpoints[] | {pod: .targetRef.name[-5:], ready: .conditions.ready,
     serving: .conditions.serving, terminating: .conditions.terminating}'
 ```
@@ -1174,7 +1174,7 @@ kubectl get endpointslice -l kubernetes.io/service-name=echo -o json | jq -c \
 
 ```bash
 sleep 10
-kubectl get endpointslice -l kubernetes.io/service-name=echo -o json | jq -c \
+k get endpointslice -l kubernetes.io/service-name=echo -o json | jq -c \
   '.items[].endpoints[] | {pod: .targetRef.name[-5:], ready: .conditions.ready,
     serving: .conditions.serving, terminating: .conditions.terminating}'
 ```
@@ -1198,7 +1198,7 @@ kubectl get endpointslice -l kubernetes.io/service-name=echo -o json | jq -c \
 **Уборка.** Deployment и Service `echo` оставьте: они нужны работам 4 и 5. Если вы заканчиваете здесь, удалите их.
 
 ```bash
-kubectl delete deploy/echo svc/echo
+k delete deploy/echo svc/echo
 ```
 
 **Вопросы для самопроверки.**
@@ -1232,7 +1232,7 @@ kube-proxy берёт эндпоинты с `serving: true`, пока они п�
 **Риски.** Работа меняет конфигурацию kube-proxy всего кластера стенда.
 
 - **Что меняется:** ConfigMap `kube-proxy` в `kube-system` и режим на четырёх узлах; kube-proxy перезапускается по очереди.
-- **Надолго ли:** на время работы; шаг 5 возвращает режим, уборка проверяет его. Аннотация `last-applied-configuration`, которую добавит `kubectl apply`, останется в ConfigMap; она безвредна.
+- **Надолго ли:** на время работы; шаг 5 возвращает режим, уборка проверяет его. Аннотация `last-applied-configuration`, которую добавит `k apply`, останется в ConfigMap; она безвредна.
 - **Безопасность:** привилегии те же, что у администратора кластера; привилегированных контейнеров нет.
 - **Влияние на систему:** затрагивает все namespace стенда, включая `orders` и вход через Envoy; при перезапуске правила на узле пересобираются секунды, установленные соединения сохраняются в conntrack. Если ядро хоста старше 5.13, kube-proxy в режиме nftables не поднимет правила, и Service перестанут работать во всём кластере до отката.
 - **Откат:** шаг 5; если kube-proxy не стартует, выполните команды шага 5 сразу: они возвращают `mode: iptables` и перезапускают DaemonSet. Проверка — строка `Using iptables Proxier` в журнале kube-proxy.
@@ -1260,7 +1260,7 @@ ConfigMap kube-proxy (mode) ──► kube-proxy на узле ──► iptable
 Команда создаёт Service с NodePort 30081 для подов `echo`, читает режим из ConfigMap и считает iptables-правила наших Service на узле.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Service
 metadata: {name: echo-np}
@@ -1301,7 +1301,7 @@ mode: iptables
 ```bash
 kubectl -n kube-system get cm kube-proxy -o json \
   | jq '.data["config.conf"] |= sub("mode: iptables"; "mode: nftables")' \
-  | kubectl apply -f -
+  | k apply -f -
 kubectl -n kube-system rollout restart ds/kube-proxy
 kubectl -n kube-system rollout status ds/kube-proxy
 kubectl -n kube-system logs ds/kube-proxy | grep -i 'Using'
@@ -1310,7 +1310,7 @@ kubectl -n kube-system logs ds/kube-proxy | grep -i 'Using'
 | Часть команды | Значение |
 |---|---|
 | `jq '… \|= sub(…)'` | заменить строку режима в тексте конфигурации |
-| `kubectl apply -f -` | записать изменённый ConfigMap обратно |
+| `k apply -f -` | записать изменённый ConfigMap обратно |
 | `rollout restart ds/kube-proxy` | перезапустить kube-proxy на всех узлах |
 | `logs ds/kube-proxy` | журнал одного из подов kube-proxy |
 | `grep -i 'Using'` | строка о выбранном режиме |
@@ -1374,9 +1374,9 @@ iptables rules for echo: 0
 Клиентский под обращается к `echo` по имени, а хост проходит весь путь от порта `8088` до `orders-api`.
 
 ```bash
-kubectl run client --image=python:3.12-slim --restart=Never --command -- sleep infinity
-kubectl wait --for=condition=Ready pod/client
-kubectl exec client -- python -c \
+k run client --image=python:3.12-slim --restart=Never --command -- sleep infinity
+k wait --for=condition=Ready pod/client
+k exec client -- python -c \
   "import urllib.request;print(urllib.request.urlopen('http://echo/version').status)"
 curl -s -o /dev/null -w '%{http_code}\n' http://orders.localhost:8088/api/orders
 ```
@@ -1408,7 +1408,7 @@ pod/client condition met
 ```bash
 kubectl -n kube-system get cm kube-proxy -o json \
   | jq '.data["config.conf"] |= sub("mode: nftables"; "mode: iptables")' \
-  | kubectl apply -f -
+  | k apply -f -
 kubectl -n kube-system rollout restart ds/kube-proxy
 kubectl -n kube-system rollout status ds/kube-proxy
 docker exec lab-worker sh -c 'nft list tables | grep kube-proxy; \
@@ -1444,7 +1444,7 @@ iptables rules for echo: 19
 
 ```bash
 kubectl -n kube-system get cm kube-proxy -o jsonpath='{.data.config\.conf}' | grep '^mode'
-kubectl delete pod/client svc/echo-np
+k delete pod/client svc/echo-np
 ```
 
 Ожидаемый результат: строка `mode: iptables`, `pod "client" deleted` и `service "echo-np" deleted`. Удаление пода занимает около 30 с, потому что `sleep` не обрабатывает SIGTERM.
@@ -1506,18 +1506,18 @@ zone-a: lab-worker  [клиент, под]     zone-b: lab-worker2 [под]   la
 Клиентский под принудительно ставим на `lab-worker`. Функция `cnt` делает 60 запросов, каждый — новое соединение, и считает ответы по подам.
 
 ```bash
-kubectl run client --image=python:3.12-slim --restart=Never \
+k run client --image=python:3.12-slim --restart=Never \
   --overrides='{"spec":{"nodeName":"lab-worker"}}' --command -- sleep infinity
-kubectl wait --for=condition=Ready pod/client
+k wait --for=condition=Ready pod/client
 cnt() {
-  kubectl exec client -- python -c "
+  k exec client -- python -c "
 import urllib.request, collections, json
 u = 'http://echo/version'
 c = collections.Counter(json.loads(urllib.request.urlopen(u).read())['pod'][-5:]
                         for _ in range(60))
 print(dict(c))"
 }
-kubectl get pods -l app=echo -o wide
+k get pods -l app=echo -o wide
 ```
 
 | Часть команды | Значение |
@@ -1544,10 +1544,10 @@ echo-…-…    1/1     Running   …   lab-worker3
 
 ```bash
 echo "no affinity: $(cnt)"
-kubectl patch svc echo -p '{"spec":{"sessionAffinity":"ClientIP"}}'
+k patch svc echo -p '{"spec":{"sessionAffinity":"ClientIP"}}'
 sleep 2
 echo "ClientIP: $(cnt)"
-kubectl patch svc echo -p '{"spec":{"sessionAffinity":"None"}}'
+k patch svc echo -p '{"spec":{"sessionAffinity":"None"}}'
 ```
 
 | Часть команды | Значение |
@@ -1580,7 +1580,7 @@ kubectl label node lab-worker topology.kubernetes.io/zone=zone-a
 kubectl label node lab-worker2 lab-worker3 topology.kubernetes.io/zone=zone-b
 echo "default: $(cnt)"
 for v in PreferClose PreferSameZone PreferSameNode; do
-  kubectl patch svc echo -p "{\"spec\":{\"trafficDistribution\":\"$v\"}}"
+  k patch svc echo -p "{\"spec\":{\"trafficDistribution\":\"$v\"}}"
   sleep 3
   echo "$v: $(cnt)"
 done
@@ -1620,7 +1620,7 @@ PreferSameNode: {'sxwfr': 60}
 Подсказки показывают, кому предназначен каждый эндпоинт. Команда печатает под, узел и поле `hints`.
 
 ```bash
-kubectl get endpointslice -l kubernetes.io/service-name=echo -o json | jq -c \
+k get endpointslice -l kubernetes.io/service-name=echo -o json | jq -c \
   '.items[].endpoints[] | {pod: .targetRef.name[-5:], node: .nodeName, hints}'
 ```
 
@@ -1648,13 +1648,12 @@ kubectl get endpointslice -l kubernetes.io/service-name=echo -o json | jq -c \
 | `PreferClose` устарел | предупреждение в выводе |
 | Подсказки хранятся в срезе | `hints.forZones`, `hints.forNodes` |
 
-**Уборка.** Снимаем метки зон, удаляем объекты работ 3–5 и клиента, возвращаем namespace по умолчанию и удаляем namespace `lab-03-2`.
+**Уборка.** Снимаем метки зон, удаляем объекты работ 3–5 и клиента, и удаляем namespace `lab-03-2`.
 
 ```bash
 kubectl label node lab-worker lab-worker2 lab-worker3 topology.kubernetes.io/zone-
-kubectl delete pod client
-kubectl delete deploy/echo svc/echo
-kubectl config set-context --current --namespace=default
+k delete pod client
+k delete deploy/echo svc/echo
 kubectl delete ns lab-03-2
 unset -f cnt
 ```

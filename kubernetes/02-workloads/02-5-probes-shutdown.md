@@ -354,7 +354,7 @@ Liveness, которая проверяет базу данных, превра�
 
 ## Лабораторные работы
 
-Работы идут на стенде 00-1 в namespace `lab-02-5`. Все они выполняются внутри кластера kind. На хосте меняются две вещи: текущий namespace контекста `kind-lab` в `~/.kube/config` и каталог `~/lab/k8s/02-5`. Уборка последней работы возвращает namespace `default` и удаляет каталог. Работы 1 и 2 идут подряд на одном приложении, работы 3 и 4 независимы.
+Работы идут на стенде 00-1 в namespace `lab-02-5`. Все они выполняются внутри кластера kind. На хосте меняется только каталог `~/lab/k8s/02-5`; уборка последней работы удаляет его. Работы 1 и 2 идут подряд на одном приложении, работы 3 и 4 независимы.
 
 Образы `busybox:1.37`, `python:3.12-slim` и `postgres:17.6-alpine` узлы тянут из Docker Hub. Если он недоступен, положите образы в реестр стенда, как описано в начале лабораторных 02-1, и замените имена в манифестах.
 
@@ -363,11 +363,11 @@ Liveness, которая проверяет базу данных, превра�
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-02-5
-kubectl config set-context --current --namespace=lab-02-5
+k() { kubectl -n lab-02-5 "$@"; }
 mkdir -p ~/lab/k8s/02-5
 ```
 
-Первая команда выбирает кластер стенда, вторая создаёт namespace, третья делает его текущим, а четвёртая создаёт каталог для файлов работ.
+Первая команда выбирает кластер стенда, вторая создаёт namespace, третья определяет функцию `k` — короткое имя для `kubectl -n lab-02-5`, а четвёртая создаёт каталог для файлов работ. Функция живёт только в текущем окне терминала: в новом окне определите её снова.
 
 ### Лабораторная работа 1. Ошибки при выкатке без graceful shutdown
 
@@ -393,7 +393,7 @@ client (под, 4 потока)
 Команда создаёт Deployment из 4 реплик, Service и маршрут через Gateway `lab` и ждёт готовности.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: orders-api}
@@ -426,7 +426,7 @@ spec:
   hostnames: ["lab025.localhost"]
   rules: [{backendRefs: [{name: orders-api, port: 80}]}]
 EOF
-kubectl rollout status deploy/orders-api
+k rollout status deploy/orders-api
 ```
 
 | Часть манифеста | Значение |
@@ -481,13 +481,13 @@ win = f"{max(errs) - min(errs):.1f}s" if errs else "0s"
 line = f"requests={total} ok={stats[200]} errors={errors} error_window={win}"
 print(line + (f" detail={dict(stats)}" if errors else ""))
 EOF
-kubectl run client --image=python:3.12-slim --command -- sleep infinity
-kubectl wait --for=condition=Ready pod/client
-kubectl cp ~/lab/k8s/02-5/load.py client:/tmp/load.py
+k run client --image=python:3.12-slim --command -- sleep infinity
+k wait --for=condition=Ready pod/client
+k cp ~/lab/k8s/02-5/load.py client:/tmp/load.py
 GW=$(kubectl -n envoy-gateway-system get svc \
   -l gateway.envoyproxy.io/owning-gateway-name=lab \
   -o jsonpath='{.items[0].metadata.name}').envoy-gateway-system
-kubectl exec client -- python /tmp/load.py 3 http://$GW/version lab025.localhost
+k exec client -- python /tmp/load.py 3 http://$GW/version lab025.localhost
 ```
 
 | Часть команды | Значение |
@@ -496,7 +496,7 @@ kubectl exec client -- python /tmp/load.py 3 http://$GW/version lab025.localhost
 | `timeout=2` в клиенте | запрос дольше 2 с считается ошибкой |
 | `errs` и `error_window` | моменты ошибок и разброс между первой и последней |
 | `GW=$(kubectl … get svc -l …)` | имя Service, который Envoy Gateway создал для Gateway `lab` |
-| `kubectl cp … client:/tmp/load.py` | копия клиента внутрь пода |
+| `k cp … client:/tmp/load.py` | копия клиента внутрь пода |
 
 Результат (в записи автора строка сокращена до `requests=544 ok=544 errors=0`; хвост `error_window=0s` клиент печатает всегда):
 
@@ -515,11 +515,11 @@ requests=544 ok=544 errors=0 error_window=0s
 
 ```bash
 run() {
-  kubectl exec client -- python /tmp/load.py 30 http://$GW/version lab025.localhost \
+  k exec client -- python /tmp/load.py 30 http://$GW/version lab025.localhost \
     > ~/lab/k8s/02-5/gw.txt &
-  kubectl exec client -- python /tmp/load.py 30 http://orders-api/version \
+  k exec client -- python /tmp/load.py 30 http://orders-api/version \
     > ~/lab/k8s/02-5/svc.txt &
-  sleep 3; kubectl rollout restart deploy/orders-api; kubectl rollout status deploy/orders-api
+  sleep 3; k rollout restart deploy/orders-api; k rollout status deploy/orders-api
   wait; echo "$1"
   echo "  via gateway: $(cat ~/lab/k8s/02-5/gw.txt)"
   echo "  via service: $(cat ~/lab/k8s/02-5/svc.txt)"
@@ -601,10 +601,10 @@ A2 via service: requests=5280 ok=5273 errors=7 error_window=2.1s
 Команда добавляет в контейнер хук `preStop` с паузой 5 с, ждёт новую выкатку и повторяет замер. Дополнительные 5 с перед замером нужны, чтобы новые поды успели стать Ready.
 
 ```bash
-kubectl patch deploy orders-api --type=json -p '[
+k patch deploy orders-api --type=json -p '[
   {"op":"add","path":"/spec/template/spec/containers/0/lifecycle",
    "value":{"preStop":{"sleep":{"seconds":5}}}}]'
-kubectl rollout status deploy/orders-api; sleep 5
+k rollout status deploy/orders-api; sleep 5
 run "B: SHUTDOWN_DELAY=0, preStop sleep 5"
 ```
 
@@ -637,10 +637,10 @@ B2: preStop sleep 5 (repeat)
 Команда убирает хук и включает задержку в приложении: после SIGTERM orders-api отдаёт на `/ready` ответ 503, но ещё 5 с обслуживает запросы.
 
 ```bash
-kubectl patch deploy orders-api --type=json -p '[
+k patch deploy orders-api --type=json -p '[
   {"op":"remove","path":"/spec/template/spec/containers/0/lifecycle"},
   {"op":"replace","path":"/spec/template/spec/containers/0/env/0/value","value":"5"}]'
-kubectl rollout status deploy/orders-api; sleep 5
+k rollout status deploy/orders-api; sleep 5
 run "C: SHUTDOWN_DELAY=5 (app keeps serving after SIGTERM, readiness 503)"
 ```
 
@@ -669,12 +669,12 @@ C: SHUTDOWN_DELAY=5 (app keeps serving after SIGTERM, readiness 503)
 Команда создаёт два пода: `polite` ловит SIGTERM и выходит, `stubborn` запускает `sleep infinity` как PID 1 без обработчика. Функция `del` удаляет под и печатает, сколько заняло удаление.
 
 ```bash
-kubectl run stubborn --image=busybox:1.37 -- sleep infinity
-kubectl run polite --image=busybox:1.37 -- \
+k run stubborn --image=busybox:1.37 -- sleep infinity
+k run polite --image=busybox:1.37 -- \
   sh -c 'trap "echo got TERM; exit 0" TERM; while true; do sleep 1; done'
-kubectl wait --for=condition=Ready pod/stubborn pod/polite
+k wait --for=condition=Ready pod/stubborn pod/polite
 del() {
-  s=$(date +%s%N); kubectl delete pod "$1" -o name > /dev/null
+  s=$(date +%s%N); k delete pod "$1" -o name > /dev/null
   awk -v ns=$(( $(date +%s%N) - s )) -v p="$1" \
     'BEGIN{printf "%s deleted in %.1f s\n", p, ns/1e9}'
 }
@@ -685,7 +685,7 @@ del polite; del stubborn
 |---|---|
 | `trap "echo got TERM; exit 0" TERM` | при SIGTERM напечатать строку и выйти с кодом 0 |
 | `sleep infinity` | PID 1 без обработчика сигнала |
-| `kubectl delete pod … -o name` | удалить под и ждать его исчезновения |
+| `k delete pod … -o name` | удалить под и ждать его исчезновения |
 | `date +%s%N` | время в наносекундах до и после удаления |
 | `awk … ns/1e9` | перевести наносекунды в секунды |
 
@@ -709,7 +709,7 @@ stubborn deleted in 30.8 s
 
 ```bash
 docker exec lab-worker crictl images | grep pause
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: nosleep-exec}
@@ -732,9 +732,9 @@ spec:
       preStop:
         sleep: {seconds: 5}
 EOF
-kubectl wait --for=condition=Ready pod/nosleep-exec pod/nosleep-native
+k wait --for=condition=Ready pod/nosleep-exec pod/nosleep-native
 del nosleep-exec; del nosleep-native
-kubectl get events --field-selector reason=FailedPreStopHook \
+k get events --field-selector reason=FailedPreStopHook \
   -o custom-columns=POD:.involvedObject.name,MSG:.message
 ```
 
@@ -774,8 +774,8 @@ nosleep-exec  Exec lifecycle hook ([sleep 5]) for Container "app" in Pod … fai
 **Уборка.** Удаляем объекты работ 1 и 2, файлы замера и функции оболочки.
 
 ```bash
-kubectl delete deploy,svc,httproute orders-api
-kubectl delete pod client nosleep-exec nosleep-native --now --ignore-not-found
+k delete deploy,svc,httproute orders-api
+k delete pod client nosleep-exec nosleep-native --now --ignore-not-found
 rm -f ~/lab/k8s/02-5/gw.txt ~/lab/k8s/02-5/svc.txt
 unset -f run del
 ```
@@ -818,7 +818,7 @@ slow-endpoint    liveness на /work?ms=1500, timeoutSeconds=1        ► CrashL
 Команда создаёт три пода и показывает, какие значения kubelet подставил в liveness первого.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: slow-no-startup}
@@ -854,7 +854,7 @@ spec:
       httpGet: {path: "/work?ms=1500", port: http}
       periodSeconds: 5
 EOF
-kubectl get pod slow-no-startup -o jsonpath='{.spec.containers[0].livenessProbe}{"\n"}'
+k get pod slow-no-startup -o jsonpath='{.spec.containers[0].livenessProbe}{"\n"}'
 ```
 
 | Часть манифеста | Значение |
@@ -884,7 +884,7 @@ kubectl get pod slow-no-startup -o jsonpath='{.spec.containers[0].livenessProbe}
 
 ```bash
 sleep 240
-kubectl get pods slow-no-startup slow-startup slow-endpoint
+k get pods slow-no-startup slow-startup slow-endpoint
 ```
 
 Результат:
@@ -908,12 +908,12 @@ slow-endpoint     0/1     CrashLoopBackOff   6 (32s ago)   4m4s
 Команда показывает последнее событие `Unhealthy` у `slow-endpoint` и причину завершения прежнего запуска у `slow-no-startup`, затем удаляет поды.
 
 ```bash
-kubectl get events --field-selector involvedObject.name=slow-endpoint,reason=Unhealthy \
+k get events --field-selector involvedObject.name=slow-endpoint,reason=Unhealthy \
   -o custom-columns=COUNT:.count,MSG:.message | tail -1
 T='lastState={.status.containerStatuses[0].lastState.terminated.reason}'
 T+='/{.status.containerStatuses[0].lastState.terminated.exitCode}{"\n"}'
-kubectl get pod slow-no-startup -o jsonpath="$T"
-kubectl delete pod slow-no-startup slow-startup slow-endpoint --now
+k get pod slow-no-startup -o jsonpath="$T"
+k delete pod slow-no-startup slow-startup slow-endpoint --now
 ```
 
 | Часть команды | Значение |
@@ -992,7 +992,7 @@ scale sts postgres 0 на 60 с ► scale 1 ► кто быстрее стане
 Команда создаёт Secret с учебными реквизитами, headless Service и StatefulSet без тома.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Secret
 metadata: {name: postgres}
@@ -1035,7 +1035,7 @@ spec:
         volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
       volumes: [{name: data, emptyDir: {}}]
 EOF
-kubectl rollout status sts/postgres --timeout=180s
+k rollout status sts/postgres --timeout=180s
 ```
 
 | Часть манифеста | Значение |
@@ -1067,7 +1067,7 @@ statefulset rolling update complete 1 pods at revision postgres-…
 ```bash
 for v in readiness-only liveness-db; do
   LP=/health; [ $v = liveness-db ] && LP=/ready
-  kubectl apply -f - <<EOF
+  k apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata: {name: $v}
@@ -1088,7 +1088,7 @@ spec:
         livenessProbe: {httpGet: {path: $LP, port: http}, periodSeconds: 5, failureThreshold: 3}
 EOF
 done
-kubectl rollout status deploy/readiness-only; kubectl rollout status deploy/liveness-db
+k rollout status deploy/readiness-only; k rollout status deploy/liveness-db
 ```
 
 | Часть команды | Значение |
@@ -1112,9 +1112,9 @@ deployment "liveness-db" successfully rolled out
 Команда останавливает базу, ждёт минуту и показывает поды.
 
 ```bash
-kubectl scale sts postgres --replicas=0
+k scale sts postgres --replicas=0
 sleep 60
-kubectl get pods -l 'app in (readiness-only,liveness-db)'
+k get pods -l 'app in (readiness-only,liveness-db)'
 ```
 
 | Часть команды | Значение |
@@ -1144,9 +1144,9 @@ readiness-only-…     0/1     Running            0          …
 Команда запускает базу и следит за подами, чтобы заметить, кто быстрее вернётся в `1/1`. Остановить наблюдение можно сочетанием Ctrl+C.
 
 ```bash
-kubectl scale sts postgres --replicas=1
-kubectl rollout status sts/postgres
-kubectl get pods -l 'app in (readiness-only,liveness-db)' -w
+k scale sts postgres --replicas=1
+k rollout status sts/postgres
+k get pods -l 'app in (readiness-only,liveness-db)' -w
 ```
 
 | Часть команды | Значение |
@@ -1176,10 +1176,9 @@ kubectl get pods -l 'app in (readiness-only,liveness-db)' -w
 | Readiness только снимает под с трафика, процесс не трогает | шаг 3, `readiness-only` |
 | Каскад замедляет восстановление после сбоя | шаг 4, 3 с против 20 с |
 
-**Уборка.** Удаляем namespace со всем содержимым, возвращаем namespace по умолчанию и убираем файлы работ.
+**Уборка.** Удаляем namespace со всем содержимым и убираем файлы работ.
 
 ```bash
-kubectl config set-context --current --namespace=default
 kubectl delete ns lab-02-5
 rm -rf ~/lab/k8s/02-5
 ```

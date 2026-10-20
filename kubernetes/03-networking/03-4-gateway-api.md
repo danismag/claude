@@ -415,14 +415,14 @@ Gateway API работает не только с HTTP.
 
 ## Лабораторные работы
 
-Работы идут на стенде 00-1 в namespace `lab-03-4` и выполняются подряд: общую подготовку делают один раз перед работой 1. Хост работы почти не меняют: на машине появляются каталог `~/lab/k8s/03-4`, образы Docker и текущий namespace в контексте kubectl, а остальное происходит внутри кластера kind.
+Работы идут на стенде 00-1 в namespace `lab-03-4` и выполняются подряд: общую подготовку делают один раз перед работой 1. Хост работы почти не меняют: на машине появляются каталог `~/lab/k8s/03-4`, образы Docker, а остальное происходит внутри кластера kind.
 
 Подготовка создаёт namespace, каталог и два образа с версиями 2.0 и 2.1 в реестре стенда. Образ 2.0 — это образ из 00-1 под новым именем, образ 2.1 собирается из тех же исходников с другим номером версии. Приложение не требует базы и отвечает JSON с именем пода, по которому клиент отличает версии.
 
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-03-4
-kubectl config set-context --current --namespace=lab-03-4
+k() { kubectl -n lab-03-4 "$@"; }
 mkdir -p ~/lab/k8s/03-4
 
 docker tag localhost:5001/orders-api:2.0 localhost:5001/lab-03-4/orders-api:2.0
@@ -434,7 +434,7 @@ docker push localhost:5001/lab-03-4/orders-api:2.1
 
 | Часть команды | Значение |
 |---|---|
-| `config set-context --current --namespace=…` | сделать `lab-03-4` текущим namespace |
+| `k() { … }` | короткая команда `kubectl -n lab-03-4`; контекст не меняется |
 | `docker tag … lab-03-4/orders-api:2.0` | дать образу 2.0 имя с префиксом работы |
 | `docker build … --build-arg APP_VERSION=2.1` | собрать версию 2.1 из исходников orders-api |
 | `docker push` | отправить оба образа в реестр стенда |
@@ -487,9 +487,9 @@ spec:
   selector: {app: api-2-1}
   ports: [{name: http, port: 80, targetPort: http}]
 EOF
-kubectl apply -f ~/lab/k8s/03-4/versions.yaml
-kubectl rollout status deploy/api-2-0
-kubectl rollout status deploy/api-2-1
+k apply -f ~/lab/k8s/03-4/versions.yaml
+k rollout status deploy/api-2-0
+k rollout status deploy/api-2-1
 ```
 
 | Часть манифеста | Значение |
@@ -562,7 +562,7 @@ T='{range .status.parents[*].conditions[*]}{.type}={.status} {.reason}: {.messag
 
 **Риски.** Работа меняет только кластер стенда и три вещи на хосте.
 
-- **Что меняется:** namespace `lab-03-4` с двумя версиями приложения и маршрутом; на хосте — каталог `~/lab/k8s/03-4`, два тега образов в Docker и реестре, namespace по умолчанию у контекста `kind-lab` в `~/.kube/config`.
+- **Что меняется:** namespace `lab-03-4` с двумя версиями приложения и маршрутом; на хосте — каталог `~/lab/k8s/03-4`, два тега образов в Docker и реестре.
 - **Надолго ли:** до уборки в конце работы 3.
 - **Безопасность:** привилегии не нужны; маршрут слушает только хост `shop.localhost` на стенде.
 - **Влияние на систему:** другие контексты kubectl и существующий маршрут `orders-api` не затронуты.
@@ -644,9 +644,9 @@ spec:
         path: {type: ReplaceFullPath, replaceFullPath: /api/orders}
         statusCode: 302
 EOF
-kubectl apply -f ~/lab/k8s/03-4/shop.yaml
+k apply -f ~/lab/k8s/03-4/shop.yaml
 sleep 3
-kubectl get httproute shop -o jsonpath="$T"
+k get httproute shop -o jsonpath="$T"
 gw
 ```
 
@@ -684,7 +684,7 @@ unknown host -> 404
 Добавляем в первое правило тот же путь `/api`. Тогда длина префикса у правил 1 и 2 одинакова, и первое выигрывает за счёт совпадения по заголовку. Заменяем только условие первого правила JSON-патчем.
 
 ```bash
-kubectl patch httproute shop --type=json -p \
+k patch httproute shop --type=json -p \
   '[{"op":"replace","path":"/spec/rules/0/matches/0","value":
      {"path":{"type":"PathPrefix","value":"/api"},
       "headers":[{"name":"x-canary","value":"true"}]}}]'
@@ -728,7 +728,7 @@ unknown host -> 404
 **Уборка.** Удаляем только маршрут: namespace и приложения понадобятся в работах 2 и 3.
 
 ```bash
-kubectl delete httproute shop
+k delete httproute shop
 ```
 
 Результат:
@@ -825,7 +825,7 @@ spec:
         path: {type: ReplaceFullPath, replaceFullPath: /api/orders}
         statusCode: 302
 EOF
-kubectl apply -f ~/lab/k8s/03-4/shop.yaml
+k apply -f ~/lab/k8s/03-4/shop.yaml
 sleep 3
 gw
 ```
@@ -833,7 +833,7 @@ gw
 | Часть команды | Значение |
 |---|---|
 | `cat > shop.yaml` | записать маршрут целиком, с путём в правиле 1 |
-| `kubectl apply -f` | создать маршрут (в работе 1 он удалён) |
+| `k apply -f` | создать маршрут (в работе 1 он удалён) |
 | `gw` | замерить 1000 запросов и 20 запросов с заголовком |
 
 Результат:
@@ -857,7 +857,7 @@ unknown host -> 404
 Следующий этап выкатки: если на 10 % всё хорошо, переводим половину трафика. Правим только веса во втором правиле. Это единственное изменение, которое нужно для выкатки.
 
 ```bash
-kubectl patch httproute shop --type=json -p \
+k patch httproute shop --type=json -p \
   '[{"op":"replace","path":"/spec/rules/1/backendRefs/0/weight","value":50},
     {"op":"replace","path":"/spec/rules/1/backendRefs/1/weight","value":50}]'
 sleep 3
@@ -891,12 +891,12 @@ x-canary: true -> {'api-2-1': 20}
 Завершаем выкатку: весь трафик на новую версию, затем возвращаем всё на старую, как при обнаружении ошибки. Вес 0 не удаляет бэкенд из списка, а только лишает его запросов. Поэтому откат — это та же правка весов.
 
 ```bash
-kubectl patch httproute shop --type=json -p \
+k patch httproute shop --type=json -p \
   '[{"op":"replace","path":"/spec/rules/1/backendRefs/0/weight","value":0},
     {"op":"replace","path":"/spec/rules/1/backendRefs/1/weight","value":100}]'
 sleep 3
 gw
-kubectl patch httproute shop --type=json -p \
+k patch httproute shop --type=json -p \
   '[{"op":"replace","path":"/spec/rules/1/backendRefs/0/weight","value":100},
     {"op":"replace","path":"/spec/rules/1/backendRefs/1/weight","value":0}]'
 sleep 3
@@ -932,14 +932,14 @@ x-canary: true -> {'api-2-1': 20}
 |---|---|
 | Доля задаётся весами, а не числом подов | `weight` в `backendRefs` |
 | Распределение случайное, разброс ≈ 9,5 на 1000 при 10 % | замер `split over 1000` |
-| Выкатка и откат — правка двух чисел | `kubectl patch` весов |
+| Выкатка и откат — правка двух чисел | `k patch` весов |
 | Вес 0 даёт точное «ничего» | при 100/0 все 1000 запросов в `api-2-0` |
 | Заголовочное правило не зависит от весов | `x-canary: true` всегда в `api-2-1` |
 
 **Уборка.** Удаляем маршрут, как в работе 1. Версии приложения остаются для работы 3.
 
 ```bash
-kubectl delete httproute shop
+k delete httproute shop
 ```
 
 Результат:
@@ -1031,9 +1031,9 @@ spec:
   rules:
   - backendRefs: [{name: orders-api, namespace: orders, port: 80}]
 EOF
-kubectl apply -f ~/lab/k8s/03-4/cross.yaml
+k apply -f ~/lab/k8s/03-4/cross.yaml
 sleep 3
-kubectl get httproute cross -o jsonpath="$T"
+k get httproute cross -o jsonpath="$T"
 httpcode cross.localhost /api/orders
 ```
 
@@ -1077,7 +1077,7 @@ spec:
 EOF
 kubectl apply -f ~/lab/k8s/03-4/grant.yaml
 sleep 4
-kubectl get httproute cross -o jsonpath="$T"
+k get httproute cross -o jsonpath="$T"
 httpcode cross.localhost /api/orders
 ```
 
@@ -1111,7 +1111,7 @@ ResolvedRefs=True ResolvedRefs: Resolved all the Object references for the Route
 ```bash
 kubectl -n orders delete referencegrant allow-lab-03-4
 sleep 4
-kubectl get httproute cross -o jsonpath="$T"
+k get httproute cross -o jsonpath="$T"
 httpcode cross.localhost /api/orders
 ```
 
@@ -1149,8 +1149,7 @@ ResolvedRefs=False RefNotPermitted: Failed to process route rule 0 backendRef 0:
 
 ```bash
 kubectl -n orders delete referencegrant allow-lab-03-4 --ignore-not-found
-kubectl delete httproute cross shop --ignore-not-found
-kubectl config set-context --current --namespace=default
+k delete httproute cross shop --ignore-not-found
 kubectl delete ns lab-03-4
 rm -rf ~/lab/k8s/03-4
 unset -f gw httpcode

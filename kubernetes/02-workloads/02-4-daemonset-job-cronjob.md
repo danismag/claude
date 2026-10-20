@@ -326,10 +326,10 @@ CronJob backup  ──(10:00)──►  Job backup-29866200  ──►  Pod
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-02-4
-kubectl config set-context --current --namespace=lab-02-4
+k() { kubectl -n lab-02-4 "$@"; }
 ```
 
-Первая команда выбирает кластер стенда, вторая создаёт namespace, а третья делает его текущим, чтобы не писать `-n lab-02-4`. Namespace удаляется в уборке четвёртой работы.
+Первая команда выбирает кластер стенда, вторая создаёт namespace, а третья определяет функцию `k` — короткое имя для `kubectl -n lab-02-4`. Функция живёт только в текущем окне терминала: в новом окне определите её снова. Namespace удаляется в уборке четвёртой работы.
 
 ### Лабораторная работа 1. Job: повторы, лимит времени, политика отказа
 
@@ -354,7 +354,7 @@ ttl       true, ttl 10 с            ─► Job исчезает через 10 �
 Команда создаёт пять Job'ов с разными лимитами. Во всех `restartPolicy: Never`, чтобы каждая попытка была отдельным подом.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: batch/v1
 kind: Job
 metadata: {name: flaky}
@@ -450,8 +450,8 @@ EOF
 
 ```bash
 sleep 75
-kubectl get jobs flaky deadline policy parallel
-kubectl get job ttl
+k get jobs flaky deadline policy parallel
+k get job ttl
 ```
 
 | Часть команды | Значение |
@@ -485,7 +485,7 @@ Error from server (NotFound): jobs.batch "ttl" not found
 ```bash
 T='{range .status.conditions[*]}{.type}={.status}/{.reason} {end}'
 T+='failed={.status.failed}{"\n"}'
-for j in flaky deadline policy; do echo -n "$j: "; kubectl get job $j -o jsonpath="$T"; done
+for j in flaky deadline policy; do echo -n "$j: "; k get job $j -o jsonpath="$T"; done
 ```
 
 | Часть команды | Значение |
@@ -515,10 +515,10 @@ policy: FailureTarget=True/PodFailurePolicy Failed=True/PodFailurePolicy failed=
 Команда выводит время старта подов `flaky` и подов `parallel` с индексами.
 
 ```bash
-kubectl get pods -l batch.kubernetes.io/job-name=flaky \
+k get pods -l batch.kubernetes.io/job-name=flaky \
   -o custom-columns=POD:.metadata.name,STARTED:.status.startTime \
   --sort-by=.status.startTime
-kubectl get pods -l batch.kubernetes.io/job-name=parallel \
+k get pods -l batch.kubernetes.io/job-name=parallel \
   -o custom-columns=POD:.metadata.name,\
 IDX:.metadata.annotations.batch\\.kubernetes\\.io/job-completion-index,\
 START:.status.startTime \
@@ -553,7 +553,7 @@ START:.status.startTime \
 **Уборка.**
 
 ```bash
-kubectl delete job --all
+k delete job --all
 ```
 
 **Вопросы для самопроверки.**
@@ -595,7 +595,7 @@ pr-default / pr-failed  удалить под                       ─► за�
 Команда создаёт Job из шести индексов. Нечётные индексы всегда падают, у каждого индекса одна повторная попытка.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: batch/v1
 kind: Job
 metadata: {name: idx-fail}
@@ -616,8 +616,8 @@ EOF
 sleep 40
 T='completed={.status.completedIndexes} failedIdx={.status.failedIndexes} '
 T+='succeeded={.status.succeeded} failed={.status.failed}{"\n"}'
-kubectl get job idx-fail -o jsonpath="$T"
-kubectl get job idx-fail
+k get job idx-fail -o jsonpath="$T"
+k get job idx-fail
 ```
 
 | Часть команды | Значение |
@@ -648,7 +648,7 @@ idx-fail   Failed   3/6           …          40s
 Команда создаёт Job, где индекс 1 возвращает код 42, и добавляет правило `FailIndex`: оно проваливает этот индекс сразу, не тратя попытки.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: batch/v1
 kind: Job
 metadata: {name: idx-failindex}
@@ -672,7 +672,7 @@ EOF
 sleep 15
 T='completed={.status.completedIndexes} failedIdx={.status.failedIndexes} '
 T+='failed={.status.failed}{"\n"}'
-kubectl get job idx-failindex -o jsonpath="$T"
+k get job idx-failindex -o jsonpath="$T"
 ```
 
 | Часть команды | Значение |
@@ -698,7 +698,7 @@ completed=0,2,3 failedIdx=1 failed=1
 Команда создаёт Job из пяти индексов, где быстро завершается только индекс 0, а остальные ждут. Политика успеха объявляет Job выполненным, когда индекс 0 успешен.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: batch/v1
 kind: Job
 metadata: {name: idx-success}
@@ -721,8 +721,8 @@ EOF
 sleep 20
 T='{range .status.conditions[*]}{.type}={.status}/{.reason} {end}'
 T+='completed={.status.completedIndexes}{"\n"}'
-kubectl get job idx-success -o jsonpath="$T"
-kubectl get pods -l batch.kubernetes.io/job-name=idx-success \
+k get job idx-success -o jsonpath="$T"
+k get pods -l batch.kubernetes.io/job-name=idx-success \
   --field-selector=status.phase=Running
 ```
 
@@ -751,7 +751,7 @@ No resources found in lab-02-4 namespace.
 Команда создаёт два Job'а с одинаковым подом, который игнорирует SIGTERM и останавливается 20 секунд. Отличается только `podReplacementPolicy`. Удалённый под считается неудачной попыткой, поэтому замена ждёт паузу back-off в 10 секунд, и смотреть результат нужно через 15 секунд.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: batch/v1
 kind: Job
 metadata: {name: pr-default}
@@ -781,10 +781,10 @@ spec:
         command: ["sleep", "3600"]
 EOF
 sleep 10
-kubectl delete pod -l 'batch.kubernetes.io/job-name in (pr-default,pr-failed)' --wait=false
+k delete pod -l 'batch.kubernetes.io/job-name in (pr-default,pr-failed)' --wait=false
 sleep 15
-kubectl get pods -l 'batch.kubernetes.io/job-name in (pr-default,pr-failed)'
-kubectl get job pr-default pr-failed -o custom-columns=\
+k get pods -l 'batch.kubernetes.io/job-name in (pr-default,pr-failed)'
+k get job pr-default pr-failed -o custom-columns=\
 JOB:.metadata.name,TERMINATING:.status.terminating,FAILED:.status.failed
 ```
 
@@ -833,7 +833,7 @@ pr-failed    1             <none>
 **Уборка.**
 
 ```bash
-kubectl delete job --all
+k delete job --all
 ```
 
 **Вопросы для самопроверки.**
@@ -872,7 +872,7 @@ backup-ok       * * * * *, Europe/Moscow, date ─► новый Job кажду�
 Команда создаёт три CronJob'а, которые срабатывают каждую минуту. Два из них запускают задачу на час, чтобы наложить запуски друг на друга.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: batch/v1
 kind: CronJob
 metadata: {name: backup-forbid}
@@ -942,8 +942,8 @@ EOF
 Команда показывает CronJob'ы и созданные ими Job'ы.
 
 ```bash
-kubectl get cronjobs
-kubectl get jobs --sort-by=.metadata.creationTimestamp | grep backup
+k get cronjobs
+k get jobs --sort-by=.metadata.creationTimestamp | grep backup
 ```
 
 | Часть команды | Значение |
@@ -979,13 +979,13 @@ backup-replace-29866172   Running    0/1           3s
 Команда выводит события Forbid и Replace и поля статуса зависшего CronJob'а.
 
 ```bash
-kubectl get events --sort-by=.lastTimestamp \
+k get events --sort-by=.lastTimestamp \
   -o custom-columns=OBJ:.involvedObject.name,REASON:.reason,MSG:.message \
   | grep -E 'backup-(forbid|replace)' | tail -8
 T='lastSchedule={.status.lastScheduleTime} '
 T+='lastSuccessful={.status.lastSuccessfulTime} '
 T+='active={.status.active[*].name}{"\n"}'
-kubectl get cronjob backup-forbid -o jsonpath="$T"
+k get cronjob backup-forbid -o jsonpath="$T"
 ```
 
 | Часть команды | Значение |
@@ -1015,14 +1015,14 @@ lastSchedule=2026-10-14T09:30:00Z lastSuccessful= active=backup-forbid-29866170
 Команда читает лог последнего Job'а `backup-ok`.
 
 ```bash
-kubectl logs $(kubectl get pods -o name | grep backup-ok | tail -1)
+k logs $(k get pods -o name | grep backup-ok | tail -1)
 ```
 
 | Часть команды | Значение |
 |---|---|
-| `kubectl get pods -o name` | имена всех подов |
+| `k get pods -o name` | имена всех подов |
 | `grep backup-ok`, затем `tail -1` | последний под этого CronJob'а |
-| `kubectl logs …` | лог этого пода |
+| `k logs …` | лог этого пода |
 
 Результат:
 
@@ -1045,8 +1045,8 @@ ok
 **Уборка.**
 
 ```bash
-kubectl delete cronjob --all
-kubectl delete job --all
+k delete cronjob --all
+k delete job --all
 ```
 
 **Вопросы для самопроверки.**
@@ -1095,7 +1095,7 @@ lab-worker, lab-worker2, lab-worker3
 Команда создаёт DaemonSet из лёгкого пода-агента и показывает его сводку и расположение подов.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: apps/v1
 kind: DaemonSet
 metadata: {name: node-agent}
@@ -1112,9 +1112,9 @@ spec:
         env: [{name: NODE, valueFrom: {fieldRef: {fieldPath: spec.nodeName}}}]
         resources: {requests: {cpu: 10m, memory: 16Mi}}
 EOF
-kubectl rollout status ds/node-agent
-kubectl get ds node-agent
-kubectl get pods -l app=node-agent -o wide
+k rollout status ds/node-agent
+k get ds node-agent
+k get pods -l app=node-agent -o wide
 ```
 
 | Часть команды | Значение |
@@ -1145,7 +1145,7 @@ node-agent   3         3         3       3            3
 Команда выводит tolerations, которые контроллер добавил в под, и taint узла.
 
 ```bash
-kubectl get pod -l app=node-agent -o jsonpath='{.items[0].spec.tolerations}' | jq -c '.[]'
+k get pod -l app=node-agent -o jsonpath='{.items[0].spec.tolerations}' | jq -c '.[]'
 kubectl get node lab-control-plane -o jsonpath='{.spec.taints}{"\n"}'
 ```
 
@@ -1180,12 +1180,12 @@ kubectl get node lab-control-plane -o jsonpath='{.spec.taints}{"\n"}'
 Команда добавляет в шаблон toleration и ждёт обновления. Изменение шаблона запускает rolling update.
 
 ```bash
-kubectl patch ds node-agent --type=merge -p \
+k patch ds node-agent --type=merge -p \
   '{"spec":{"template":{"spec":{"tolerations":[
     {"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}
   ]}}}}'
-kubectl rollout status ds/node-agent
-kubectl get ds node-agent
+k rollout status ds/node-agent
+k get ds node-agent
 ```
 
 | Часть команды | Значение |
@@ -1216,7 +1216,7 @@ node-agent   4         4         4       4            4
 Команда показывает `updateStrategy` созданного DaemonSet.
 
 ```bash
-kubectl get ds node-agent -o jsonpath='{.spec.updateStrategy}{"\n"}'
+k get ds node-agent -o jsonpath='{.spec.updateStrategy}{"\n"}'
 ```
 
 | Часть команды | Значение |
@@ -1238,7 +1238,7 @@ kubectl get ds node-agent -o jsonpath='{.spec.updateStrategy}{"\n"}'
 
 ```bash
 kubectl cordon lab-worker2
-kubectl get pods -l app=node-agent -o wide | grep lab-worker2
+k get pods -l app=node-agent -o wide | grep lab-worker2
 kubectl uncordon lab-worker2
 ```
 
@@ -1265,12 +1265,11 @@ kubectl uncordon lab-worker2
 | По умолчанию `maxUnavailable` равно 1, `maxSurge` равно 0 | шаг 4 |
 | Cordon не выселяет агентов | шаг 5 |
 
-**Уборка.** Удаляем DaemonSet и namespace, возвращаем namespace kubectl по умолчанию и проверяем, что узел открыт.
+**Уборка.** Удаляем DaemonSet и namespace и проверяем, что узел открыт.
 
 ```bash
 kubectl uncordon lab-worker2
-kubectl delete ds node-agent
-kubectl config set-context --current --namespace=default
+k delete ds node-agent
 kubectl delete ns lab-02-4
 ```
 

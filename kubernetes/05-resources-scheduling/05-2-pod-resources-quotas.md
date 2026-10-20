@@ -442,10 +442,10 @@ kubectl get pod shared -o jsonpath="$T"
 ```bash
 kubectl config use-context kind-lab
 kubectl create ns lab-05-2
-kubectl config set-context --current --namespace=lab-05-2
+k() { kubectl -n lab-05-2 "$@"; }
 ```
 
-Первая команда выбирает кластер стенда, вторая создаёт namespace, третья делает его текущим для kubectl.
+Первая команда выбирает кластер стенда, вторая создаёт namespace, третья определяет функцию `k` — короткое имя для `kubectl -n lab-05-2`. Функция живёт только в текущем окне терминала: в новом окне определите её снова.
 
 ### Лабораторная работа 1. Resize на месте
 
@@ -472,7 +472,7 @@ Pod hold          держит 100 МиБ ──► лимит 200Mi → 80Mi (�
 Команда создаёт под Burstable (запрос меньше лимита по памяти) и читает его cgroup.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: cpu-limited}
@@ -485,8 +485,8 @@ spec:
       requests: {cpu: 200m, memory: 64Mi}
       limits: {cpu: 200m, memory: 128Mi}
 EOF
-kubectl wait --for=condition=Ready pod/cpu-limited --timeout=60s
-kubectl exec cpu-limited -- cat /sys/fs/cgroup/cpu.max
+k wait --for=condition=Ready pod/cpu-limited --timeout=60s
+k exec cpu-limited -- cat /sys/fs/cgroup/cpu.max
 ```
 
 | Часть команды | Значение |
@@ -510,12 +510,12 @@ kubectl exec cpu-limited -- cat /sys/fs/cgroup/cpu.max
 ```bash
 P='{"spec":{"containers":[{"name":"app","resources":'
 P+='{"requests":{"cpu":"500m"},"limits":{"cpu":"500m"}}}]}}'
-kubectl patch pod cpu-limited --subresource resize --patch "$P"
+k patch pod cpu-limited --subresource resize --patch "$P"
 T='restarts={.status.containerStatuses[0].restartCount} '
 T+='spec={.spec.containers[0].resources.limits.cpu} '
 T+='status={.status.containerStatuses[0].resources.limits.cpu}{"\n"}'
-kubectl get pod cpu-limited -o jsonpath="$T"
-kubectl exec cpu-limited -- cat /sys/fs/cgroup/cpu.max
+k get pod cpu-limited -o jsonpath="$T"
+k exec cpu-limited -- cat /sys/fs/cgroup/cpu.max
 ```
 
 | Часть команды | Значение |
@@ -544,7 +544,7 @@ restarts=0 spec=500m status=500m
 Теперь запрос и лимит CPU равны (500m). Команда пробует сделать равными и память: это превратило бы Burstable в Guaranteed.
 
 ```bash
-kubectl patch pod cpu-limited --subresource resize \
+k patch pod cpu-limited --subresource resize \
   --patch '{"spec":{"containers":[{"name":"app","resources":{"limits":{"memory":"64Mi"}}}]}}'
 ```
 
@@ -562,9 +562,9 @@ Pod QOS Class may not change as a result of resizing
 Разбор: оба ресурса стали бы равными в запросе и лимите, и класс сменился бы на Guaranteed. API отказывает, и под остаётся прежним. Теперь допустимое изменение: лимит 100Mi остаётся выше запроса 64Mi.
 
 ```bash
-kubectl patch pod cpu-limited --subresource resize \
+k patch pod cpu-limited --subresource resize \
   --patch '{"spec":{"containers":[{"name":"app","resources":{"limits":{"memory":"100Mi"}}}]}}'
-kubectl exec cpu-limited -- cat /sys/fs/cgroup/memory.max
+k exec cpu-limited -- cat /sys/fs/cgroup/memory.max
 ```
 
 Результат:
@@ -581,7 +581,7 @@ pod/cpu-limited patched
 Команда запускает под, который держит около 100 МиБ, и уменьшает его лимит с 200Mi до 80Mi.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: hold}
@@ -594,9 +594,9 @@ spec:
       requests: {memory: 64Mi}
       limits: {memory: 200Mi}
 EOF
-kubectl wait --for=condition=Ready pod/hold --timeout=60s
-kubectl exec hold -- cat /sys/fs/cgroup/memory.current
-kubectl patch pod hold --subresource resize \
+k wait --for=condition=Ready pod/hold --timeout=60s
+k exec hold -- cat /sys/fs/cgroup/memory.current
+k patch pod hold --subresource resize \
   --patch '{"spec":{"containers":[{"name":"app","resources":{"limits":{"memory":"80Mi"}}}]}}'
 sleep 15
 ```
@@ -622,8 +622,8 @@ T+='spec={.spec.containers[0].resources.limits.memory} '
 T+='status={.status.containerStatuses[0].resources.limits.memory}{"\n"}'
 T+='{range .status.conditions[?(@.type=="PodResizeInProgress")]}'
 T+='{.type}={.status} {.reason} {.message}{"\n"}{end}'
-kubectl get pod hold -o jsonpath="$T"
-kubectl exec hold -- cat /sys/fs/cgroup/memory.max
+k get pod hold -o jsonpath="$T"
+k exec hold -- cat /sys/fs/cgroup/memory.max
 ```
 
 | Часть команды | Значение |
@@ -660,7 +660,7 @@ attempting to set container "app" memory limit (83886080) below current usage (0
 **Уборка.**
 
 ```bash
-kubectl delete pod cpu-limited hold --now
+k delete pod cpu-limited hold --now
 ```
 
 **Вопросы для самопроверки.**
@@ -707,7 +707,7 @@ Pod shared   spec.resources: memory request 100Mi, limit 200Mi
 Команда создаёт под, у которого ресурсы заданы на весь под, а контейнер `a` имеет ещё и свой лимит.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: shared}
@@ -727,8 +727,8 @@ spec:
     command: ["python", "-c", "import time; x = bytearray(250*1024*1024); time.sleep(3600)"]
 EOF
 sleep 20
-kubectl get pod shared -o jsonpath='{.status.qosClass}{" "}{.spec.resources}{"\n"}'
-kubectl exec shared -c a -- cat /sys/fs/cgroup/memory.max
+k get pod shared -o jsonpath='{.status.qosClass}{" "}{.spec.resources}{"\n"}'
+k exec shared -c a -- cat /sys/fs/cgroup/memory.max
 ```
 
 | Часть команды | Значение |
@@ -757,7 +757,7 @@ Burstable {"limits":{"memory":"200Mi"},"requests":{"cpu":"200m","memory":"100Mi"
 ```bash
 T='{range .status.containerStatuses[*]}{.name}: restarts={.restartCount} '
 T+='last={.lastState.terminated.reason}{"\n"}{end}'
-kubectl get pod shared -o jsonpath="$T"
+k get pod shared -o jsonpath="$T"
 ```
 
 | Часть команды | Значение |
@@ -779,12 +779,12 @@ b: restarts=1 last=OOMKilled
 Команда увеличивает общий лимит памяти до 400 МиБ через подресурс `resize`.
 
 ```bash
-kubectl patch pod shared --subresource resize \
+k patch pod shared --subresource resize \
   --patch '{"spec":{"resources":{"limits":{"memory":"400Mi"}}}}'
 sleep 30
 T='{range .status.containerStatuses[*]}{.name}: ready={.ready} '
 T+='restarts={.restartCount}{"\n"}{end}'
-kubectl get pod shared -o jsonpath="$T"
+k get pod shared -o jsonpath="$T"
 ```
 
 | Часть команды | Значение |
@@ -816,7 +816,7 @@ b: ready=true restarts=2
 **Уборка.**
 
 ```bash
-kubectl delete pod shared --now
+k delete pod shared --now
 ```
 
 **Вопросы для самопроверки.**
@@ -982,7 +982,7 @@ kubectl -n lab-05-2q run huge --image=python:3.12-slim \
 
 | Часть команды | Значение |
 |---|---|
-| `--overrides='{…}'` | задать контейнеру ресурсы, которых нет у `kubectl run` |
+| `--overrides='{…}'` | задать контейнеру ресурсы, которых нет у `k run` |
 | `limits.memory: 2Gi` | лимит выше `max: 1Gi` из LimitRange |
 
 Результат (строка перенесена):
@@ -999,7 +999,7 @@ maximum memory usage per Container is 1Gi, but limit is 2Gi
 Команда создаёт под с лимитом диска 50 МиБ, который пишет 100 МиБ.
 
 ```bash
-kubectl apply -f - <<'EOF'
+k apply -f - <<'EOF'
 apiVersion: v1
 kind: Pod
 metadata: {name: disk}
@@ -1017,8 +1017,8 @@ spec:
       limits: {ephemeral-storage: 50Mi}
 EOF
 sleep 30
-kubectl get pod disk
-kubectl get pod disk -o jsonpath='{.status.phase}/{.status.reason}: {.status.message}{"\n"}'
+k get pod disk
+k get pod disk -o jsonpath='{.status.phase}/{.status.reason}: {.status.message}{"\n"}'
 ```
 
 | Часть команды | Значение |
@@ -1055,13 +1055,12 @@ containers 50Mi.
 **Уборка.**
 
 ```bash
-kubectl delete pod disk --now
+k delete pod disk --now
 kubectl delete ns lab-05-2q
-kubectl config set-context --current --namespace=default
 kubectl delete ns lab-05-2
 ```
 
-Первая команда убирает под с диском, вторая удаляет namespace с квотой, LimitRange и Deployment, третья возвращает namespace по умолчанию, четвёртая удаляет рабочий namespace.
+Первая команда убирает под с диском, вторая удаляет namespace с квотой, LimitRange и Deployment, третья удаляет рабочий namespace.
 
 **Вопросы для самопроверки.**
 
@@ -1074,7 +1073,7 @@ kubectl delete ns lab-05-2
 <summary>Ответы</summary>
 
 1. Плагин LimitRanger стоит в цепочке admission раньше ResourceQuota, который проверяет последним. Лимит 2Gi выше `max: 1Gi`, поэтому отказ пришёл от LimitRange, и до квоты запрос не дошёл.
-2. В событиях ReplicaSet (`kubectl describe rs`), где написано `exceeded quota`, а не в событиях Deployment.
+2. В событиях ReplicaSet (`k describe rs`), где написано `exceeded quota`, а не в событиях Deployment.
 3. Квота на cpu и memory требует, чтобы каждый под указал ресурсы. LimitRange подставляет значения по умолчанию, и поды без ресурсов не отклоняются.
 4. Колонка STATUS показывает состояние контейнера, а не причину пода. Выселение видно в `status.reason` как `Evicted`.
 
