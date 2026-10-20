@@ -1,22 +1,79 @@
 # 09-1. CRD и операторы
 
-> Модуль 9 «Расширение API» · часть 1 из 2 · 🟡🔴 · ~1,5 ч чтения + ~1 ч лабы · Нужно: стенд 00-1; CloudNativePG 1.30.1 ставится в лабе (образы с ghcr.io — до 5–10 минут на загрузку)
+> Модуль 09 «Расширение API» · часть 1 из 2 · ~1,5 ч чтения + ~1,5 ч лабораторных · Нужно: стенд 00-1 (контекст `kind-lab`), kubectl из 00-2; для работы 2 ещё Docker на хосте, доступ к `github.com` и `ghcr.io`, до 5 ГиБ памяти стенда и место под три тома по 1 ГиБ · Опирается на: 01-1 (watch, informers, Lease), 01-3 (подресурсы, server-side apply, finalizers), 04-3 (бэкап в объектное хранилище)
+
+## Где мы на карте
+
+Эта часть открывает модуль 09 и показывает, как добавить в Kubernetes свой тип объектов и программу, которая этим типом управляет. Она опирается на модуль 01: на путь запроса и watch (01-1), на подресурсы, владельцев и finalizers (01-3). Следующая часть, 09-2, разбирает вебхуки и finalizers: их используют почти все операторы, и они же чаще всего блокируют кластер.
+
+```
+kubectl / клиенты ──► API-сервер ──► etcd
+                        │   встроенные типы:  Pod, Service, Deployment …
+                        │   типы из CRD:      RetentionPolicy, Cluster (CloudNativePG) …   ← 09-1
+                        │ watch
+                        ▼
+                контроллер оператора ──► создаёт поды, тома, Service'ы и пишет status
+```
+
+Схема 1. Тип из CRD живёт в том же API-сервере и в том же etcd, что и встроенные. Работу выполняет отдельная программа: она смотрит на объекты через watch и меняет мир вокруг них.
 
 ---
 
-## Зачем это DevOps-у
+## 1. Какую задачу решает расширение API
 
-Половина того, что установлено в кластере, — операторы: cert-manager, Envoy Gateway, Argo CD, KEDA, операторы БД и брокеров. Каждый приносит свои ресурсы (CRD) и свой контроллер. В работе: «что это за объект и кто его обрабатывает», «почему мой CR не применяется», «удалили CRD — пропали все объекты», «оператор упал — что теперь с БД». На собеседовании: «что такое оператор», «чем CRD отличается от ConfigMap», «когда оператор оправдан».
+Расширение API отвечает на вопрос, как описать в Kubernetes то, чего в нём нет, и поручить программе следить за этим описанием. Разберём тип ресурса, контроллер, уровни зрелости оператора и границы, где оператор оправдан.
 
-Сквозной сценарий: PostgreSQL orders-api — одна реплика без failover (01-2: потеря узла = 503). Здесь — тот же PostgreSQL под управлением CloudNativePG: три экземпляра, автоматический failover, замер окна недоступности записи.
+### Свой тип ресурса
+
+**CustomResourceDefinition** (CRD, определение пользовательского ресурса) — объект, который регистрирует в API-сервере новый тип. Запись этого типа называют **custom resource** (CR, пользовательский ресурс). После регистрации у типа появляются адрес в API, команды `kubectl get` и `kubectl explain`, права RBAC (06-1), watch и хранение в etcd — всё, как у встроенных типов.
+
+ConfigMap для той же цели подходит хуже, потому что хранит строки без структуры. CRD добавляет схему и проверку значений при записи, отдельные права на тип, подресурс `status` для ответа контроллера и свои колонки в `kubectl get`.
+
+### Контроллер превращает запись в действие
+
+CR без контроллера — просто запись в etcd: API-сервер проверит её и сохранит, но ничего не произойдёт. Действия выполняет **контроллер** (01-1 §1) — программа, которая следит за объектами своего типа и приводит мир к описанному. Контроллер CR работает не в control plane, а обычным Deployment внутри кластера.
+
+**Оператор** (operator) — это CRD вместе с контроллером, который знает предметную область: как развернуть БД, сделать бэкап, переключить primary, обновить версию. Термин ввела компания CoreOS: оператор записывает опыт дежурного инженера в код.
+
+```
+вы:         kubectl apply -f cluster.yaml     «хочу PostgreSQL на 3 экземпляра»
+оператор:   видит CR ─► создаёт поды и тома ─► следит за ролями ─► при отказе переключает primary
+вы:         kubectl get cluster               status: кто primary, сколько экземпляров готово
+```
+
+Схема 2. Пользователь описывает желаемое в CR, а оператор выполняет операции и сообщает результат в `status`.
+
+### Уровни зрелости оператора
+
+**Operator Capability Levels** (уровни зрелости оператора) — шкала проекта Operator Framework из пяти ступеней. Она помогает оценить, сколько работы оператор снимает с человека.
+
+1. Установка — оператор разворачивает приложение по описанию.
+2. Обновления — оператор обновляет приложение и себя без простоя.
+3. Полный жизненный цикл — оператор делает бэкапы и восстанавливает из них.
+4. Наблюдаемость — оператор отдаёт метрики, алерты и логи.
+5. Автопилот — оператор сам масштабирует, настраивает и лечит приложение.
+
+Большинство зрелых операторов баз данных находится на уровнях 3–4. Уровень 5 встречается редко.
+
+### Когда оператор оправдан
+
+Оператор оправдан, когда у приложения сложный жизненный цикл, который иначе приходится делать вручную.
+
+- Нужны failover, бэкапы и обновления с порядком шагов: базы данных, брокеры сообщений, поисковые кластеры.
+- Одна и та же операция повторяется на десятках экземпляров.
+- Есть зрелый проект с сообществом или поддержкой вендора.
+
+Хватает Deployment и Helm (07-1), когда приложение не хранит состояние и обновляется заменой подов. Свой оператор «для одного сервиса» обычно не окупается: его нужно тестировать, обновлять вместе с Kubernetes и держать на дежурстве. Для небольших расширений есть и другие пути: агрегированный API (05-4) — собственный сервер, подключённый к API-серверу через объект APIService, — и политики admission (06-3).
 
 ---
 
-## 1. CRD: свой тип в API 🟡
+## 2. Как устроены CRD и контроллер
 
-CustomResourceDefinition регистрирует новый ресурс в apiserver: `kubectl get`, RBAC, watch, etcd, `kubectl explain` — всё работает «как у встроенных». Без контроллера CR — просто запись в etcd (как Ingress без контроллера, 03-4).
+CRD описывает тип, API-сервер проверяет и хранит объекты, контроллер читает их и действует. Пройдём эти части по порядку: описание типа, проверки, подресурсы, версии и сам контроллер.
 
-CRD стенда — политика хранения данных:
+### Описание типа и структурная схема
+
+CRD относится к группе `apiextensions.k8s.io/v1`. Его имя составляется из множественного числа и группы, например `retentionpolicies.ops.lab.local`. Объекты такого типа обслуживает сам API-сервер, отдельного процесса нет.
 
 ```yaml
 apiVersion: apiextensions.k8s.io/v1
@@ -24,17 +81,379 @@ kind: CustomResourceDefinition
 metadata: {name: retentionpolicies.ops.lab.local}
 spec:
   group: ops.lab.local
-  names: {kind: RetentionPolicy, plural: retentionpolicies, shortNames: [rp]}
   scope: Namespaced
+  names: {kind: RetentionPolicy, plural: retentionpolicies, shortNames: [rp]}
+  versions:
+  - {name: v1, served: true, storage: true, schema: {openAPIV3Schema: {…}}}
+```
+
+Это скелет: полный CRD вы создадите в работе 1. Разбор полей:
+
+- **group** — домен, которым вы владеете; группы, оканчивающиеся на `k8s.io`, зарезервированы.
+- **scope** — `Namespaced` (объект живёт в namespace) или `Cluster` (один на кластер).
+- **names** — `kind` для манифестов, `plural` для адреса, `shortNames` для коротких команд.
+- **versions** — список версий, у каждой своя схема (подраздел о версиях ниже).
+
+Схема в `openAPIV3Schema` — это **OpenAPI v3 schema**, описание полей объекта: типы, допустимые значения, обязательные поля. Для CRD версии v1 схема должна быть **структурной** (structural schema). Это значит, что у корня и у каждого узла задан непустой `type`, а свойства перечислены в `properties`, а не спрятаны в `anyOf` или `oneOf`.
+
+Структурность нужна для трёх вещей. Первая — **pruning** (отсечение): API-сервер удаляет при записи поля, которых нет в схеме, поэтому опечатка в имени поля не сохранится молча. Вторая — **default**: значение по умолчанию подставляется при записи и при чтении из etcd. Третья — проверка CEL, о которой ниже. Исключения из pruning делают явно: `x-kubernetes-preserve-unknown-fields: true` оставляет неизвестные поля на этом узле, и тогда ошибки всплывают уже в контроллере, а не при `kubectl apply`.
+
+```
+запрос ─► pruning ─► default ─► mutating ─► схема ─► CEL ─► validating ─► etcd
+          убрать     подставить admission   типы,    правила admission
+          чужие поля значения   (09-2)      enum     x-k8s-… (09-2)
+```
+
+Схема 3. Путь CR внутри API-сервера, слева направо. Проверки схемы и CEL идут после мутирующих вебхуков и до валидирующих; любой этап может отклонить запрос, и тогда в etcd ничего не попадает.
+
+### Валидация: схема и CEL
+
+Схема проверяет простое: `type`, `enum`, `minimum` и `maximum`, `pattern`, `minLength`, `required`. Связи между полями схема не выражает, для них есть CEL (05-3, 06-3) — язык выражений, встроенный в API-сервер. Правила пишут в поле `x-kubernetes-validations` на нужном узле схемы.
+
+```yaml
+keepDays:
+  type: integer
+  x-kubernetes-validations:
+  - rule: "self >= oldSelf"
+    message: "keepDays можно только увеличивать"
+```
+
+Правило получает значение узла в переменной `self`, а в `oldSelf` — старое значение. Правило с `oldSelf` называют **transition rule** (правило перехода): оно срабатывает только при обновлении и позволяет запретить откат или смену поля. Для неизменяемого поля пишут `self == oldSelf`. Поля `message`, `fieldPath` и `reason` управляют текстом ошибки, её привязкой к полю и кодом причины.
+
+Если схема ужесточилась, старые объекты могут перестать проходить проверку. С Kubernetes 1.33 (GA) действует **validation ratcheting** («храповик» проверки): обновление объекта не отклоняют из-за полей, которые оно не меняет. Объект с устаревшим значением можно править, пока вы не трогаете именно это значение.
+
+### Подресурсы, колонки и селекторы
+
+В CRD включают три добавки к основному адресу объекта. Подресурсы (01-3 §2) описывают так:
+
+- **status** — `subresources.status: {}` выделяет `status` в отдельный адрес. Обычная запись игнорирует `status`, а `metadata.generation` растёт при любом изменении, кроме `metadata` и `status`.
+- **scale** — `subresources.scale` указывает пути к полям реплик: `specReplicasPath`, `statusReplicasPath` и необязательный `labelSelectorPath`. Первые два поля дают работать `kubectl scale`, а HPA (05-4) нужен ещё `labelSelectorPath`.
+
+**Printer columns** (колонки вывода) — поле `additionalPrinterColumns`: имя, тип и `jsonPath` каждой колонки для `kubectl get`. Поле `priority` выше нуля прячет колонку до `-o wide`. Если задать свои колонки, колонка Age не добавляется сама, её нужно описать явно.
+
+**selectableFields** (селектируемые поля, GA в 1.32) — список путей `jsonPath`, по которым сервер фильтрует выдачу: `kubectl get rp --field-selector spec.target=logs`. Без этого списка фильтр работает только по `metadata.name` и `metadata.namespace`. Допускается не больше 8 полей на версию, а каждое поле должно иметь тип string, integer или boolean.
+
+### Версии и конвертация
+
+Версий у типа может быть несколько, например `v1beta1` и `v1`. У каждой версии два флага: `served` (API отдаёт эту версию клиентам) и `storage` (в этой версии объект лежит в etcd). Хранимая версия ровно одна. Устаревшую версию помечают `deprecated: true` и `deprecationWarning`, тогда клиенты получают предупреждение.
+
+Клиент может запросить версию, отличную от хранимой, и API-сервер конвертирует объект на лету. **Conversion** (конвертация) бывает двух видов. Стратегия `None` меняет только поле `apiVersion` и подходит, когда схемы совместимы. Стратегия `Webhook` вызывает **conversion webhook** — HTTPS-службу оператора, которая получает объект в одной версии и возвращает его в другой.
+
+```
+клиент v1beta1 ─┐
+                ├─► API-сервер ── конвертация (None или webhook) ──► etcd хранит v1
+клиент v1      ─┘                                                   status.storedVersions
+```
+
+Схема 4. Клиенты видят разные версии, а в etcd объект лежит в одной. Список `status.storedVersions` в CRD запоминает все версии, в которых объекты когда-либо записывались.
+
+Старую версию нельзя удалить из CRD, пока в etcd остаются объекты в ней. Порядок такой: сделать новую версию хранимой, перезаписать все объекты (прочитать и записать обратно), убрать старую версию из `storedVersions` и только потом из `spec.versions`. Перезапись берёт на себя ресурс **StorageVersionMigration** (миграция версии хранения): встроенный контроллер перезаписывает все объекты ресурса и затем обновляет `storedVersions`. В 1.35 и 1.36 он в beta и выключен по умолчанию: нужны feature gate `StorageVersionMigrator` и API `storagemigration.k8s.io/v1beta1`. В 1.37 он стал GA и включён по умолчанию.
+
+### Контроллер: очередь и reconcile
+
+Контроллер строится вокруг тех же informers и кэша, что и встроенные (01-1 §2), а решение принимает цикл reconcile.
+
+```
+API-сервер ─ watch ─► informer + кэш ─ ключ объекта ─► очередь ─► reconcile(ключ)
+     ▲                                                              │ читает CR и детей из кэша
+     │                                                              │ сравнивает с желаемым
+     └──────────── status и conditions ◄─ создаёт / правит / удаляет ┘
+                                           ошибка: ключ вернётся в очередь с паузой
+```
+
+Схема 5. Контроллер получает только ключ (namespace и имя). Состояние он читает из кэша, а результат записывает в `status`.
+
+Три свойства делают цикл надёжным.
+
+1. **Уровневая логика** (level-triggered). Reconcile получает имя объекта, а не событие, поэтому пропущенное или повторное событие ничего не ломает: каждый проход сравнивает желаемое с фактом заново.
+2. **Идемпотентность.** Повторный проход с тем же CR ничего не меняет, если мир уже совпал с описанием.
+3. **Очередь с паузами.** Ключи одного объекта склеиваются, а при ошибке ключ возвращается в очередь с растущей паузой.
+
+Дочерние объекты контроллер создаёт с `ownerReferences` на CR (01-3 §3): удаление CR тогда удалит и их. Внешние ресурсы, которые каскад не достанет, чистят через finalizer (09-2 §3). Копий контроллера обычно несколько, но действует одна: держатель **Lease** (01-1 §2).
+
+Писать контроллеры принято на Go с библиотекой controller-runtime. Генераторы Kubebuilder и Operator SDK собирают из Go-типов и CRD, и каркас контроллера.
+
+---
+
+## 3. Как управлять CRD и оператором
+
+Управление сводится к установке CRD и оператора, правам на новый тип, описанию CR и обновлению. В качестве примера взят оператор PostgreSQL **CloudNativePG** (CNPG).
+
+### Установка CRD и оператора
+
+Оператор приходит манифестом, Helm-чартом (07-1) или через OLM (Operator Lifecycle Manager, менеджер операторов проекта Operator Framework). Манифест оператора применяют командой `kubectl apply --server-side`. Большие схемы CRD не помещаются в аннотацию `last-applied-configuration` с лимитом 256 КиБ (01-3 §6), и client-side apply на них падает.
+
+Helm ставит CRD из каталога `crds/` только при первой установке и не обновляет их при `upgrade` (07-1). Поэтому у чартов операторов обновление CRD — отдельный шаг, который выполняют вручную. CRD всегда ставят раньше контроллера и CR, иначе первый `apply` CR вернёт ошибку «no matches for kind».
+
+### Права на новый тип
+
+RBAC (06-1) работает с CR как с любым ресурсом: правило с `apiGroups: [ops.lab.local]` и `resources: [retentionpolicies]`. Подресурс получает отдельное правило `retentionpolicies/status`. Контроллеру нужны оба, а пользователям обычно только основной адрес: так человек пишет `spec`, а `status` остаётся за оператором.
+
+Оператор может расширить встроенные роли `view`, `edit` и `admin`: достаточно пометить его ClusterRole меткой `rbac.authorization.k8s.io/aggregate-to-view: "true"` или аналогичной (06-1). Тогда пользователи с правами на namespace получают доступ к новому типу без правки ролей.
+
+### Кластер CloudNativePG
+
+Весь PostgreSQL описывается одним объектом `Cluster`. Этот манифест вы создадите в работе 2.
+
+```yaml
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata: {name: orders-db}
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.11-standard-trixie
+  storage: {size: 1Gi}
+  resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 512Mi}}
+  bootstrap:
+    initdb: {database: orders, owner: orders}
+```
+
+| Поле | Значение |
+|---|---|
+| `instances: 3` | один primary и две реплики |
+| `imageName` | образ PostgreSQL с закреплённой версией, без `latest` |
+| `storage.size` | размер тома каждого экземпляра, 1 ГиБ |
+| `resources` | запрос CPU и памяти и лимит памяти для каждого пода |
+| `bootstrap.initdb` | создать пустую БД `orders` с владельцем `orders` |
+
+Из этого CR оператор создаёт объекты, которые вы найдёте командами из §4.
+
+- **Поды** `orders-db-1`, `-2`, `-3`. CNPG управляет подами напрямую, без StatefulSet (02-3): ему нужно решать, какой экземпляр перезапускать и какой повысить до primary, а StatefulSet этого не умеет.
+- **Тома** — по одному PVC на экземпляр.
+- **Service'ы**: `orders-db-rw` ведёт на primary (запись), `orders-db-ro` — на реплики, `orders-db-r` — на любой экземпляр.
+- **Secret'ы**: `orders-db-app` с паролем и готовым `uri`, `orders-db-ca` с сертификатом центра, `orders-db-server` с сертификатом сервера и `orders-db-replication` с клиентским сертификатом для репликации.
+
+В каждом поде PID 1 — **instance manager** (менеджер экземпляра) оператора: он запускает PostgreSQL и сообщает оператору о состоянии. Реплика получает данные по **потоковой репликации** (streaming replication): primary отправляет ей **WAL** (write-ahead log, журнал упреждающей записи), а реплика применяет записи. Репликация по умолчанию асинхронная, поэтому при аварийном переключении последние транзакции могут потеряться; синхронный режим включается отдельной настройкой.
+
+### Бэкапы CNPG в объектное хранилище
+
+Бэкап в CNPG — тоже CR, а не внешний скрипт. Базовую копию описывает `Backup`, расписание — `ScheduledBackup`. Хранилище и непрерывную отправку WAL берёт на себя плагин **Barman Cloud**: место хранения задаёт его CR `ObjectStore`, а `Cluster` подключает плагин. Встроенное поле `barmanObjectStore` устарело с CNPG 1.26, плагин требует CNPG 1.26 или новее и cert-manager (03-5).
+
+Хранилищем может быть любое S3-совместимое: в 04-3 для этого поднимается шлюз VersityGW, а облачные S3 подходят так же. Непрерывный архив WAL даёт RPO в секунды и **PITR** (point-in-time recovery, восстановление на момент времени): новый `Cluster` загружается из архива с `bootstrap.recovery` и целевым временем. Обычный дамп `pg_dump` (04-3) такого не умеет. Работа 2 бэкапов не включает: им нужны хранилище и cert-manager, то есть отдельный стенд.
+
+### Обновление оператора
+
+Оператор обновляют поверх, без удаления CRD: схема меняется на месте, а объекты остаются. Порядок такой.
+
+1. Прочитать release notes: изменения CRD, поведения и значений по умолчанию.
+2. Проверить `status.storedVersions` и убедиться, что миграция версий не нужна.
+3. Применить новые CRD, затем новый Deployment оператора.
+4. Следить за управляемыми экземплярами: новая версия оператора может перезапустить их поочерёдно.
+
+Обновление репетируют на стенде с теми же CR. Для оператора БД это важнее, чем для остальных: его ошибка касается данных.
+
+---
+
+## 4. Как увидеть состояние
+
+Состояние видно в четырёх местах: список типов, `status` объекта, события и логи контроллера. Начнём с вопроса «что это за тип и кто его обрабатывает».
+
+### Какие типы есть и кто их обслуживает
+
+Команды ниже показывают CRD кластера, типы одной группы, описание полей и хранимые версии.
+
+```bash
+kubectl get crd
+kubectl api-resources --api-group=postgresql.cnpg.io
+kubectl explain retentionpolicy.spec
+kubectl get crd retentionpolicies.ops.lab.local -o jsonpath='{.status.storedVersions}'
+```
+
+| Команда | Что показывает |
+|---|---|
+| `get crd` | все CRD с датой создания |
+| `api-resources --api-group=…` | типы группы, их короткие имена и область |
+| `explain retentionpolicy.spec` | поля и ограничения из схемы CRD |
+| `jsonpath='{.status.storedVersions}'` | версии, в которых объекты лежат в etcd |
+
+Прямой ссылки из CRD на контроллер нет. Имя группы подсказывает проект (`postgresql.cnpg.io` — CloudNativePG), а нужный Deployment ищут в namespace оператора. Если у типа есть conversion webhook, на службу оператора указывает `spec.conversion.webhook.clientConfig`.
+
+### status и conditions
+
+Контроллер пишет результат в `status`, чаще всего в массив `conditions`. **Condition** (условие) — запись со стандартными полями.
+
+- **type** — что проверяется, например `Ready`.
+- **status** — `True`, `False` или `Unknown`.
+- **reason** — причина одним словом в CamelCase.
+- **message** — подробности для человека.
+- **observedGeneration** — какую версию `spec` контроллер уже учёл (01-3 §2).
+
+Если `observedGeneration` меньше `metadata.generation`, контроллер ещё не обработал последнее изменение или не работает. В скриптах условие ждут командой `kubectl wait --for=condition=Ready`. Набор условий каждый оператор задаёт сам, поэтому читают документацию типа: CNPG, например, показывает состояние строкой `status.phase` и счётчиками `readyInstances` и `currentPrimary`.
+
+### События и логи контроллера
+
+Ошибки reconcile контроллер пишет в события объекта и в свой лог. События видны в `kubectl describe` у CR, лог читают командой `kubectl logs` у Deployment оператора. Если CR применён, а `status` пуст, лог контроллера — первое место поиска.
+
+Лог оператора CNPG находится в namespace `cnpg-system` у Deployment `cnpg-controller-manager`. Логи отдельных экземпляров PostgreSQL читают у подов `orders-db-N`: они пишутся в формате JSON.
+
+### Состояние кластера CloudNativePG
+
+Колонки `kubectl get cluster` заданы в printer columns CRD оператора: число экземпляров, готовых, статус и primary. Роль каждого пода видна по метке `cnpg.io/instanceRole`, которую оператор переставляет при переключении.
+
+```bash
+kubectl -n lab-09-1 get cluster orders-db
+kubectl -n lab-09-1 get pods -L cnpg.io/instanceRole -o wide
+```
+
+Первая команда показывает сводку по кластеру, вторая — поды с ролями и узлами. Вывод вы получите в работе 2. Есть и плагин `kubectl cnpg` (команды `status` и `promote`): он удобен, но в работах не используется.
+
+---
+
+## 5. Что ломается и как найти причину
+
+Поломки группируются вокруг трёх вещей: удаление CRD, отсутствие реакции на CR и отказ оператора. Отдельный случай — клиент, который не переживает переключение.
+
+### Удаление CRD удаляет все объекты
+
+`kubectl delete crd` удаляет все объекты этого типа во всех namespace. Для CRD оператора БД это означает удаление всех кластеров, а через `ownerReferences` (01-3 §3) каскад заберёт поды и тома. Работа 1 показывает механику на безопасном типе.
+
+Три меры защищают от такой ошибки. Helm не удаляет CRD из `crds/` (07-1), и удаление CRD должно оставаться отдельной процедурой. Право `delete` на CRD выдают только платформенной роли (06-1), а при необходимости закрывают политикой admission (06-3). Тома ценных данных получают политику `Retain` (04-2).
+
+### CR применён, но ничего не происходит
+
+Причину ищут сверху вниз по цепочке, от запроса к контроллеру.
+
+1. Приняла ли запись API: `kubectl apply` без ошибок, объект виден в `kubectl get`.
+2. Запущен ли контроллер: Deployment оператора готов, поды не перезапускаются.
+3. Что пишет его лог: ошибки reconcile, отказ в правах RBAC на дочерние объекты.
+4. Что показывает `status`: `observedGeneration` и условия.
+5. Нет ли блокирующего вебхука (09-2 §5): ошибки вида `failed calling webhook` в ответе `apply`.
+
+Если у CRD настроен conversion webhook и его служба недоступна, ломается не только запись: чтение CR в другой версии тоже возвращает ошибку конвертации.
+
+### Отказ самого оператора
+
+Остановленный оператор не останавливает работающую БД: поды CNPG продолжают обслуживать запросы, а instance manager держит PostgreSQL. Но пока оператора нет, не работают failover, бэкапы, обновления и реакция на изменение CR. Поэтому оператору нужны несколько реплик с выбором лидера (01-1 §2) и мониторинг. Вебхуки оператора с `failurePolicy: Fail` дополнительно блокируют создание и изменение его CR (09-2 §5).
+
+### Клиент не переживает failover
+
+Оператор может переключить primary за секунды, а приложение всё равно остаётся без БД. В опыте запись пропадала на 2,5 с. Клиент без таймаутов повис навсегда: `psql` открыл соединение к адресу, которого уже не было, и ждал без `connect_timeout`. От приложения нужны четыре вещи.
+
+- Таймаут подключения и запросов: `connect_timeout`, `statement_timeout`, TCP keepalive.
+- Переподключение в пуле соединений.
+- Повтор идемпотентных операций.
+- Подключение к Service `-rw`, а не к конкретному поду.
+
+### Обрезанный манифест оператора
+
+Манифест оператора занимает около 1,29 МБ. Если загрузка оборвалась на середине, `apply` создаёт часть CRD с ошибками вроде `must have exactly one version marked as storage version`. Размер файла проверяют до применения, как и код возврата `curl`.
+
+---
+
+## 6. Пределы и значения по умолчанию
+
+Ниже собраны числа и версии, которые встретились в части. По ним видно, где механизм упирается в предел.
+
+### Размеры
+
+- Объект целиком вместе с `managedFields` должен укладываться в запрос к etcd, по умолчанию 1,5 МиБ (01-1 §6).
+- Все аннотации объекта вместе занимают не больше 256 КиБ (01-3 §6), поэтому CRD ставят через server-side apply.
+- На одну версию CRD допускается не больше 8 `selectableFields`.
+
+### Стоимость правил CEL
+
+API-сервер оценивает стоимость каждого правила CEL и отклоняет CRD, если оценка выше лимита. Стоимость считается в условных единицах, а лимиты заданы в коде API-сервера:
+
+- одно правило при создании CRD — не больше 10 млн единиц по оценке;
+- все правила одного CRD — не больше 100 млн единиц;
+- одно правило при выполнении — не больше 1 млн единиц;
+- все правила одного запроса при выполнении — не больше 10 млн единиц.
+
+Без ограничений размера оценка считает худший случай, поэтому правилам помогают `maxLength`, `maxItems` и `maxProperties` в схеме. Ошибка оценки видна сразу при создании CRD, а не при записи CR.
+
+### Версии и стадии
+
+- `selectableFields` — GA в 1.32.
+- Validation ratcheting — GA в 1.33.
+- StorageVersionMigration — beta с 1.35, выключен по умолчанию; GA и включён в 1.37.
+- Защита встроенных контроллеров от устаревшего кэша (staleness mitigation) — beta в 1.36. Контроллер не действует по данным informer, пока кэш не догнал его собственные записи.
+- Перечисленное относится к стенду 1.36.1; для 1.37 меняется только StorageVersionMigration.
+
+### Значения CloudNativePG
+
+- Версия оператора — 1.30.1 (сентябрь 2026, исправляет CVE в gRPC-Go). Линия 1.30 поддерживает Kubernetes 1.34–1.36, конец поддержки — около декабря 2026.
+- Образ PostgreSQL — `17.11-standard-trixie`. Вывод работы 2 снят с прежним тегом `17.6`: такие теги без типа образа устарели и больше не выпускаются. Самое надёжное закрепление — по digest.
+- Число экземпляров `instances` по умолчанию равно 1; для failover нужны не меньше двух.
+- Репликация по умолчанию асинхронная.
+- Экземпляры оператор раскладывает по узлам правилом мягкой anti-affinity (05-3): на стенде все три лежат на разных worker.
+- Окно недоступности записи при потере primary на стенде — около 2,5 с (работа 2). Это измерение на одном стенде, а не гарантия.
+
+---
+
+## Лабораторные работы
+
+Две работы идут на стенде 00-1 в namespace `lab-09-1`, файлы лежат в `~/lab/k8s/09-1/`. CRD и оператор CloudNativePG принадлежат всему кластеру, а не namespace, поэтому работы удаляют их отдельными командами. Контекст kubectl не меняется.
+
+Подготовку выполняют один раз. Первая команда должна вывести `kind-lab`; если нет, переключитесь на контекст стенда самостоятельно.
+
+```bash
+kubectl config current-context
+kubectl create ns lab-09-1
+mkdir -p ~/lab/k8s/09-1
+k() { kubectl -n lab-09-1 "$@"; }
+```
+
+Вторая команда создаёт namespace работ, третья — каталог для файлов. Функция `k` сокращает запись `kubectl -n lab-09-1`; её снимает уборка работы 2, а если вы закрыли терминал, объявите её заново.
+
+### Лабораторная работа 1. Свой CRD и его удаление
+
+**Риски.** Работа создаёт и удаляет объект, который принадлежит всему кластеру.
+
+- **Что меняется:** в кластере появляется CRD `retentionpolicies.ops.lab.local` и несколько его объектов в `lab-09-1`; на хосте — один файл в `~/lab/k8s/09-1`.
+- **Надолго ли:** до шага 5, где CRD удаляется вместе со всеми его объектами.
+- **Безопасность:** привилегий не нужно; группа `ops.lab.local` вымышленная, чужих CRD работа не задевает.
+- **Влияние на систему:** нагрузки нет; нельзя подставлять в команду удаления другое имя, потому что `delete crd` каскадом удалит все объекты типа.
+- **Откат:** блок «Уборка» в конце работы.
+
+**Цель.** Создать CRD со схемой, правилом CEL, колонками и подресурсом `status`, проверить отказы валидации и увидеть, что удаление CRD удаляет все объекты.
+
+**Что понадобится.**
+
+- Стенд 00-1 и подготовка выше.
+- Права cluster-admin (kind даёт их по умолчанию).
+- Около 15 минут.
+
+**Схема опыта.** Сначала регистрируется тип, потом в него записываются корректные и ошибочные объекты, в конце тип удаляется.
+
+```
+CRD RetentionPolicy ──► API-сервер проверяет: схема, enum, CEL, default
+        │                         │
+        │ объекты принимаются ◄───┘ ошибочные отклоняются
+        ▼
+delete crd ──► все объекты типа исчезают из всех namespace
+```
+
+Схема показывает, что проверки происходят до записи в etcd, а удаление типа вычищает все его записи.
+
+#### Шаг 1. Зарегистрировать тип
+
+Команда сохраняет CRD в файл, применяет его, ждёт условия `Established` и показывает описание поля `spec`.
+
+```bash
+cat > ~/lab/k8s/09-1/rp-crd.yaml <<'EOF'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: retentionpolicies.ops.lab.local
+spec:
+  group: ops.lab.local
+  scope: Namespaced
+  names:
+    kind: RetentionPolicy
+    plural: retentionpolicies
+    shortNames: [rp]
   versions:
   - name: v1
     served: true
     storage: true
-    subresources: {status: {}}
+    subresources:
+      status: {}
     additionalPrinterColumns:
     - {name: Keep, type: integer, jsonPath: .spec.keepDays}
     - {name: Target, type: string, jsonPath: .spec.target}
     - {name: Phase, type: string, jsonPath: .status.phase}
+    selectableFields:
+    - jsonPath: .spec.target
     schema:
       openAPIV3Schema:
         type: object
@@ -43,75 +462,385 @@ spec:
             type: object
             required: [target, keepDays]
             properties:
-              target: {type: string, enum: [orders-db, logs, backups]}
-              keepDays: {type: integer, minimum: 1, maximum: 365}
-              archive: {type: boolean, default: false}
-              minKeepDays: {type: integer, minimum: 1}
+              target:
+                type: string
+                enum: [orders-db, logs, backups]
+              keepDays:
+                type: integer
+                minimum: 1
+                maximum: 365
+              archive:
+                type: boolean
+                default: false
+              minKeepDays:
+                type: integer
+                minimum: 1
             x-kubernetes-validations:
             - rule: "!has(self.minKeepDays) || self.minKeepDays <= self.keepDays"
               message: "minKeepDays не может быть больше keepDays"
           status:
             type: object
-            properties: {phase: {type: string}}
+            properties:
+              phase:
+                type: string
+EOF
+kubectl apply -f ~/lab/k8s/09-1/rp-crd.yaml
+kubectl wait --for=condition=Established crd/retentionpolicies.ops.lab.local --timeout=30s
+kubectl explain retentionpolicy.spec
 ```
 
-Валидация выполняется в apiserver до записи (проверено):
+| Часть команды | Значение |
+|---|---|
+| `scope: Namespaced` | объекты принадлежат namespace |
+| `shortNames: [rp]` | короткое имя для `kubectl get rp` |
+| `subresources: {status: {}}` | выделить `status` в отдельный адрес |
+| `additionalPrinterColumns` | три колонки для `kubectl get`; Age не задана |
+| `selectableFields` | разрешить фильтр по `spec.target` |
+| `x-kubernetes-validations` | правило CEL: `minKeepDays` не больше `keepDays` |
+| `wait --for=condition=Established` | ждать, пока API-сервер начнёт обслуживать тип |
+
+Результат (ожидаемый, сокращён):
+
+```
+customresourcedefinition.apiextensions.k8s.io/retentionpolicies.ops.lab.local created
+customresourcedefinition.apiextensions.k8s.io/retentionpolicies.ops.lab.local condition met
+GROUP:      ops.lab.local
+KIND:       RetentionPolicy
+VERSION:    v1
+
+FIELD: spec <Object>
+…
+FIELDS:
+  archive	<boolean>
+…
+  keepDays	<integer> -required-
+…
+  target	<string> -required-
+  enum: orders-db, logs, backups
+…
+```
+
+Разбор:
+
+1. `created` — CRD принят: схема структурная, правило CEL допустимо по стоимости.
+2. `condition met` — тип зарегистрирован, API-сервер отдаёт `/apis/ops.lab.local/v1`.
+3. `KIND` и `VERSION` в выводе `explain` взяты из CRD, а не из справочника kubectl.
+4. `-required-` и строка `enum` пришли из `required` и `enum` схемы; поля идут по алфавиту.
+
+#### Шаг 2. Проверить валидацию
+
+Цикл отправляет пять объектов: один корректный и четыре с ошибками. Для каждого он показывает ответ API-сервера. Затем читаем принятый объект, где виден `default`.
+
+```bash
+for spec in \
+  '{"target":"orders-db","keepDays":30}' \
+  '{"target":"cache","keepDays":30}' \
+  '{"target":"logs","keepDays":900}' \
+  '{"target":"logs"}' \
+  '{"target":"backups","keepDays":7,"minKeepDays":14}'; do
+  echo "{\"apiVersion\":\"ops.lab.local/v1\",\"kind\":\"RetentionPolicy\",\
+\"metadata\":{\"name\":\"rp-$RANDOM\"},\"spec\":$spec}" | k apply -f - 2>&1 | head -2
+done
+k get rp -o jsonpath='{.items[0].spec}{"\n"}'
+```
+
+| Часть команды | Значение |
+|---|---|
+| `for spec in …` | перебрать пять вариантов `spec` |
+| `rp-$RANDOM` | случайное имя, чтобы объекты не совпали |
+| `k apply -f -` | применить объект, собранный из стандартного ввода |
+| `2>&1 \| head -2` | показать первые две строки ответа, включая ошибки |
+| `jsonpath='{.items[0].spec}'` | вывести `spec` первого объекта |
+
+Результат (сокращён до сути: перед каждой ошибкой kubectl печатает строку `The RetentionPolicy "rp-…" is invalid:`):
 
 ```
 spec.target: Unsupported value: "cache": supported values: "orders-db", "logs", "backups"
 spec.keepDays: Invalid value: 900: spec.keepDays in body should be less than or equal to 365
 spec.keepDays: Required value
-spec: Invalid value: minKeepDays не может быть больше keepDays          ← правило CEL
-{"archive":false,"keepDays":30,"target":"orders-db"}                       ← default подставлен
-NAME       KEEP   TARGET      PHASE
-rp-21812   30     orders-db   Applied                                      ← printer columns
+spec: Invalid value: minKeepDays не может быть больше keepDays
+{"archive":false,"keepDays":30,"target":"orders-db"}
 ```
 
-- **Подресурс status** (`subresources.status`): обычный patch `status` игнорирует (проверено — `phase` осталась `Applied` после попытки записать `Hacked`), менять его можно только через `/status` — права контроллера отдельно от прав пользователей (01-3 §6).
-- Без схемы (`x-kubernetes-preserve-unknown-fields: true` на всё) API принимает любой мусор — ошибки всплывают в контроллере, а не при `kubectl apply`.
-- Версии: `served` (отдаётся API), `storage` (в какой хранится в etcd — одна); переход v1beta1 → v1 — conversion webhook или совместимые схемы; `kubectl get crd <имя> -o jsonpath='{.status.storedVersions}'` — какие версии лежат в etcd (важно перед удалением старой версии, 10-2).
+Разбор:
 
-### Удалить CRD = удалить все объекты 🔴
+1. `Unsupported value … supported values` — значение вне `enum`.
+2. `should be less than or equal to 365` — сработал `maximum`.
+3. `Required value` — нет обязательного `keepDays`.
+4. Четвёртая ошибка пришла от правила CEL, и её текст — наш `message`.
+5. В последней строке `archive:false` появилось само: так сработал `default`.
 
-Проверено: два CR, `kubectl delete crd retentionpolicies.ops.lab.local`:
+#### Шаг 3. Записать status и посмотреть колонки
+
+Команды пишут `status` двумя способами: через подресурс и обычным `patch`.
+
+```bash
+R=$(k get rp -o name | head -1)
+k patch $R --subresource=status --type=merge -p '{"status":{"phase":"Applied"}}'
+k patch $R --type=merge -p '{"status":{"phase":"Hacked"}}'
+k get rp
+```
+
+| Часть команды | Значение |
+|---|---|
+| `R=$(k get rp -o name \| head -1)` | сохранить имя первого объекта |
+| `--subresource=status` | писать через подресурс `/status` |
+| `--type=merge -p '…'` | применить JSON merge patch |
+| `k get rp` | показать колонки из `additionalPrinterColumns` |
+
+Результат:
+
+```
+retentionpolicy.ops.lab.local/rp-21812 patched
+retentionpolicy.ops.lab.local/rp-21812 patched (no change)
+NAME       KEEP   TARGET      PHASE
+rp-21812   30     orders-db   Applied
+```
+
+Строки `patched` ожидаемые, таблица получена на стенде. Имя `rp-21812` у вас будет другим.
+
+Разбор:
+
+1. Первая запись через `/status` сохранила `phase: Applied`.
+2. Вторая запись пошла на основной адрес: сервер отбросил поле `status`, поэтому `patched (no change)`.
+3. В таблице осталось `Applied`, а не `Hacked`: подресурс защищает `status` от обычных пользователей.
+4. Колонки идут в порядке CRD, колонки Age нет: мы её не описали.
+
+#### Шаг 4. Отфильтровать по полю
+
+Команды создают второй объект и выбирают объекты по `spec.target`. Последняя команда использует поле, которого нет в `selectableFields`.
+
+```bash
+k apply -f - <<'EOF'
+apiVersion: ops.lab.local/v1
+kind: RetentionPolicy
+metadata: {name: logs}
+spec: {target: logs, keepDays: 14}
+EOF
+k get rp --field-selector spec.target=logs
+k get rp --field-selector spec.keepDays=30
+```
+
+| Часть команды | Значение |
+|---|---|
+| `metadata: {name: logs}` | объект с понятным именем |
+| `--field-selector spec.target=logs` | сервер вернёт только объекты с таким значением |
+| `spec.keepDays=30` | поле вне `selectableFields` |
+
+Результат (ожидаемый):
+
+```
+retentionpolicy.ops.lab.local/logs created
+NAME   KEEP   TARGET   PHASE
+logs   14     logs
+Error from server (BadRequest): Unable to find "ops.lab.local/v1, Resource=retentionpolicies"
+  that match label selector "", field selector "spec.keepDays=30":
+  field label not supported: spec.keepDays
+```
+
+Разбор:
+
+1. Первый фильтр отобрал один объект из двух: выбор идёт на стороне сервера.
+2. У `logs` колонка PHASE пуста: никто не писал `status`.
+3. Второй фильтр отклонён: разрешены только поля из `selectableFields` и `metadata.name`, `metadata.namespace`.
+
+#### Шаг 5. Удалить CRD
+
+Команда считает объекты, удаляет CRD и пробует прочитать тот же тип.
+
+```bash
+echo "CRs before CRD delete: $(k get rp --no-headers | wc -l)"
+kubectl delete crd retentionpolicies.ops.lab.local
+k get rp
+```
+
+| Часть команды | Значение |
+|---|---|
+| `k get rp --no-headers \| wc -l` | число объектов типа в namespace |
+| `kubectl delete crd …` | удалить определение типа |
+| `k get rp` | повторно прочитать тип |
+
+Результат:
 
 ```
 CRs before CRD delete: 2
-Error from server (NotFound): Unable to list "ops.lab.local/v1, Resource=retentionpolicies": … could not find the requested resource
+customresourcedefinition.apiextensions.k8s.io "retentionpolicies.ops.lab.local" deleted
+Error from server (NotFound): Unable to list "ops.lab.local/v1, Resource=retentionpolicies":
+  … could not find the requested resource
 ```
 
-Все объекты этого типа во всех namespace удалены вместе с CRD. Для операторов БД это значит: удаление CRD `clusters.postgresql.cnpg.io` удалит все кластеры PostgreSQL (а их finalizer'ы и owner-ссылки потянут за собой StatefulSet'ы/поды/PVC — в зависимости от оператора). Поэтому Helm-чарты операторов по умолчанию **не удаляют CRD** при `helm uninstall`, а «почистить кластер от лишних CRD» — операция с ревью.
+Строка `deleted` ожидаемая, остальные получены на стенде.
 
-## 2. Оператор: контроллер + знание предметной области 🟡
+Разбор:
 
-Оператор = CRD + контроллер, который в цикле reconcile (01-1 §2) приводит мир к описанному в CR — с «операционным знанием»: как развернуть, обновить, сделать бэкап, переключить primary.
+1. До удаления в namespace было два объекта.
+2. После удаления CRD сам тип исчез из API: `k get rp` возвращает `NotFound`, а не пустой список.
+3. Объекты удалены вместе с типом, и вернуть их можно только из бэкапа (04-3).
+
+**Итог.**
+
+| Что узнали | Где видно |
+|---|---|
+| Схема, enum и CEL отклоняют ошибки до записи | шаг 2, сообщения об ошибках |
+| `default` подставляется сервером | шаг 2, `archive:false` |
+| Обычная запись не меняет `status` | шаг 3, `patched (no change)` |
+| Фильтр по полю работает только для `selectableFields` | шаг 4, ошибка на `spec.keepDays` |
+| Удаление CRD удаляет все объекты типа | шаг 5, `NotFound` |
+
+**Уборка.** Шаг 5 уже удалил CRD; команды ниже проверяют это и удаляют файл. Namespace `lab-09-1` остаётся для работы 2.
+
+```bash
+kubectl delete crd retentionpolicies.ops.lab.local --ignore-not-found
+rm -f ~/lab/k8s/09-1/rp-crd.yaml
+```
+
+Первая команда удаляет CRD, если он остался, и молчит, если его нет. Вторая удаляет файл.
+
+**Вопросы для самопроверки.**
+
+1. Почему `kubectl apply` объекта с `target: cache` не доходит до контроллера?
+2. Зачем нужен подресурс `status`, если `status` можно записать обычным `patch`?
+3. Что произойдёт с объектами типа, если удалить его CRD, и как от этого защититься?
+4. Почему фильтр по `spec.keepDays` не сработал?
+
+<details>
+<summary>Ответы</summary>
+
+1. API-сервер отклоняет его на этапе проверки схемы: значение вне `enum`. В etcd объект не попадает, и контроллер о нём не узнаёт.
+2. Обычный `patch` игнорирует `status`. Поэтому права на `spec` и на `status` выдают раздельно: человек пишет желаемое, контроллер пишет результат.
+3. Все объекты типа удаляются во всех namespace. Защита: право `delete` на CRD только у платформенной роли, политика admission, бэкапы и Helm-чарты, которые не удаляют CRD.
+4. Поля нет в `selectableFields`. Без записи в этом списке сервер фильтрует только по `metadata.name` и `metadata.namespace`.
+
+</details>
+
+### Лабораторная работа 2. CloudNativePG и failover
+
+**Риски.** Работа ставит оператор во весь кластер и качает образы на хост.
+
+- **Что меняется:** в кластере появляются namespace `cnpg-system`, CRD группы `cnpg.io`, ClusterRole оператора и конфигурации его вебхуков; в `lab-09-1` — три пода PostgreSQL и три PVC; на хосте — два образа Docker и файлы в `~/lab/k8s/09-1`; во всех узлах kind — те же образы.
+- **Надолго ли:** до блока «Уборка». Если вы прервёте работу, оператор и CRD останутся в кластере.
+- **Безопасность:** у оператора широкие права, в том числе на Secret'ы; манифест скачивается с `github.com` без проверки подписи, а версии образов закреплены. Пароль приложения лежит в Secret `orders-db-app` и в командах не печатается.
+- **Влияние на систему:** около 1,5 ГиБ памяти на три экземпляра и три тома по 1 ГиБ; вебхуки оператора обслуживают только его CR. Если образы `ghcr.io/cloudnative-pg/...` были у вас раньше, не удаляйте их на хосте в уборке.
+- **Откат:** блок «Уборка»; порядок важен: сначала Cluster, потом оператор и CRD.
+
+**Цель.** Поставить оператор закреплённой версии, создать кластер из трёх экземпляров, удалить primary и измерить окно недоступности записи.
+
+**Что понадобится.**
+
+- Стенд 00-1, подготовка выше, kind-кластер `lab`.
+- Docker на хосте; доступ к `github.com` и `ghcr.io`.
+- Около 20 минут, из них скачивание образов может занять 5–10 минут.
+
+**Схема опыта.** Писатель вставляет строку каждые 0,5 с через Service `-rw`. Primary удаляется, оператор повышает реплику, и в журнале писателя видно окно ошибок.
 
 ```
-CR Cluster (instances: 3) ──watch──► оператор
-                                       ├─ создаёт поды/PVC/Service/Secret'ы
-                                       ├─ следит за ролями (primary/replica), здоровьем
-                                       ├─ при отказе primary — промоутит реплику, переключает Service -rw
-                                       └─ пишет status: currentPrimary, readyInstances, conditions
+Pod writer ──► Service orders-db-rw ──► primary orders-db-N
+     │ INSERT каждые 0,5 с               │ delete pod
+     ▼                                   ▼
+журнал: ok … FAIL FAIL … ok       оператор повышает реплику, меняет метку роли
 ```
 
-Уровни зрелости (Operator Capability Levels): установка → обновления → полный жизненный цикл (бэкапы, восстановление) → глубокая наблюдаемость → автопилот (автомасштаб, авто-тюнинг). Большинство полезных операторов БД — уровень 3–4.
+Схема показывает, что клиент ходит в Service, а оператор меняет то, на что Service указывает.
 
-## 3. CloudNativePG: PostgreSQL с failover 🟡🔴
+#### Шаг 1. Скачать манифест и образы
 
-```yaml
+Команды скачивают манифест оператора версии 1.30.1, проверяют размер, скачивают два образа на хост и загружают их в узлы kind.
+
+```bash
+cd ~/lab/k8s/09-1
+curl -fL --retry 3 -o cnpg.yaml \
+  https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v1.30.1/cnpg-1.30.1.yaml
+wc -c cnpg.yaml
+for img in ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1 \
+           ghcr.io/cloudnative-pg/postgresql:17.11-standard-trixie; do
+  docker pull $img && kind load docker-image $img --name lab
+done
+```
+
+| Часть команды | Значение |
+|---|---|
+| `curl -fL --retry 3 -o` | скачать с переходами по ссылкам и повторами; ошибка HTTP даёт код возврата |
+| `wc -c cnpg.yaml` | размер файла в байтах |
+| `docker pull $img` | скачать образ на хост |
+| `kind load docker-image --name lab` | скопировать образ в containerd каждого узла кластера `lab` |
+
+Результат: `wc -c` печатает размер около 1,29 млн байт. Меньше значит, что файл недокачан, и применять его нельзя (§5). Образ PostgreSQL с прежним тегом `17.6` скачивался 181 с (у вас время зависит от канала). После `kind load` для каждого узла kind печатает строку вида `Image: "…" with ID "sha256:…" not yet present on node "lab-worker", loading...` (ожидаемый вид).
+
+Разбор:
+
+1. Ключ `-f` у `curl` делает ошибку HTTP ошибкой команды, поэтому `&&` и цикл не продолжат работу с обрывом.
+2. Оба образа закреплены тегами. Заранее загруженные в узлы, они не тянутся с `ghcr.io` во время запуска подов.
+3. Если `wc -c` вернул заметно меньше 1,29 млн, скачайте файл заново: при обрыве загрузки получается меньший файл (например, 1,07 МБ) и ошибки CRD.
+
+#### Шаг 2. Установить оператор
+
+Команды применяют манифест через server-side apply, ждут готовности Deployment оператора и показывают CRD и вебхуки группы `cnpg.io`.
+
+```bash
+kubectl apply --server-side -f ~/lab/k8s/09-1/cnpg.yaml
+kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager
+kubectl get crd | grep cnpg.io
+kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations | grep cnpg
+```
+
+| Часть команды | Значение |
+|---|---|
+| `apply --server-side` | применить с владением полями на сервере, без аннотации last-applied |
+| `rollout status deploy/…` | ждать, пока Deployment оператора станет готов |
+| `grep cnpg.io` | оставить только CRD группы CNPG |
+| `…webhookconfigurations \| grep cnpg` | найти конфигурации вебхуков оператора |
+
+Результат (ожидаемый, сокращён):
+
+```
+deployment "cnpg-controller-manager" successfully rolled out
+backups.postgresql.cnpg.io
+clusters.postgresql.cnpg.io
+poolers.postgresql.cnpg.io
+scheduledbackups.postgresql.cnpg.io
+…
+```
+
+Разбор:
+
+1. Манифест создал namespace, CRD, роли и Deployment оператора одной командой; это и есть установка оператора.
+2. `clusters.postgresql.cnpg.io` — тот самый CRD, удаление которого удалило бы все кластеры (§5).
+3. `poolers` и `scheduledbackups` показывают, что пул соединений и расписание бэкапов — тоже CR.
+4. Конфигурации вебхуков оператор регистрирует в кластере; их роль разбирает 09-2.
+
+#### Шаг 3. Создать кластер из трёх экземпляров
+
+Команды сохраняют манифест Cluster, применяют его и ждут, пока все три экземпляра станут готовы. Затем они показывают кластер, поды и объекты, которые создал оператор.
+
+```bash
+cat > ~/lab/k8s/09-1/orders-db.yaml <<'EOF'
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata: {name: orders-db}
 spec:
   instances: 3
-  imageName: ghcr.io/cloudnative-pg/postgresql:17.6
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.11-standard-trixie
   storage: {size: 1Gi}
   resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 512Mi}}
   bootstrap:
     initdb: {database: orders, owner: orders}
+EOF
+k apply -f ~/lab/k8s/09-1/orders-db.yaml
+until [ "$(k get cluster orders-db -o jsonpath='{.status.readyInstances}')" = 3 ]; do sleep 5; done
+k get cluster orders-db
+k get pods -L cnpg.io/instanceRole -o wide
+k get svc,secret
 ```
 
-Проверено — 3 экземпляра готовы за 79 с:
+| Часть команды | Значение |
+|---|---|
+| `instances: 3` | один primary и две реплики |
+| `imageName` | закреплённый образ, уже загруженный в узлы |
+| `until [ … = 3 ]; do sleep 5; done` | опрашивать `readyInstances`, пока не станет 3 |
+| `-L cnpg.io/instanceRole` | добавить колонку с ролью экземпляра |
+| `get svc,secret` | показать Service'ы и Secret'ы, созданные оператором |
+
+Результат (сокращён до имён, статуса, узла и роли):
 
 ```
 NAME        AGE   INSTANCES   READY   STATUS                     PRIMARY
@@ -119,255 +848,177 @@ orders-db   80s   3           3       Cluster in healthy state   orders-db-1
 orders-db-1 Running lab-worker  primary
 orders-db-2 Running lab-worker3 replica
 orders-db-3 Running lab-worker2 replica
-orders-db-rw  orders-db-ro  orders-db-r                         ← Service'ы: запись, только реплики, любые
-orders-db-app  orders-db-ca  orders-db-replication  orders-db-server   ← Secret'ы: приложение, CA, TLS
+orders-db-rw  orders-db-ro  orders-db-r
+orders-db-app  orders-db-ca  orders-db-replication  orders-db-server
 ```
 
-Что CNPG делает иначе, чем StatefulSet (02-3): управляет **подами напрямую** (без StatefulSet), имена `orders-db-N`, каждый со своим PVC; реплики — потоковая репликация PostgreSQL; TLS между экземплярами и для клиентов из коробки; Secret приложения с готовым `uri`; разносит экземпляры по узлам (anti-affinity по умолчанию — на стенде все три на разных worker'ах).
+Разбор:
 
-### Failover: замер 🔴
+1. Все три экземпляра готовы за 79 с, не считая скачивания образов.
+2. Поды называются `orders-db-N`, а не `…-0`: это не StatefulSet, оператор создаёт их сам.
+3. Экземпляры лежат на трёх разных worker: мягкая anti-affinity сработала.
+4. Роль `primary` одна, остальные `replica`. По метке `cnpg.io/instanceRole` оператор выбирает поды для Service'ов.
+5. Три Service'а — запись (`-rw`), чтение с реплик (`-ro`), любой экземпляр (`-r`). Secret `orders-db-app` содержит готовый `uri`.
 
-Клиент пишет в `orders-db-rw` каждые 0,5 с; под primary удалён (лаба, шаг 4). Проверено:
+#### Шаг 4. Удалить primary и измерить окно
+
+Первая команда создаёт под-писатель с таймаутами: каждые 0,5 с он вставляет строку через `-rw` и пишет в журнал время, результат и адрес сервера. Затем она удаляет под primary и ждёт, пока оператор назначит нового.
+
+```bash
+k apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata: {name: writer}
+spec:
+  restartPolicy: Never
+  containers:
+  - name: writer
+    image: ghcr.io/cloudnative-pg/postgresql:17.11-standard-trixie
+    env:
+    - name: URI
+      valueFrom: {secretKeyRef: {name: orders-db-app, key: uri}}
+    - {name: PGCONNECT_TIMEOUT, value: "2"}
+    command:
+    - sh
+    - -c
+    - |
+      psql "$URI" -qc "create table if not exists ticks(ts timestamptz default now(), host text)"
+      while true; do
+        if out=$(timeout 3 psql "$URI" -qtAc \
+          "insert into ticks(host) select inet_server_addr()::text returning host" 2>&1); then
+          echo "$(date +%T.%N | cut -c1-12) ok $out"
+        else
+          echo "$(date +%T.%N | cut -c1-12) FAIL $(echo $out | cut -c1-70)"
+        fi
+        sleep 0.5
+      done
+EOF
+k wait --for=condition=Ready pod/writer --timeout=60s
+sleep 5
+PRIM=$(k get cluster orders-db -o jsonpath='{.status.currentPrimary}')
+echo "primary=$PRIM deleted at $(date +%T)"
+k delete pod $PRIM --wait=false
+SECONDS=0
+cur() { k get cluster orders-db -o jsonpath='{.status.currentPrimary}'; }
+until [ "$(cur)" != "$PRIM" ]; do sleep 1; done
+echo "new primary=$(cur) after ${SECONDS}s"
+```
+
+| Часть команды | Значение |
+|---|---|
+| `secretKeyRef … key: uri` | взять строку подключения из Secret оператора, пароль в команду не попадает |
+| `PGCONNECT_TIMEOUT: "2"` | ждать подключения не дольше 2 с |
+| `timeout 3 psql …` | оборвать зависший запрос через 3 с |
+| `inet_server_addr()` | адрес сервера, который принял запись |
+| `k delete pod $PRIM --wait=false` | удалить под primary и не ждать завершения |
+| `cur()` | функция: прочитать `status.currentPrimary`, где оператор записывает primary |
+
+Результат:
 
 ```
 primary=orders-db-2 deleted at 15:02:41
+pod "orders-db-2" deleted
 new primary=orders-db-1 after 5s
+```
+
+Строка `pod … deleted` ожидаемая, остальные получены на стенде.
+
+Разбор:
+
+1. Primary был `orders-db-2`; его удалили в 15:02:41.
+2. Оператор записал нового primary в `status` за 5 с. Это время решения оператора, а не окно ошибок клиента.
+3. Сколько времени клиент получал ошибки, видно только в журнале писателя.
+
+Вторая команда ждёт 40 с и читает журнал: сводку по результатам, границы окна ошибок, число строк в таблице и роли подов.
+
+```bash
+sleep 40
+k logs writer | cut -d' ' -f2- | cut -c1-75 | uniq -c
+k logs writer | grep FAIL | sed -n '1p;$p' | cut -c1-12
+NEW=$(k get cluster orders-db -o jsonpath='{.status.currentPrimary}')
+k exec $NEW -c postgres -- psql -U postgres -d orders -tAc \
+  "select count(*), count(distinct host) from ticks"
+k get pods -L cnpg.io/instanceRole
+```
+
+| Часть команды | Значение |
+|---|---|
+| `cut -d' ' -f2-` | убрать время из начала строки |
+| `uniq -c` | свернуть подряд идущие одинаковые строки со счётчиком |
+| `grep FAIL \| sed -n '1p;$p'` | первая и последняя строки с ошибкой |
+| `cut -c1-12` | оставить только время |
+| `count(distinct host)` | сколько разных серверов принимало запись |
+| `-L cnpg.io/instanceRole` | роль каждого пода |
+
+Результат (сокращён; время, адреса и счётчики — пример, у вас они будут другими):
+
+```
      11 ok 10.244.1.17/32
       2 FAIL psql: error: connection to server at "orders-db-rw.lab-09-1" (10.96.17…
      77 ok 10.244.2.233/32
-first FAIL 15:02:42.161, last FAIL 15:02:44.692
-101|3                                             ← 101 строка от трёх разных primary (по адресам), потерь нет
-orders-db-2 Running replica                       ← бывший primary вернулся репликой
+15:02:42.161
+15:02:44.692
+101|3
+orders-db-2 Running replica
 ```
 
-Окно ошибок записи — **~2,5 с** (две неудачные попытки), status оператора сменил `currentPrimary` за 5 с. Для сравнения: потеря узла с одиночным PostgreSQL на local-томе — 503 до возвращения узла (01-2, 05-4).
+Разбор:
 
-**Первый прогон** показал не менее важное (проверено): клиент без таймаутов **повис навсегда** на первой же попытке после удаления primary — `psql` открыл соединение к адресу, которого больше нет, и ждал без `connect_timeout`. Failover на стороне БД прошёл за секунды, а клиент так и не узнал. Отсюда требования к приложениям:
+1. 11 успешных записей на адрес старого primary, затем 2 ошибки, затем 77 записей на адрес нового. Адрес изменился, а имя `-rw` осталось прежним.
+2. Первая ошибка в 15:02:42.161, последняя в 15:02:44.692: окно записи около 2,5 с при удалении пода в 15:02:41.
+3. `101|3` — пример счётчиков: в таблице 101 строка от трёх адресов, а в журнале 88 удачных записей от двух. Лишние строки и третий адрес дала таблица `ticks`, оставшаяся от прежней попытки. В чистом запуске вы увидите два адреса и столько строк, сколько `ok` в журнале.
+4. `orders-db-2` вернулся репликой: оператор не вернул ему роль primary.
+5. Если убрать из манифеста `PGCONNECT_TIMEOUT` и `timeout 3`, писатель повисает навсегда на первой попытке после удаления primary.
 
-- таймаут подключения (`connect_timeout`, `PGCONNECT_TIMEOUT`) и запросов (`statement_timeout`), TCP keepalive;
-- переподключение и повтор идемпотентных операций в пуле соединений;
-- ходить в Service `-rw`, а не в конкретный под.
+**Итог.**
 
-orders-api делает переподключение на каждый запрос и ставит `connect_timeout=2` (00-1, функция `db()`) — поэтому переживает failover; многие реальные пулы — нет, пока их не настроить.
-
-### Что ещё даёт оператор (⚠️ на стенде не проверялось)
-
-- бэкапы в объектное хранилище (базовые + WAL) и PITR — через плагин Barman Cloud (в новых версиях CNPG бэкапы вынесены в плагины);
-- плановый switchover (без потери) — `kubectl cnpg promote` (плагин kubectl);
-- rolling update минорных версий PostgreSQL: сначала реплики, потом switchover и старый primary;
-- пул соединений `Pooler` (PgBouncer) как отдельный CR;
-- мониторинг: метрики на каждом экземпляре.
-
-## 4. Когда оператор оправдан 🔴
-
-| За | Против |
+| Что узнали | Где видно |
 |---|---|
-| сложный жизненный цикл (БД, брокеры, поиск): failover, бэкапы, обновления | простое stateless-приложение — Deployment и Helm хватает |
-| операция повторяется на десятках экземпляров | ещё один компонент со своими багами, CRD и обновлениями |
-| зрелый проект с сообществом (CNCF/вендор) | самописный оператор «для одного сервиса» — дорого поддерживать |
+| Оператор ставится манифестом, а его CRD и вебхуки принадлежат кластеру | шаг 2, CRD и конфигурации вебхуков |
+| Кластер из трёх экземпляров собирается из одного CR | шаг 3, поды, Service'ы и Secret'ы |
+| Оператор повышает реплику за секунды | шаг 4, `new primary … after 5s` |
+| Окно ошибок записи у клиента с таймаутами около 2,5 с | шаг 4, журнал писателя |
+| Клиент без таймаутов не переживает failover | разбор шага 4, п. 5 |
 
-Риски эксплуатации: оператор — точка отказа управления (упал — не будет failover, но работающая БД продолжит обслуживать); обновление оператора меняет поведение всех управляемых объектов; webhook'и оператора с `failurePolicy: Fail` могут заблокировать изменения в кластере (09-2); удаление оператора и CRD — удаление данных.
-
----
-
-## 🔧 Лаба
-
-### Шаг 0. Подготовка
+**Уборка.** Порядок важен: сначала удаляется Cluster, пока оператор может обработать удаление, потом оператор вместе с CRD, потом образы и файлы.
 
 ```bash
-kubectl config use-context kind-lab
-kubectl create ns lab-09-1
-kubectl config set-context --current --namespace=lab-09-1
-```
-
-### Шаг 1. Свой CRD
-
-Создайте CRD из §1 (`kubectl apply -f - <<'EOF' … EOF`) и проверьте валидацию:
-
-```bash
-for spec in '{"target":"orders-db","keepDays":30}' '{"target":"cache","keepDays":30}' '{"target":"logs","keepDays":900}' \
-            '{"target":"logs"}' '{"target":"backups","keepDays":7,"minKeepDays":14}'; do
-  echo "{\"apiVersion\":\"ops.lab.local/v1\",\"kind\":\"RetentionPolicy\",\"metadata\":{\"name\":\"rp-$RANDOM\"},\"spec\":$spec}" | kubectl apply -f - 2>&1 | head -2
-done
-kubectl get rp; kubectl get rp -o jsonpath='{.items[0].spec}{"\n"}'
-R=$(kubectl get rp -o name | head -1)
-kubectl patch $R --subresource=status --type=merge -p '{"status":{"phase":"Applied"}}'
-kubectl patch $R --type=merge -p '{"status":{"phase":"Hacked"}}'
-kubectl get rp
-kubectl explain retentionpolicy.spec
-```
-
-Проверено: вывод в §1.
-
-### Шаг 2. Удаление CRD
-
-```bash
-kubectl apply -f - <<'EOF'
-apiVersion: ops.lab.local/v1
-kind: RetentionPolicy
-metadata: {name: logs}
-spec: {target: logs, keepDays: 14}
-EOF
-kubectl get rp -A
-kubectl delete crd retentionpolicies.ops.lab.local
-kubectl get rp -A
-```
-
-Проверено: 2 объекта → NotFound.
-
-### Шаг 3. CloudNativePG
-
-```bash
-mkdir -p /tmp/lab-09-1 && cd /tmp/lab-09-1
-curl -fL --retry 3 -o cnpg.yaml https://github.com/cloudnative-pg/cloudnative-pg/releases/download/v1.30.1/cnpg-1.30.1.yaml
-wc -c cnpg.yaml                                   # ~1,29 МБ; меньше — файл недокачан, не применяйте
-# образы с ghcr.io тянутся медленно — заранее на хост и в узлы kind
-for img in ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1 ghcr.io/cloudnative-pg/postgresql:17.6; do
-  docker pull $img && kind load docker-image $img --name lab; done
-kubectl apply --server-side -f cnpg.yaml
-kubectl -n cnpg-system rollout status deploy/cnpg-controller-manager
-kubectl apply -f - <<'EOF'
-apiVersion: postgresql.cnpg.io/v1
-kind: Cluster
-metadata: {name: orders-db}
-spec:
-  instances: 3
-  imageName: ghcr.io/cloudnative-pg/postgresql:17.6
-  storage: {size: 1Gi}
-  resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {memory: 512Mi}}
-  bootstrap:
-    initdb: {database: orders, owner: orders}
-EOF
-until [ "$(kubectl get cluster orders-db -o jsonpath='{.status.readyInstances}')" = 3 ]; do sleep 5; done
-kubectl get cluster orders-db
-kubectl get pods -L cnpg.io/instanceRole -o wide
-kubectl get svc,secret
-```
-
-Проверено: вывод в §3. Агент на первой попытке получил обрезанный манифест (таймаут curl посередине загрузки — 1,07 МБ из 1,29 МБ) и ошибки CRD `must have exactly one version marked as storage version` — проверяйте размер файла и код возврата curl до `apply`. Загрузка образа PostgreSQL заняла 181 с.
-
-### Шаг 4. Failover
-
-```bash
-kubectl run writer --image=ghcr.io/cloudnative-pg/postgresql:17.6 --restart=Never --overrides='{"spec":{"containers":[{"name":"writer","image":"ghcr.io/cloudnative-pg/postgresql:17.6",
- "env":[{"name":"URI","valueFrom":{"secretKeyRef":{"name":"orders-db-app","key":"uri"}}},{"name":"PGCONNECT_TIMEOUT","value":"2"}],
- "command":["sh","-c","psql \"$URI\" -qc \"create table if not exists ticks(ts timestamptz default now(), host text)\"; while true; do if out=$(timeout 3 psql \"$URI\" -qtAc \"insert into ticks(host) select inet_server_addr()::text returning host\" 2>&1); then echo \"$(date +%T.%N | cut -c1-12) ok $out\"; else echo \"$(date +%T.%N | cut -c1-12) FAIL $(echo $out | cut -c1-70)\"; fi; sleep 0.5; done"]}]}}'
-kubectl wait --for=condition=Ready pod/writer; sleep 5
-PRIM=$(kubectl get cluster orders-db -o jsonpath='{.status.currentPrimary}'); kubectl delete pod $PRIM --wait=false
-until [ "$(kubectl get cluster orders-db -o jsonpath='{.status.currentPrimary}')" != "$PRIM" ]; do sleep 1; done
-kubectl get cluster orders-db -o jsonpath='new primary: {.status.currentPrimary}{"\n"}'
-sleep 40; kubectl logs writer | awk '{print $2, $3}' | uniq -c
-kubectl logs writer | grep FAIL
-NEW=$(kubectl get cluster orders-db -o jsonpath='{.status.currentPrimary}')
-kubectl exec $NEW -c postgres -- psql -U postgres -d orders -tAc "select count(*), count(distinct host) from ticks"
-kubectl get pods -L cnpg.io/instanceRole
-```
-
-Проверено: вывод в §3. Уберите `PGCONNECT_TIMEOUT` и `timeout 3` — и писатель повиснет на первой попытке после удаления primary (так было в первом прогоне).
-
-### Уборка
-
-```bash
-kubectl delete pod writer --now
-kubectl delete cluster orders-db                 # оператор удалит поды и PVC кластера
-kubectl config set-context --current --namespace=default
+k delete pod writer --now
+k delete cluster orders-db
+k get pods,pvc
 kubectl delete ns lab-09-1
-kubectl delete -f /tmp/lab-09-1/cnpg.yaml        # оператор и его CRD — после удаления всех Cluster
-rm -rf /tmp/lab-09-1
-for n in lab-control-plane lab-worker lab-worker2 lab-worker3; do docker exec $n crictl rmi --prune; done
+kubectl delete -f ~/lab/k8s/09-1/cnpg.yaml
+for n in $(kind get nodes --name lab); do
+  docker exec $n crictl rmi ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1 \
+    ghcr.io/cloudnative-pg/postgresql:17.11-standard-trixie
+done
+docker rmi ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1 \
+  ghcr.io/cloudnative-pg/postgresql:17.11-standard-trixie
+rm -rf ~/lab/k8s/09-1
+unset -f k cur
 ```
 
----
+Первая и вторая команды удаляют писателя и Cluster; оператор сам удаляет его поды и тома. Третья должна показать, что подов и PVC в namespace больше нет. Далее удаляются namespace работ и оператор вместе с CRD и вебхуками: манифест создал и namespace `cnpg-system`. Потом удаляются образы на узлах kind и на хосте, файлы и функция `k`. Строку с `docker rmi` пропустите, если образы были на хосте до работы.
 
-## 🔥 Кейс из прода: «удалили CRD — исчезли все объекты»
+**Вопросы для самопроверки.**
 
-**Контекст.** При переезде на новый мажорный релиз оператора Redis команда удалила старый Helm-релиз оператора, «потому что новая версия ставит свои CRD». Старый чарт был настроен с `crds.keep: false` (кто-то когда-то включил «полную уборку»). Через минуту пропали все 14 кластеров Redis во всех namespace; приложения получили `connection refused`.
+1. Почему оператор и CRD удаляют после удаления Cluster?
+2. Что изменилось у Service `orders-db-rw` при переключении, а что осталось прежним?
+3. Чем окно 5 с в `status` отличается от окна 2,5 с в журнале писателя?
+4. Что нужно от приложения, чтобы пережить failover?
 
-**Разбор.**
-1. `helm uninstall` удалил CRD (`kubectl get crd | grep redis` — пусто).
-2. Удаление CRD удаляет все объекты типа (шаг 2 лабы); у CR были owner-ссылки на StatefulSet'ы, GC удалил и их, а PVC — по `reclaimPolicy: Delete` вместе с дисками.
-3. Восстановление — из бэкапов RDB, которые были не у всех экземпляров (кэш «не надо бэкапить» оказался сессионным хранилищем).
+<details>
+<summary>Ответы</summary>
 
-**Фикс.**
-- Политика: CRD операторов не удаляются Helm'ом (`crds.keep: true` по умолчанию у большинства чартов — не трогать), удаление CRD — отдельная процедура с проверкой `kubectl get <тип> -A`.
-- Admission-политика (06-2): запрет `DELETE` на CRD для всех, кроме роли платформенной команды.
-- Обновление оператора — по инструкции вендора (обычно поверх, без удаления), сначала на стенде.
-- PV ценных данных — `Retain` (04-2), бэкапы всего, что «вроде кэш».
+1. Пока оператор работает, он обрабатывает удаление Cluster и чистит поды и тома. Если сначала удалить CRD, все Cluster исчезнут разом, а очистка будет зависеть от каскада. Тот же порядок объясняет 09-2 §3.
+2. Прежними остались имя и адрес Service. Изменился под, на который он указывает: оператор переставил метку роли.
+3. 5 с — время, за которое оператор записал нового primary в `status`. 2,5 с — время, когда клиент получал ошибки. Это два разных события.
+4. Таймаут подключения и запросов, переподключение в пуле, повтор идемпотентных операций и подключение к `-rw`, а не к поду.
 
-**Что запомнить.**
-- Удаление CRD удаляет все объекты этого типа во всём кластере.
-- `helm uninstall` оператора может удалить CRD — проверяйте настройки чарта.
-- Оператор и его CRD — часть данных, а не «просто софт».
+</details>
 
 ---
 
-## 💼 Вопросы с собеседования
+## → Дальше
 
-### 🟢 Junior
-
-**1. Что такое CRD?**
-Определение нового типа ресурса в API Kubernetes: группа, версии, схема. После создания с объектами работают как со встроенными (`kubectl get`, RBAC, watch).
-
-**2. Что такое оператор?**
-Контроллер, который управляет приложением через CR: создаёт и обновляет ресурсы, выполняет операции (бэкапы, failover, обновления) в цикле reconcile — «автоматизированный дежурный».
-
-### 🟡 Middle
-
-**3. Чем CRD лучше ConfigMap для хранения конфигурации приложения?**
-Схема и валидация в apiserver (типы, enum, CEL), отдельные права RBAC на тип, printer columns, status-подресурс для обратной связи от контроллера, watch по типу. ConfigMap — неструктурированные строки без проверки.
-
-**4. Что будет, если удалить CRD?**
-Удалятся все объекты этого типа во всех namespace; дальше — каскадное удаление по ownerReferences (поды, StatefulSet'ы, иногда PVC). Поэтому чарты операторов не удаляют CRD по умолчанию.
-
-**5. Что происходит с БД под оператором, если упал сам оператор?**
-Работающие экземпляры продолжают обслуживать запросы (как поды без control plane, 01-1); не будет failover, бэкапов, обновлений и реакции на изменения CR, пока оператор не вернётся. Оператору нужны реплики/лидер-элекшн и мониторинг.
-
-### 🔴 Senior
-
-**6. Как CloudNativePG делает failover и что нужно от приложения?**
-Оператор видит недоступный primary, промоутит наиболее продвинутую реплику, переключает Service `-rw` на новый primary, старый после возврата становится репликой. На стенде окно ошибок записи — ~2,5 с. Приложению нужны таймауты подключения и запросов, переподключение пула, повтор идемпотентных операций и подключение через `-rw`, а не к поду; без таймаутов клиент может повиснуть навсегда (проверено).
-
-**7. Писать свой оператор или нет?**
-Только если есть повторяющаяся сложная операционная логика, которую нельзя закрыть существующими операторами, Helm/Kustomize и CronJob'ами, и есть команда, готовая сопровождать (обновления API, controller-runtime, тесты, RBAC). Иначе — зрелый оператор сообщества или managed-сервис.
-
-**8. Как безопасно обновить оператор?**
-Прочитать release notes (изменения CRD, поведения, дефолтов), обновить на стенде с такими же CR, обновлять поверх (без удаления CRD), проверить `storedVersions` и миграции версий CR, следить за rolling-обновлением управляемых экземпляров (оператор может перезапустить всё), иметь бэкапы.
-
----
-
-## ⚠️ Подводные камни
-
-- CR без контроллера — просто запись; ничего не происходит.
-- CRD без схемы принимает мусор — ошибка всплывёт в контроллере.
-- Удаление CRD удаляет все объекты типа; `helm uninstall` оператора может удалить CRD.
-- Обрезанный манифест оператора (таймаут загрузки) даёт невалидные CRD — проверяйте файл до apply.
-- Образы операторов с ghcr.io/quay.io/ECR тянутся медленно и упираются в лимиты — зеркалируйте.
-- Клиент БД без таймаутов не переживёт failover, даже если оператор отработал за секунды.
-- Оператор — точка отказа управления; его webhook'и — точка отказа API (09-2).
-- Обновление оператора может перезапустить все управляемые экземпляры.
-
----
-
-## Чеклист
-
-- [ ] Напишу CRD со схемой, CEL-правилом, printer columns и status.
-- [ ] Объясню, что произойдёт при удалении CRD, и как от этого защититься.
-- [ ] Объясню устройство оператора и уровни зрелости.
-- [ ] Разверну CloudNativePG и найду primary, Service'ы и Secret'ы.
-- [ ] Измерю failover и назову требования к клиентам.
-- [ ] Аргументирую «оператор или нет».
-
----
-
-## Задание со звёздочкой
-
-Переведите сквозной сценарий на CloudNativePG:
-
-1. Создайте `Cluster orders-db` (3 экземпляра) в namespace `orders`, перенесите данные из старого PostgreSQL (`pg_dump`/`pg_restore`, 04-3; или `bootstrap.import` CNPG).
-2. Переключите `DATABASE_URL` orders-api на Secret `orders-db-app` (ключ `uri`).
-3. Повторите опыт 01-2 «узел теряет kubelet» на узле с primary: сколько секунд `curl http://orders.localhost:8088/api/orders` отвечает 503? Сравните с одиночным StatefulSet.
-4. Поставьте плагин Barman Cloud с MinIO (04-3, задание) и сделайте восстановление на момент времени (PITR).
-
----
-
-→ Следующая часть: **09-2. Admission webhooks и finalizers** — сломанный validating webhook с `failurePolicy: Fail` блокирует создание подов во всём кластере, `namespaceSelector` и `timeoutSeconds`; namespace, который висит в Terminating, — как найти, какой finalizer и какой контроллер его держат.
+Тип из CRD и оператор живут в том же API, что и встроенные объекты. Оператор при этом остаётся точкой отказа управления: пока он работает, кластер БД лечится сам, а без него failover не будет. Следующая часть, 09-2, разбирает два механизма, на которых оператор встраивается в запросы. Admission-вебхуки проверяют и меняют объекты до записи, а finalizers не дают удалить объект, пока контроллер не закончил работу. Эти же механизмы чаще всего блокируют кластер: вебхук с `failurePolicy: Fail` останавливает создание подов, а забытый finalizer оставляет namespace в Terminating.

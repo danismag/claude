@@ -10,7 +10,7 @@
 #                          lab-worker            kubelet + containerd, kube-proxy (iptables), kindnet (CNI)
 #                          lab-worker2           — «/ 3 рабочих узла
 #                          lab-worker3           —
-#   127.0.0.1:5001  ─────► kind-registry         registry:2 — образы стенда (localhost:5001/... на хосте и в узлах)
+#   127.0.0.1:5001  ─────► kind-registry   registry:2.8.3 — образы стенда (localhost:5001/... на хосте и в узлах)
 #
 #   Дополнения: metrics-server (kubectl top, HPA), local-path-provisioner (StorageClass standard, встроен в kind),
 #   Envoy Gateway + CRD Gateway API.
